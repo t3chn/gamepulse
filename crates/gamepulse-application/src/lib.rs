@@ -2,6 +2,7 @@
 
 //! Application use cases and ports for GamePulse.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 pub use gamepulse_domain::{
@@ -93,11 +94,60 @@ pub trait DailyCrawlStatePort {
 /// The application-owned data atomically committed after a successful selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DailyCrawlCommit {
+    expected_previous_state: Option<DailyCrawlState>,
     state: DailyCrawlState,
     selected: Vec<DiscoveryCandidate>,
 }
 
 impl DailyCrawlCommit {
+    /// Construct a validated application-owned commit for a persistence adapter.
+    pub fn new(
+        expected_previous_state: Option<DailyCrawlState>,
+        state: DailyCrawlState,
+        selected: Vec<DiscoveryCandidate>,
+    ) -> Result<Self, DailyCrawlCommitError> {
+        let mut selected_ids = BTreeSet::new();
+        for candidate in &selected {
+            let source_product_id = candidate.source_product_id();
+            if !state.selected_or_processed().contains(&source_product_id) {
+                return Err(DailyCrawlCommitError::SelectedCandidateAbsentFromState);
+            }
+            if !selected_ids.insert(source_product_id) {
+                return Err(DailyCrawlCommitError::DuplicateSelectedCandidate);
+            }
+        }
+
+        if let Some(previous_state) = &expected_previous_state {
+            if previous_state.day() != state.day() {
+                return Err(DailyCrawlCommitError::ExpectedPreviousDayMismatch);
+            }
+            if !previous_state
+                .selected_or_processed()
+                .is_subset(state.selected_or_processed())
+            {
+                return Err(DailyCrawlCommitError::SelectedOrProcessedRegression);
+            }
+            if previous_state.new_releases_completed() && !state.new_releases_completed() {
+                return Err(DailyCrawlCommitError::NewReleasesCompletionRegression);
+            }
+            if matches!(previous_state.browse_progress(), BrowseProgress::Exhausted)
+                && !matches!(state.browse_progress(), BrowseProgress::Exhausted)
+            {
+                return Err(DailyCrawlCommitError::BrowseExhaustionRegression);
+            }
+        }
+
+        Ok(Self {
+            expected_previous_state,
+            state,
+            selected,
+        })
+    }
+
+    pub fn expected_previous_state(&self) -> Option<&DailyCrawlState> {
+        self.expected_previous_state.as_ref()
+    }
+
     pub fn state(&self) -> &DailyCrawlState {
         &self.state
     }
@@ -148,9 +198,9 @@ where
     S: DailyCrawlStatePort,
     D: DailyCrawlSourcePort,
 {
-    let persisted_state = state_port.load(&day).map_err(DailyCrawlError::Load)?;
+    let expected_previous_state = state_port.load(&day).map_err(DailyCrawlError::Load)?;
 
-    let discovery = match prepare_daily_crawl(day, persisted_state) {
+    let discovery = match prepare_daily_crawl(day, expected_previous_state.clone()) {
         DailyCrawlAction::Discover(discovery) => discovery,
         DailyCrawlAction::Exhausted(state) => return Ok(DailyCrawlOutcome::Exhausted(state)),
     };
@@ -167,13 +217,10 @@ where
     );
     let selected = selected_candidates(&page, &transition);
     let state = transition.next_state().clone();
+    let commit = DailyCrawlCommit::new(expected_previous_state, state.clone(), selected.clone())
+        .map_err(DailyCrawlError::InvalidCommit)?;
 
-    state_port
-        .commit(DailyCrawlCommit {
-            state: state.clone(),
-            selected: selected.clone(),
-        })
-        .map_err(DailyCrawlError::Commit)?;
+    state_port.commit(commit).map_err(DailyCrawlError::Commit)?;
 
     Ok(DailyCrawlOutcome::Selected(DailyCrawlSelection {
         request,
@@ -220,9 +267,46 @@ impl fmt::Display for DiscoveryCandidateError {
 
 impl std::error::Error for DiscoveryCandidateError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DailyCrawlCommitError {
+    ExpectedPreviousDayMismatch,
+    SelectedOrProcessedRegression,
+    NewReleasesCompletionRegression,
+    BrowseExhaustionRegression,
+    SelectedCandidateAbsentFromState,
+    DuplicateSelectedCandidate,
+}
+
+impl fmt::Display for DailyCrawlCommitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExpectedPreviousDayMismatch => {
+                formatter.write_str("expected previous state must belong to the committed day")
+            }
+            Self::SelectedOrProcessedRegression => {
+                formatter.write_str("selected or processed identities must not regress")
+            }
+            Self::NewReleasesCompletionRegression => {
+                formatter.write_str("new releases completion must not regress")
+            }
+            Self::BrowseExhaustionRegression => {
+                formatter.write_str("browse exhaustion must not regress")
+            }
+            Self::SelectedCandidateAbsentFromState => formatter
+                .write_str("selected candidate identity must belong to the committed state"),
+            Self::DuplicateSelectedCandidate => {
+                formatter.write_str("selected candidate identities must be unique")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DailyCrawlCommitError {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DailyCrawlError<StateError, SourceError> {
     Load(StateError),
     Source(SourceError),
+    InvalidCommit(DailyCrawlCommitError),
     Commit(StateError),
 }

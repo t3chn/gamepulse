@@ -243,6 +243,7 @@ fn load_cargo_workspace() -> WorkspaceShape {
             "--format-version",
             "1",
             "--locked",
+            "--no-deps",
             "--manifest-path",
         ])
         .arg(workspace_root.join("Cargo.toml"))

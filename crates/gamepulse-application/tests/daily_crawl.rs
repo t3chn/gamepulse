@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use gamepulse_application::{
     BrowseCursor, BrowseProgress, CrawlDayKey, CrawlDiscoveryRequest, DailyCrawlCommit,
-    DailyCrawlError, DailyCrawlOutcome, DailyCrawlSourcePort, DailyCrawlState, DailyCrawlStatePort,
-    DiscoveryCandidate, DiscoveryPage, execute_daily_crawl,
+    DailyCrawlCommitError, DailyCrawlError, DailyCrawlOutcome, DailyCrawlSourcePort,
+    DailyCrawlState, DailyCrawlStatePort, DiscoveryCandidate, DiscoveryPage, execute_daily_crawl,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +116,7 @@ fn fresh_day_uses_new_releases_and_preserves_source_order() {
     );
     assert_eq!(selection.state().browse_progress(), BrowseProgress::Initial);
     assert_eq!(state.commits.len(), 1);
+    assert_eq!(state.commits[0].expected_previous_state(), None);
 }
 
 #[test]
@@ -320,4 +321,51 @@ fn source_or_commit_failure_does_not_publish_a_partial_transition() {
     );
     assert!(commit_failure_state.states.is_empty());
     assert!(commit_failure_state.commits.is_empty());
+}
+
+#[test]
+fn commit_payload_preserves_the_loaded_previous_state() {
+    let previous = DailyCrawlState::restored(
+        day("2026-08-14"),
+        [gamepulse_application::SourceProductId::new(1).expect("valid ID")],
+        true,
+        BrowseProgress::Continue(BrowseCursor::new(24)),
+    );
+    let mut state = MemoryStatePort {
+        states: BTreeMap::from([(day("2026-08-14"), previous.clone())]),
+        ..Default::default()
+    };
+    let mut source = FakeSourcePort::from_pages([Ok(page(vec![candidate(2, "second")], None))]);
+
+    selected(
+        execute_daily_crawl(&mut state, &mut source, day("2026-08-14"))
+            .expect("selection must succeed"),
+    );
+
+    assert_eq!(state.commits.len(), 1);
+    assert_eq!(state.commits[0].expected_previous_state(), Some(&previous));
+}
+
+#[test]
+fn public_commit_constructor_rejects_completion_and_exhaustion_regressions() {
+    let complete = DailyCrawlState::restored(day("2026-08-14"), [], true, BrowseProgress::Initial);
+    let incomplete =
+        DailyCrawlState::restored(day("2026-08-14"), [], false, BrowseProgress::Initial);
+    assert_eq!(
+        DailyCrawlCommit::new(Some(complete), incomplete, vec![]),
+        Err(DailyCrawlCommitError::NewReleasesCompletionRegression)
+    );
+
+    let exhausted =
+        DailyCrawlState::restored(day("2026-08-14"), [], true, BrowseProgress::Exhausted);
+    let continued = DailyCrawlState::restored(
+        day("2026-08-14"),
+        [],
+        true,
+        BrowseProgress::Continue(BrowseCursor::new(24)),
+    );
+    assert_eq!(
+        DailyCrawlCommit::new(Some(exhausted), continued, vec![]),
+        Err(DailyCrawlCommitError::BrowseExhaustionRegression)
+    );
 }

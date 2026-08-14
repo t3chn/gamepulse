@@ -10,9 +10,12 @@ bounded direct-HTTP Metacritic source-contract canary in
 `gamepulse-worker-source`, and a deterministic M003 daily-crawl selection seam.
 M003 plans New Releases first, then newest-first browse progression, with
 numeric-ID daily uniqueness, replay of a partially consumed browse page, and an
-atomic application-owned commit boundary.
-Scheduling, durable ingestion and persistence, summaries, and the web UI are
-not implemented yet.
+atomic application-owned commit boundary. M004 implements the SQLite adapter
+that durably commits daily-crawl state and selected candidate slugs through that
+boundary.
+Scheduler and timer execution, the generic durable queue, durable ingestion,
+all remaining application persistence, summaries, the web UI, media, LLM,
+deployment, and M005 are not implemented yet.
 
 ## Baseline architecture
 

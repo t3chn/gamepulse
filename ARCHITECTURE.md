@@ -184,7 +184,10 @@ support reliably:
   a second binary, a missing member, an extra ninth member, an extra library
   target, and a retyped library target.
 
-`mise run architecture` runs this gate against live `cargo metadata`. The test
+`mise run architecture` runs this gate against live `cargo metadata --no-deps`.
+`--no-deps` intentionally avoids resolving external transitive packages while
+retaining the workspace package manifests, production target metadata, and
+complete direct declared dependency entries the gate inspects. The test
 normalizes workspace package identities, manifest dependency paths, and target
 metadata; it does not parse Rust source text or use feature-resolved graph
 nodes as its dependency source.
@@ -199,16 +202,19 @@ prove complete architecture conformance and must not be reported as such.
 
 The repository contains the eight-package workspace harness, one compileable
 binary shell, a sabotage-tested Cargo graph gate, the bounded M002 direct-HTTP
-Metacritic source-contract canary in `gamepulse-worker-source`, and M003's pure
-daily-crawl selection policy. M003 keeps day reset, numeric-ID uniqueness,
-source-order selection, the 20-item cap, replay of a partially consumed browse
-page, and explicit browse exhaustion in the domain; the application owns the
-discovery and atomic state-commit ports. The source worker provides only a
-deterministic mapping from its parsed listing to that application contract and
-does not issue a request as part of M003.
+Metacritic source-contract canary in `gamepulse-worker-source`, M003's pure
+daily-crawl selection policy, and M004's SQLite daily-crawl state adapter. M003
+keeps day reset, numeric-ID uniqueness, source-order selection, the 20-item
+cap, replay of a partially consumed browse page, and explicit browse exhaustion
+in the domain; the application owns the discovery and atomic state-commit ports.
+M004 durably commits the per-day state and selected candidate slugs through that
+port. The source worker provides only a deterministic mapping from its parsed
+listing to that application contract and does not issue a request as part of
+M003 or M004.
 
-SQLite persistence, scheduler/timer execution, queue dispatch, leases, retries,
-ingestion, summaries, web behavior, and deployment remain unimplemented.
+Scheduler and timer execution, the generic durable queue, queue dispatch,
+leases, retries, ingestion, summaries, all remaining application persistence,
+web behavior, media, LLM behavior, deployment, and M005 remain unimplemented.
 Passing CI proves the bounded workspace claims and deterministic canary and
 policy tests, not complete product behavior or complete architecture
 conformance.

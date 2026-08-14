@@ -9,6 +9,7 @@ description = "SQLite adapters for GamePulse application ports"
 [dependencies]
 gamepulse-application.workspace = true
 gamepulse-domain.workspace = true
+rusqlite.workspace = true
 
 [lints]
 workspace = true
