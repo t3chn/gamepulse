@@ -5,10 +5,14 @@ summarization, and evaluator-visible worker progress.
 
 ## Status
 
-The repository has an eight-package Cargo workspace, architecture harness, and
-a bounded direct-HTTP Metacritic source-contract canary in
-`gamepulse-worker-source`. Scheduling, durable ingestion, persistence,
-summaries, and the web UI are not implemented yet.
+The repository has an eight-package Cargo workspace, architecture harness, a
+bounded direct-HTTP Metacritic source-contract canary in
+`gamepulse-worker-source`, and a deterministic M003 daily-crawl selection seam.
+M003 plans New Releases first, then newest-first browse progression, with
+numeric-ID daily uniqueness, replay of a partially consumed browse page, and an
+atomic application-owned commit boundary.
+Scheduling, durable ingestion and persistence, summaries, and the web UI are
+not implemented yet.
 
 ## Baseline architecture
 

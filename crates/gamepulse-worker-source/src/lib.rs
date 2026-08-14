@@ -10,6 +10,9 @@ use reqwest::{Client, StatusCode, Url, redirect};
 use serde::Deserialize;
 use serde_json::Value;
 
+use gamepulse_application::{DiscoveryCandidate, DiscoveryPage};
+use gamepulse_domain::BrowseCursor;
+
 const BACKEND_BASE_URL: &str = "https://backend.metacritic.com/";
 const NEW_RELEASES_LIST_LIMIT: u32 = 20;
 const NEWEST_BROWSE_LIST_LIMIT: u32 = 24;
@@ -95,6 +98,29 @@ pub struct ListingPage {
     pub games: Vec<ListedGame>,
     pub total_results: u64,
     pub next: Option<Continuation>,
+}
+
+/// Map a parsed source-native listing into the narrow application discovery contract.
+///
+/// This seam issues no request and deliberately leaves Metacritic DTOs, parser rules, URLs, and
+/// continuation validation in this source adapter.
+pub fn map_listing_page_for_daily_crawl(
+    page: &ListingPage,
+) -> Result<DiscoveryPage, DailyCrawlMappingError> {
+    let candidates = page
+        .games
+        .iter()
+        .map(|game| {
+            DiscoveryCandidate::new(game.id.0, game.slug.clone())
+                .map_err(|_| DailyCrawlMappingError::InvalidSourceProductId)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(DiscoveryPage::new(
+        candidates,
+        page.next
+            .map(|continuation| BrowseCursor::new(u64::from(continuation.offset))),
+    ))
 }
 
 /// An image descriptor as supplied by the product endpoint.
@@ -544,6 +570,20 @@ pub enum SourceError {
     MismatchedGameIdentity,
     MismatchedSelfLink { field: &'static str },
 }
+
+/// A source-to-application mapping failure that preserves source ownership of parsing rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DailyCrawlMappingError {
+    InvalidSourceProductId,
+}
+
+impl fmt::Display for DailyCrawlMappingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Metacritic listing has an invalid numeric product identity")
+    }
+}
+
+impl std::error::Error for DailyCrawlMappingError {}
 
 impl fmt::Display for SourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

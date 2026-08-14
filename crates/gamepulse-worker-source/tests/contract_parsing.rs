@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use gamepulse_worker_source::{
-    GameId, GameIdentity, ListMode, ReviewKind, SourceError, parse_game_detail, parse_listing_page,
-    parse_review_page, parse_user_score_summary,
+    GameId, GameIdentity, ListMode, ReviewKind, SourceError, map_listing_page_for_daily_crawl,
+    parse_game_detail, parse_listing_page, parse_review_page, parse_user_score_summary,
 };
 
 const LISTING: &str = include_str!("fixtures/listing-page.json");
@@ -30,6 +30,19 @@ fn parses_new_releases_and_semantic_continuation() {
     assert_eq!(page.games[1].metascore, None);
     assert_eq!(page.games[1].userscore, None);
     assert_eq!(page.next.expect("next").offset, 20);
+}
+
+#[test]
+fn maps_source_listing_to_the_application_discovery_contract() {
+    let listing =
+        parse_listing_page(ListMode::NewestBrowse, 0, 20, LISTING).expect("fixture must parse");
+
+    let page = map_listing_page_for_daily_crawl(&listing).expect("mapping must preserve valid IDs");
+
+    assert_eq!(page.candidates().len(), 2);
+    assert_eq!(page.candidates()[0].source_product_id().value(), 101);
+    assert_eq!(page.candidates()[0].source_slug(), "example-game");
+    assert_eq!(page.next_browse_cursor().expect("next").value(), 20);
 }
 
 #[test]

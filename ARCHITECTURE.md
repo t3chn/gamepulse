@@ -198,17 +198,23 @@ prove complete architecture conformance and must not be reported as such.
 ## Current conformance
 
 The repository contains the eight-package workspace harness, one compileable
-binary shell, a sabotage-tested Cargo graph gate, and the bounded M002
-direct-HTTP Metacritic source-contract canary in `gamepulse-worker-source`.
-The canary owns source-native request construction, bounded transport decoding,
-and structural parsing only; it does not introduce an application use case,
-scheduler, durable queue, persistence, summaries, web behavior, or deployment.
-Passing CI proves the bounded workspace claims and deterministic canary tests,
-not complete product behavior or complete architecture conformance.
+binary shell, a sabotage-tested Cargo graph gate, the bounded M002 direct-HTTP
+Metacritic source-contract canary in `gamepulse-worker-source`, and M003's pure
+daily-crawl selection policy. M003 keeps day reset, numeric-ID uniqueness,
+source-order selection, the 20-item cap, replay of a partially consumed browse
+page, and explicit browse exhaustion in the domain; the application owns the
+discovery and atomic state-commit ports. The source worker provides only a
+deterministic mapping from its parsed listing to that application contract and
+does not issue a request as part of M003.
 
-M002 mutation testing is `NOT_APPLICABLE`: it introduces no domain state
-machine, durable queue/retry/lease policy, deduplication, crawl progression,
-run finalization, or selection policy.
+SQLite persistence, scheduler/timer execution, queue dispatch, leases, retries,
+ingestion, summaries, web behavior, and deployment remain unimplemented.
+Passing CI proves the bounded workspace claims and deterministic canary and
+policy tests, not complete product behavior or complete architecture
+conformance.
+
+M003 requires targeted mutation testing because it introduces daily
+deduplication, crawl progression, and selection policy.
 
 ## Revisit conditions
 
