@@ -1,0 +1,12 @@
+{
+  "workspace_members": ["path+file:///workspace/crates/gamepulse-application#0.1.0"],
+  "packages": [
+    {
+      "id": "path+file:///workspace/crates/gamepulse-application#0.1.0",
+      "name": "gamepulse-application",
+      "manifest_path": "/workspace/crates/gamepulse-application/Cargo.toml",
+      "dependencies": [],
+      "targets": [{ "name": "gamepulse_application", "kind": ["lib"], "crate_types": ["lib"] }]
+    }
+  ]
+}

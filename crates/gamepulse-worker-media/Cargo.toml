@@ -1,0 +1,14 @@
+[package]
+name = "gamepulse-worker-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "YouTube and transcript worker lane for GamePulse"
+
+[dependencies]
+gamepulse-application.workspace = true
+gamepulse-domain.workspace = true
+
+[lints]
+workspace = true

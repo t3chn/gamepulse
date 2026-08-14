@@ -1,0 +1,93 @@
+{
+  "workspace_members": [
+    "path+file:///workspace/crates/gamepulse#0.1.0",
+    "path+file:///workspace/crates/gamepulse-application#0.1.0",
+    "path+file:///workspace/crates/gamepulse-domain#0.1.0",
+    "path+file:///workspace/crates/gamepulse-storage-sqlite#0.1.0",
+    "path+file:///workspace/crates/gamepulse-web#0.1.0",
+    "path+file:///workspace/crates/gamepulse-worker-llm#0.1.0",
+    "path+file:///workspace/crates/gamepulse-worker-media#0.1.0",
+    "path+file:///workspace/crates/gamepulse-worker-source#0.1.0"
+  ],
+  "packages": [
+    {
+      "id": "path+file:///workspace/crates/gamepulse#0.1.0",
+      "name": "gamepulse",
+      "manifest_path": "/workspace/crates/gamepulse/Cargo.toml",
+      "dependencies": [
+        { "path": "/workspace/crates/gamepulse-application" },
+        { "path": "/workspace/crates/gamepulse-domain" },
+        { "path": "/workspace/crates/gamepulse-storage-sqlite" },
+        { "path": "/workspace/crates/gamepulse-web" },
+        { "path": "/workspace/crates/gamepulse-worker-llm" },
+        { "path": "/workspace/crates/gamepulse-worker-media" },
+        { "path": "/workspace/crates/gamepulse-worker-source" }
+      ],
+      "targets": [{ "name": "gamepulse", "kind": ["bin"], "crate_types": ["bin"] }]
+    },
+    {
+      "id": "path+file:///workspace/crates/gamepulse-application#0.1.0",
+      "name": "gamepulse-application",
+      "manifest_path": "/workspace/crates/gamepulse-application/Cargo.toml",
+      "dependencies": [{ "path": "/workspace/crates/gamepulse-domain" }],
+      "targets": [{ "name": "gamepulse_application", "kind": ["lib"], "crate_types": ["lib"] }]
+    },
+    {
+      "id": "path+file:///workspace/crates/gamepulse-domain#0.1.0",
+      "name": "gamepulse-domain",
+      "manifest_path": "/workspace/crates/gamepulse-domain/Cargo.toml",
+      "dependencies": [],
+      "targets": [{ "name": "gamepulse_domain", "kind": ["lib"], "crate_types": ["lib"] }]
+    },
+    {
+      "id": "path+file:///workspace/crates/gamepulse-storage-sqlite#0.1.0",
+      "name": "gamepulse-storage-sqlite",
+      "manifest_path": "/workspace/crates/gamepulse-storage-sqlite/Cargo.toml",
+      "dependencies": [
+        { "path": "/workspace/crates/gamepulse-application" },
+        { "path": "/workspace/crates/gamepulse-domain" }
+      ],
+      "targets": [{ "name": "gamepulse_storage_sqlite", "kind": ["lib"], "crate_types": ["lib"] }]
+    },
+    {
+      "id": "path+file:///workspace/crates/gamepulse-web#0.1.0",
+      "name": "gamepulse-web",
+      "manifest_path": "/workspace/crates/gamepulse-web/Cargo.toml",
+      "dependencies": [
+        { "path": "/workspace/crates/gamepulse-application" },
+        { "path": "/workspace/crates/gamepulse-domain" }
+      ],
+      "targets": [{ "name": "gamepulse_web", "kind": ["lib"], "crate_types": ["lib"] }]
+    },
+    {
+      "id": "path+file:///workspace/crates/gamepulse-worker-llm#0.1.0",
+      "name": "gamepulse-worker-llm",
+      "manifest_path": "/workspace/crates/gamepulse-worker-llm/Cargo.toml",
+      "dependencies": [
+        { "path": "/workspace/crates/gamepulse-application" },
+        { "path": "/workspace/crates/gamepulse-domain" }
+      ],
+      "targets": [{ "name": "gamepulse_worker_llm", "kind": ["lib"], "crate_types": ["lib"] }]
+    },
+    {
+      "id": "path+file:///workspace/crates/gamepulse-worker-media#0.1.0",
+      "name": "gamepulse-worker-media",
+      "manifest_path": "/workspace/crates/gamepulse-worker-media/Cargo.toml",
+      "dependencies": [
+        { "path": "/workspace/crates/gamepulse-application" },
+        { "path": "/workspace/crates/gamepulse-domain" }
+      ],
+      "targets": [{ "name": "gamepulse_worker_media", "kind": ["lib"], "crate_types": ["lib"] }]
+    },
+    {
+      "id": "path+file:///workspace/crates/gamepulse-worker-source#0.1.0",
+      "name": "gamepulse-worker-source",
+      "manifest_path": "/workspace/crates/gamepulse-worker-source/Cargo.toml",
+      "dependencies": [
+        { "path": "/workspace/crates/gamepulse-application" },
+        { "path": "/workspace/crates/gamepulse-domain" }
+      ],
+      "targets": [{ "name": "gamepulse_worker_source", "kind": ["lib"], "crate_types": ["lib"] }]
+    }
+  ]
+}

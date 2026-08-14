@@ -1,0 +1,14 @@
+[package]
+name = "gamepulse-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Server-rendered web delivery adapter for GamePulse"
+
+[dependencies]
+gamepulse-application.workspace = true
+gamepulse-domain.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+{
+  "workspace_members": [
+    "path+file:///workspace/crates/gamepulse-worker-media#0.1.0",
+    "path+file:///workspace/crates/gamepulse-worker-llm#0.1.0"
+  ],
+  "packages": [
+    {
+      "id": "path+file:///workspace/crates/gamepulse-worker-media#0.1.0",
+      "name": "gamepulse-worker-media",
+      "manifest_path": "/workspace/crates/gamepulse-worker-media/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "gamepulse-worker-llm",
+          "kind": "dev",
+          "optional": true,
+          "path": "/workspace/crates/gamepulse-worker-llm"
+        }
+      ],
+      "targets": [{ "name": "gamepulse_worker_media", "kind": ["lib"], "crate_types": ["lib"] }]
+    },
+    {
+      "id": "path+file:///workspace/crates/gamepulse-worker-llm#0.1.0",
+      "name": "gamepulse-worker-llm",
+      "manifest_path": "/workspace/crates/gamepulse-worker-llm/Cargo.toml",
+      "dependencies": [],
+      "targets": [{ "name": "gamepulse_worker_llm", "kind": ["lib"], "crate_types": ["lib"] }]
+    }
+  ]
+}

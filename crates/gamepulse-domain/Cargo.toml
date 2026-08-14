@@ -1,0 +1,10 @@
+[package]
+name = "gamepulse-domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Pure domain model and policy for GamePulse"
+
+[lints]
+workspace = true

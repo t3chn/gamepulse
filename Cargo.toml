@@ -1,0 +1,32 @@
+[workspace]
+members = [
+  "crates/gamepulse",
+  "crates/gamepulse-application",
+  "crates/gamepulse-domain",
+  "crates/gamepulse-storage-sqlite",
+  "crates/gamepulse-web",
+  "crates/gamepulse-worker-llm",
+  "crates/gamepulse-worker-media",
+  "crates/gamepulse-worker-source",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+
+[workspace.dependencies]
+gamepulse-application = { path = "crates/gamepulse-application" }
+gamepulse-domain = { path = "crates/gamepulse-domain" }
+gamepulse-storage-sqlite = { path = "crates/gamepulse-storage-sqlite" }
+gamepulse-web = { path = "crates/gamepulse-web" }
+gamepulse-worker-llm = { path = "crates/gamepulse-worker-llm" }
+gamepulse-worker-media = { path = "crates/gamepulse-worker-media" }
+gamepulse-worker-source = { path = "crates/gamepulse-worker-source" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

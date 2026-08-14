@@ -1,0 +1,14 @@
+[package]
+name = "gamepulse-worker-source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Metacritic discovery and ingestion worker lane for GamePulse"
+
+[dependencies]
+gamepulse-application.workspace = true
+gamepulse-domain.workspace = true
+
+[lints]
+workspace = true

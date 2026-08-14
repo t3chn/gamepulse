@@ -1,0 +1,14 @@
+[package]
+name = "gamepulse-storage-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "SQLite adapters for GamePulse application ports"
+
+[dependencies]
+gamepulse-application.workspace = true
+gamepulse-domain.workspace = true
+
+[lints]
+workspace = true

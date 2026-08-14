@@ -1,0 +1,15 @@
+{
+  "workspace_members": ["path+file:///workspace/crates/gamepulse-worker-source#0.1.0"],
+  "packages": [
+    {
+      "id": "path+file:///workspace/crates/gamepulse-worker-source#0.1.0",
+      "name": "gamepulse-worker-source",
+      "manifest_path": "/workspace/crates/gamepulse-worker-source/Cargo.toml",
+      "dependencies": [],
+      "targets": [
+        { "name": "gamepulse_worker_source", "kind": ["lib"], "crate_types": ["lib"] },
+        { "name": "source-worker", "kind": ["bin"], "crate_types": ["bin"] }
+      ]
+    }
+  ]
+}

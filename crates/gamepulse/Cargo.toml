@@ -1,0 +1,22 @@
+[package]
+name = "gamepulse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "GamePulse composition root and deployable binary"
+
+[dependencies]
+gamepulse-application.workspace = true
+gamepulse-domain.workspace = true
+gamepulse-storage-sqlite.workspace = true
+gamepulse-web.workspace = true
+gamepulse-worker-llm.workspace = true
+gamepulse-worker-media.workspace = true
+gamepulse-worker-source.workspace = true
+
+[dev-dependencies]
+serde_json = "1.0.145"
+
+[lints]
+workspace = true

@@ -1,0 +1,32 @@
+min_version = "2025.8.11"
+
+[tools]
+rust = "1.97.1"
+
+[tasks.fmt]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.check]
+description = "Run the fast Rust compiler check"
+run = "cargo check --workspace --all-targets --locked"
+
+[tasks.lint]
+description = "Run Clippy with warnings denied"
+run = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+
+[tasks.test]
+description = "Run all Rust tests"
+run = "cargo test --workspace --all-targets --locked"
+
+[tasks.architecture]
+description = "Verify the Cargo workspace architecture contract"
+run = "cargo test --locked -p gamepulse --test architecture_fitness"
+
+[tasks.ci]
+description = "Run the local CI checks"
+run = [
+  { task = "fmt" },
+  { task = "lint" },
+  { task = "test" },
+]
