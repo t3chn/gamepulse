@@ -75,3 +75,12 @@ agent runtime data do not belong here.
 
 No open-source license is granted by this repository. The code is prepared for
 candidate evaluation unless a separate written license is added later.
+
+## Solution cost
+
+- Accepted milestones: M003 and M004.
+- Coverage: partial; excludes shared pre-instrumentation work and cost-instrumentation setup. README formatting is outside the estimate.
+- API-equivalent estimate (not an invoice): $44.95953076.
+- Effective tokens: 2,684,859.
+- Cache savings: $267.87101184.
+- Pricing profile: as of 2026-08-14; [official OpenAI API pricing](https://developers.openai.com/api/docs/pricing).
