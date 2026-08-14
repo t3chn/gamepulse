@@ -85,9 +85,13 @@ These are architecture decisions rather than quoted assignment facts:
 
 ## Material unknowns
 
-- exact Metacritic endpoint and request contract;
 - YouTube and transcript provider;
 - LLM provider and budget;
 - assignment deadline;
 - deployment target and persistent-storage behavior;
 - accepted repository visibility and AI transcript format.
+
+The bounded current Metacritic direct-HTTP contract is recorded in
+[`source-contracts/metacritic-direct-http.md`](source-contracts/metacritic-direct-http.md).
+It remains a monitored public-source dependency rather than a permanent API
+guarantee.

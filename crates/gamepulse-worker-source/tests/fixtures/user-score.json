@@ -1,0 +1,13 @@
+{
+  "data": {
+    "item": {
+      "score": 8.4,
+      "reviewCount": 2
+    }
+  },
+  "links": {
+    "self": {
+      "href": "https://backend.metacritic.com/reviews/metacritic/user/games/example-game/platform/pc/stats/web?componentName=user-score-summary"
+    }
+  }
+}

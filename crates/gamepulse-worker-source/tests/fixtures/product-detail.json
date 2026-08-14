@@ -1,0 +1,44 @@
+{
+  "data": {
+    "item": {
+      "id": 101,
+      "slug": "example-game",
+      "title": "Example Game",
+      "description": "Synthetic detail fixture.",
+      "images": [
+        {
+          "bucketPath": "products/example-game",
+          "bucketType": "image",
+          "filename": "cover.jpg",
+          "typeName": "cardImage"
+        }
+      ],
+      "platforms": [
+        {
+          "id": 7,
+          "slug": "pc",
+          "releaseDate": "2026-08-14",
+          "criticScoreSummary": { "score": 82 }
+        },
+        {
+          "id": 8,
+          "slug": "console",
+          "criticScoreSummary": { "score": null }
+        }
+      ],
+      "production": {
+        "companies": [
+          { "name": "Example Studio", "typeName": "Developer" },
+          { "name": "Example Publisher", "typeName": "Publisher" }
+        ]
+      },
+      "genres": [
+        { "id": 11, "name": "Adventure" }
+      ],
+      "video": {
+        "embedUrl": "https://cdn.example.test/player/example-game.html",
+        "manifestUrl": "https://cdn.example.test/manifest/example-game.m3u8"
+      }
+    }
+  }
+}

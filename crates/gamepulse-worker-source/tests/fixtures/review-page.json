@@ -1,0 +1,14 @@
+{
+  "data": {
+    "items": [
+      { "id": "critic-1", "score": 95, "quote": null },
+      { "id": "critic-2", "score": null }
+    ],
+    "totalResults": 4
+  },
+  "links": {
+    "next": {
+      "href": "https://backend.metacritic.com/reviews/metacritic/critic/games/example-game/web?offset=3&limit=3"
+    }
+  }
+}

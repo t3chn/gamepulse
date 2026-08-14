@@ -1,0 +1,27 @@
+{
+  "data": {
+    "items": [
+      {
+        "id": 101,
+        "slug": "example-game",
+        "title": "Example Game",
+        "releaseDate": "2026-08-14",
+        "criticScoreSummary": { "score": 82 },
+        "userScore": { "score": 8.4 }
+      },
+      {
+        "id": 102,
+        "slug": "unscored-game",
+        "title": "Unscored Game",
+        "criticScoreSummary": null,
+        "userScore": { "score": null }
+      }
+    ],
+    "totalResults": 42
+  },
+  "links": {
+    "next": {
+      "href": "https://backend.metacritic.com/finder/metacritic/web?offset=20&limit=20"
+    }
+  }
+}

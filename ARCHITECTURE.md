@@ -197,11 +197,18 @@ prove complete architecture conformance and must not be reported as such.
 
 ## Current conformance
 
-The repository currently contains the eight-package workspace harness, one
-compileable binary shell, and a sabotage-tested Cargo graph gate. No source,
-storage, queue, worker, LLM, media, web, or deployment behavior is implemented.
-Passing scaffold CI proves only the bounded workspace claims above, not product
-behavior or complete architecture conformance.
+The repository contains the eight-package workspace harness, one compileable
+binary shell, a sabotage-tested Cargo graph gate, and the bounded M002
+direct-HTTP Metacritic source-contract canary in `gamepulse-worker-source`.
+The canary owns source-native request construction, bounded transport decoding,
+and structural parsing only; it does not introduce an application use case,
+scheduler, durable queue, persistence, summaries, web behavior, or deployment.
+Passing CI proves the bounded workspace claims and deterministic canary tests,
+not complete product behavior or complete architecture conformance.
+
+M002 mutation testing is `NOT_APPLICABLE`: it introduces no domain state
+machine, durable queue/retry/lease policy, deduplication, crawl progression,
+run finalization, or selection policy.
 
 ## Revisit conditions
 

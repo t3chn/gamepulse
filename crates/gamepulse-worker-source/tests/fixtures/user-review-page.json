@@ -1,0 +1,14 @@
+{
+  "data": {
+    "items": [
+      { "id": "user-1", "score": 9.5, "quote": null },
+      { "id": "user-2", "score": null }
+    ],
+    "totalResults": 6
+  },
+  "links": {
+    "next": {
+      "href": "https://backend.metacritic.com/reviews/metacritic/user/games/example-game/web?offset=3&limit=3"
+    }
+  }
+}

@@ -5,10 +5,10 @@ summarization, and evaluator-visible worker progress.
 
 ## Status
 
-The repository is initialized as an eight-package Cargo workspace with an
-adopted architecture and local verification harness. Product behavior is not
-implemented yet. The first product milestone is the bounded Metacritic source
-canary described in `ARCHITECTURE.md`.
+The repository has an eight-package Cargo workspace, architecture harness, and
+a bounded direct-HTTP Metacritic source-contract canary in
+`gamepulse-worker-source`. Scheduling, durable ingestion, persistence,
+summaries, and the web UI are not implemented yet.
 
 ## Baseline architecture
 
@@ -45,6 +45,20 @@ tests. The architecture task verifies the exact declared internal Cargo graph
 and the eight-target production shape (seven normal libraries plus the sole
 binary) against metadata-shaped sabotage rules. Coverage is deferred; targeted
 mutation testing begins when meaningful critical behavior exists.
+
+### Opt-in public source canary
+
+The live canary is ignored by normal tests. It performs exactly one anonymous
+public request to the verified New Releases finder endpoint and prints only
+structural counts:
+
+```bash
+METACRITIC_LIVE_CANARY=1 cargo test --locked -p gamepulse-worker-source \
+  --test live_canary live_new_releases_contract_canary -- --ignored --exact --nocapture
+```
+
+Run it deliberately and only within the request ceiling documented in
+[`docs/source-contracts/metacritic-direct-http.md`](docs/source-contracts/metacritic-direct-http.md).
 
 ## Repository boundary
 
