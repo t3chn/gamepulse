@@ -348,6 +348,35 @@ source canary remains a separate, explicit action. The container remains a
 non-root wrapper around the sole binary and mounts SQLite outside the image;
 one replica with one persistent volume is the only supported deployment shape.
 
+M014 adds local-only structured observability at the binary composition boundary.
+`GAMEPULSE_LOG_FORMAT` is required and accepts exactly `human` or `json`; an
+absent, non-Unicode, or unsupported value prevents startup without reflecting
+the supplied value. The binary installs the sole `tracing-subscriber` before
+opening SQLite, binding HTTP, or composing workers. Human output is time-free
+and ANSI-free for deterministic local inspection; JSON output is one structured
+event per line. Events contain only fixed categories and bounded operational
+fields: lifecycle, a process-local request ID, normalized method and route
+class, response status, elapsed time, scheduler enqueue/tick, durable job
+kind/attempt/settlement/latency, source-stage aggregate, optional-cover
+availability category, and review-summary kind/outcome. They never include
+bodies, query strings, title searches, review text, URLs, headers, cookies,
+credentials, database paths, local paths, or raw errors. Tracing remains an
+outer-adapter concern: domain, application, and durable storage behavior
+neither depend on it nor use it for decisions. When
+`GAMEPULSE_SOURCE_WORK_ENABLED=false`, the binary does not compose source
+clients or source handlers; this setting is the exact local offline smoke
+contract. The source-disabled smoke binds only loopback, uses a temporary
+SQLite file outside the repository, verifies liveness, readiness, one catalogue
+request, and graceful shutdown, then removes that data. It makes no source or
+other external request.
+
+The sole subscriber layer admits exactly the binary-owned targets
+`gamepulse::lifecycle`, `gamepulse::http`, `gamepulse::scheduler`,
+`gamepulse::durable`, `gamepulse::source`, and `gamepulse::review_summary`.
+All other targets, including dependency warnings and errors, are filtered before
+human or JSON formatting, so foreign message fields cannot disclose URLs,
+paths, or raw error text through this logging surface.
+
 Passing CI proves the bounded workspace
 claims and deterministic canary, policy, state-adapter, queue, M006 runtime,
 M007 discovery handler, M008 snapshot foundation, and M009 offline vertical; it
@@ -363,6 +392,19 @@ readiness coverage. Mutation testing is not applicable to the thin readiness
 adapter and status mapping: its two observable branches are deterministic,
 covered directly, and it owns no critical state-machine, lease, retry,
 deduplication, crawl-progression, run-finalization, or selection-policy rule.
+
+M014 adds focused configuration, redaction, request-correlation, and safe
+outcome-field coverage plus a direct source-disabled binary smoke. Mutation
+testing is not applicable: the instrumentation is an adapter-only projection
+with no state transition, persistence rule, retry/lease decision, or selection
+policy; the documented log-format choices and selected fixed category mappings
+are asserted directly, not every scheduler/runtime observable-outcome category.
+The focused smoke is a deterministic child-process test of the actual binary
+initializer. It uses loopback only, a temporary external SQLite file, at most
+40 readiness probes at 100 ms, both log formats, a query-bearing catalogue
+request, invalid-config failure, and SIGINT shutdown. A regression test emits a
+foreign warning containing URL-like error text and proves that the exact target
+allowlist suppresses it while retaining a GamePulse event.
 
 M003 requires targeted mutation testing because it introduces daily
 deduplication, crawl progression, and selection policy.

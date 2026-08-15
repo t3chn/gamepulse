@@ -35,6 +35,9 @@ fingerprint-fenced local summary job per kind, and renders persisted likes/disli
 unavailable state on the detail page. The fallback is deterministic and local; it does not use a
 provider. M013 adds local delivery readiness: non-dependent liveness, SQLite/schema readiness,
 an explicit offline source-work switch for smoke evidence, and a non-root container definition.
+M014 adds local-only, privacy-bounded tracing in the sole binary: explicit deterministic human
+or structured JSON output, lifecycle/HTTP/queue/source-summary categories, and a direct
+source-disabled binary smoke. No telemetry backend is configured.
 Runs/run_items, SSE, media, external LLM/provider integration, and an actual deployment remain
 unimplemented.
 
@@ -75,6 +78,10 @@ The binary requires these explicit environment variables:
 - `GAMEPULSE_HTTP_ADDRESS`: an IP socket address and port, such as
   `127.0.0.1:3000` or `0.0.0.0:3000`. Host names are rejected so startup never
   performs address resolution.
+- `GAMEPULSE_LOG_FORMAT`: required local log format, exactly `human` for
+  time-free, ANSI-free inspection output or `json` for one structured event per
+  line. A missing, non-Unicode, or unsupported value stops startup without
+  echoing the supplied value.
 
 `GAMEPULSE_SOURCE_WORK_ENABLED` is optional and defaults to `true`. Set it to
 `false` only for a local offline smoke or UI inspection: it prevents the source
@@ -85,9 +92,24 @@ requests themselves never fetch catalogue data.
 mkdir -p var
 export GAMEPULSE_DATABASE_PATH="$PWD/var/gamepulse.sqlite3"
 export GAMEPULSE_HTTP_ADDRESS="127.0.0.1:3000"
+export GAMEPULSE_LOG_FORMAT="human"
 export GAMEPULSE_SOURCE_WORK_ENABLED="false"
 cargo run --locked -p gamepulse
 ```
+
+Logging is local-only. It records fixed lifecycle, HTTP method/normalized route
+class/process-local request-ID/status/elapsed-time, scheduler, durable-job,
+source-stage, optional-cover-category, and review-summary-category fields. It
+does not record HTTP bodies, query strings, title searches, review text, URLs,
+headers, cookies, credentials, database paths, local paths, or raw errors.
+Only the six binary-owned `gamepulse::*` logging targets are admitted; warnings
+and errors from dependencies are filtered before either format is rendered.
+`GAMEPULSE_SOURCE_WORK_ENABLED=false` is the offline smoke setting: source
+clients and source handlers are not composed, so the process makes no source
+request. A source-disabled smoke uses a temporary SQLite file outside this
+repository, checks `/health/live`, `/health/ready`, and `/games`, gracefully
+stops the process, inspects its safe startup/request/shutdown logs, and removes
+the temporary data afterwards.
 
 Once the process is listening, `GET /health/live` returns `200 OK` without
 opening SQLite or a network connection. `GET /health/ready` returns `200 OK`
@@ -110,6 +132,7 @@ docker build --tag gamepulse:local .
 docker run --rm -p 3000:3000 \
   -e GAMEPULSE_HTTP_ADDRESS=0.0.0.0:3000 \
   -e GAMEPULSE_DATABASE_PATH=/var/lib/gamepulse/gamepulse.sqlite3 \
+  -e GAMEPULSE_LOG_FORMAT=human \
   -e GAMEPULSE_SOURCE_WORK_ENABLED=true \
   -v gamepulse-data:/var/lib/gamepulse \
   gamepulse:local

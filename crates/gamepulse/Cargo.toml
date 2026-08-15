@@ -16,6 +16,8 @@ gamepulse-worker-llm.workspace = true
 gamepulse-worker-media.workspace = true
 gamepulse-worker-source.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true

@@ -3,7 +3,7 @@
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gamepulse_application::{
     ClaimedJob, HourlyJobSchedule, JobClaimRequest, JobCompletion, JobEnqueueResult, JobFailure,
@@ -228,10 +228,17 @@ where
             .store()?
             .enqueue(request)
             .map_err(|_| RuntimeError::StoreUnavailable)?;
-        Ok(match result {
+        let outcome = match result {
             JobEnqueueResult::Enqueued(_) => SchedulerOutcome::Enqueued,
             JobEnqueueResult::Duplicate(_) => SchedulerOutcome::Duplicate,
-        })
+        };
+        tracing::info!(
+            target: "gamepulse::scheduler",
+            job_kind = hourly_schedule.job_type().as_str(),
+            enqueue_outcome = scheduler_outcome_category(outcome),
+            "scheduler enqueue"
+        );
+        Ok(outcome)
     }
 
     /// Claim at most the configured remaining capacity and start the matching typed handlers.
@@ -278,6 +285,13 @@ where
     pub fn tick(&mut self) -> Result<(SchedulerOutcome, DispatchReport), RuntimeError> {
         let scheduled = self.schedule_hourly()?;
         let dispatched = self.dispatch_available()?;
+        tracing::info!(
+            target: "gamepulse::scheduler",
+            scheduler_outcome = scheduler_outcome_category(scheduled),
+            claimed = dispatched.claimed,
+            settled = dispatched.settled.len(),
+            "scheduler tick"
+        );
         Ok((scheduled, dispatched))
     }
 
@@ -407,6 +421,15 @@ where
     S::Error: Send + 'static,
     C: RuntimeClock,
 {
+    let job_kind = known_job_kind(claimed.job().job_type());
+    let attempt = claimed.job().attempt_count();
+    let started = Instant::now();
+    tracing::info!(
+        target: "gamepulse::durable",
+        job_kind,
+        attempt,
+        "durable job claimed"
+    );
     let outcome = if let Some(job) = TypedJob::from_record(claimed.job()) {
         let Some(handler) = handlers.handler(job.job_type()) else {
             let outcome = settle_failure(
@@ -418,6 +441,14 @@ where
             if let Some(wakeup) = wakeup {
                 wakeup.notify_waiters();
             }
+            tracing::info!(
+                target: "gamepulse::durable",
+                job_kind,
+                attempt,
+                settlement = runtime_outcome_category(outcome),
+                latency_ms = elapsed_millis(started.elapsed()),
+                "durable job settled"
+            );
             return outcome;
         };
 
@@ -436,7 +467,48 @@ where
     if let Some(wakeup) = wakeup {
         wakeup.notify_waiters();
     }
+    tracing::info!(
+        target: "gamepulse::durable",
+        job_kind,
+        attempt,
+        settlement = runtime_outcome_category(outcome),
+        latency_ms = elapsed_millis(started.elapsed()),
+        "durable job settled"
+    );
     outcome
+}
+
+pub(crate) fn scheduler_outcome_category(outcome: SchedulerOutcome) -> &'static str {
+    match outcome {
+        SchedulerOutcome::Enqueued => "enqueued",
+        SchedulerOutcome::Duplicate => "duplicate",
+        SchedulerOutcome::Stopped => "stopped",
+    }
+}
+
+fn known_job_kind(value: &str) -> &'static str {
+    match value {
+        "source.hourly-discovery" => "source.hourly-discovery",
+        "source.game-ingestion" => "source.game-ingestion",
+        "llm.review-summary" => "llm.review-summary",
+        _ => "unknown",
+    }
+}
+
+pub(crate) fn runtime_outcome_category(outcome: RuntimeTaskOutcome) -> &'static str {
+    match outcome {
+        RuntimeTaskOutcome::Succeeded => "succeeded",
+        RuntimeTaskOutcome::Failed(JobFailureResult::ReadyForRetry) => "retryable_failure",
+        RuntimeTaskOutcome::Failed(JobFailureResult::Failed) => "terminal_failure",
+        RuntimeTaskOutcome::CompletionRejected => "completion_rejected",
+        RuntimeTaskOutcome::FailureRejected => "failure_rejected",
+        RuntimeTaskOutcome::ClockUnavailable => "clock_unavailable",
+        RuntimeTaskOutcome::StoreUnavailable => "store_unavailable",
+    }
+}
+
+fn elapsed_millis(elapsed: Duration) -> u64 {
+    elapsed.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn settle_success<S, C>(
