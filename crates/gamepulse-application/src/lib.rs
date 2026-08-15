@@ -2,8 +2,11 @@
 
 //! Application use cases and ports for GamePulse.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 pub use gamepulse_domain::{
     APP_NAME, BrowseCursor, BrowseProgress, CrawlDayKey, CrawlDayKeyError, CrawlDiscoveryRequest,
@@ -909,3 +912,205 @@ fn validate_job_text(field: &'static str, value: &str) -> Result<(), JobInputErr
     }
     Ok(())
 }
+
+/// The one M006 job type scheduled by the bounded hourly runtime.
+///
+/// This type is deliberately narrower than the product's future source, media,
+/// and summary work. Adding another execution kind requires an explicitly
+/// adopted application use case rather than accepting an arbitrary queue string.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum RuntimeJobType {
+    SourceHourlyDiscovery,
+}
+
+impl RuntimeJobType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceHourlyDiscovery => "source.hourly-discovery",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "source.hourly-discovery" => Some(Self::SourceHourlyDiscovery),
+            _ => None,
+        }
+    }
+}
+
+/// The hour width used to derive a durable schedule identity from a caller-supplied timestamp.
+pub const HOURLY_SCHEDULE_SECONDS: i64 = 60 * 60;
+
+/// Application-owned policy for one durable hourly job family.
+///
+/// The durable job identity, not process-local memory, suppresses duplicate
+/// scheduler ticks for the same hour slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HourlyJobSchedule {
+    job_type: RuntimeJobType,
+    max_attempts: u32,
+}
+
+impl HourlyJobSchedule {
+    pub fn new(job_type: RuntimeJobType, max_attempts: u32) -> Result<Self, JobInputError> {
+        if max_attempts == 0 {
+            return Err(JobInputError::ZeroMaxAttempts);
+        }
+        Ok(Self {
+            job_type,
+            max_attempts,
+        })
+    }
+
+    pub const fn job_type(self) -> RuntimeJobType {
+        self.job_type
+    }
+
+    pub const fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+
+    /// Construct the durable request for the supplied hour without reading a wall clock.
+    pub fn request_for(&self, scheduled_at: JobTimestamp) -> Result<JobRequest, JobInputError> {
+        let hour_slot = scheduled_at.value() / HOURLY_SCHEDULE_SECONDS;
+        JobRequest::new(
+            format!("hourly:{}:{hour_slot}", self.job_type.as_str()),
+            self.job_type.as_str(),
+            format!("hour-slot:{hour_slot}"),
+            self.max_attempts,
+            scheduled_at,
+        )
+    }
+}
+
+/// A validated queued job whose type can be routed without interpreting its opaque work reference.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TypedJob {
+    identity: String,
+    job_type: RuntimeJobType,
+    work_ref: String,
+}
+
+impl TypedJob {
+    pub fn from_record(record: &JobRecord) -> Option<Self> {
+        Some(Self {
+            identity: record.identity().to_owned(),
+            job_type: RuntimeJobType::parse(record.job_type())?,
+            work_ref: record.work_ref().to_owned(),
+        })
+    }
+
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub const fn job_type(&self) -> RuntimeJobType {
+        self.job_type
+    }
+
+    pub fn work_ref(&self) -> &str {
+        &self.work_ref
+    }
+}
+
+impl fmt::Debug for TypedJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TypedJob")
+            .field("identity", &self.identity)
+            .field("job_type", &self.job_type)
+            .field("work_ref_bytes", &self.work_ref.len())
+            .finish()
+    }
+}
+
+/// Opaque handler failure data. The runtime persists it through `JobStore` but never logs it.
+#[derive(Clone, Eq, PartialEq)]
+pub struct JobHandlerFailure(String);
+
+impl JobHandlerFailure {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for JobHandlerFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobHandlerFailure")
+            .field("message_bytes", &self.0.len())
+            .finish()
+    }
+}
+
+/// The only terminal signals a typed M006 handler may return to the dispatcher.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JobHandlerResult {
+    Succeeded,
+    Failed(JobHandlerFailure),
+}
+
+/// Object-safe future type used by typed worker adapters without adding an async-trait dependency.
+pub type JobHandlerFuture = Pin<Box<dyn Future<Output = JobHandlerResult> + Send + 'static>>;
+
+/// Application port implemented by outer worker lanes.
+///
+/// A handler receives a validated job type plus opaque work reference, but never
+/// receives the durable claim capability. Only the dispatcher may settle it.
+pub trait JobHandler: Send + Sync {
+    fn job_type(&self) -> RuntimeJobType;
+
+    fn handle(&self, job: TypedJob) -> JobHandlerFuture;
+}
+
+/// Immutable typed handler lookup. Duplicate registrations are rejected while wiring the process.
+#[derive(Clone, Default)]
+pub struct JobHandlerRegistry {
+    handlers: BTreeMap<RuntimeJobType, Arc<dyn JobHandler>>,
+}
+
+impl JobHandlerRegistry {
+    pub fn new(
+        handlers: impl IntoIterator<Item = Arc<dyn JobHandler>>,
+    ) -> Result<Self, JobHandlerRegistryError> {
+        let mut registered = BTreeMap::new();
+        for handler in handlers {
+            let job_type = handler.job_type();
+            if registered.insert(job_type, handler).is_some() {
+                return Err(JobHandlerRegistryError::DuplicateJobType(job_type));
+            }
+        }
+        Ok(Self {
+            handlers: registered,
+        })
+    }
+
+    pub fn handler(&self, job_type: RuntimeJobType) -> Option<Arc<dyn JobHandler>> {
+        self.handlers.get(&job_type).cloned()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobHandlerRegistryError {
+    DuplicateJobType(RuntimeJobType),
+}
+
+impl fmt::Display for JobHandlerRegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateJobType(job_type) => {
+                write!(
+                    formatter,
+                    "duplicate typed job handler for {}",
+                    job_type.as_str()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for JobHandlerRegistryError {}

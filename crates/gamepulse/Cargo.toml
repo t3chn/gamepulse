@@ -14,9 +14,11 @@ gamepulse-web.workspace = true
 gamepulse-worker-llm.workspace = true
 gamepulse-worker-media.workspace = true
 gamepulse-worker-source.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 serde_json = "1.0.145"
+tokio = { workspace = true, features = ["sync"] }
 
 [lints]
 workspace = true

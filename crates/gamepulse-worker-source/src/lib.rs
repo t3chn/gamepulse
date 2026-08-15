@@ -10,7 +10,10 @@ use reqwest::{Client, StatusCode, Url, redirect};
 use serde::Deserialize;
 use serde_json::Value;
 
-use gamepulse_application::{DiscoveryCandidate, DiscoveryPage};
+use gamepulse_application::{
+    DiscoveryCandidate, DiscoveryPage, JobHandler, JobHandlerFailure, JobHandlerFuture,
+    JobHandlerResult, RuntimeJobType, TypedJob,
+};
 use gamepulse_domain::BrowseCursor;
 
 const BACKEND_BASE_URL: &str = "https://backend.metacritic.com/";
@@ -18,6 +21,26 @@ const NEW_RELEASES_LIST_LIMIT: u32 = 20;
 const NEWEST_BROWSE_LIST_LIMIT: u32 = 24;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
+
+/// M006's deliberately bounded source-lane handler.
+///
+/// It proves typed routing and durable retry behavior without fetching Metacritic
+/// or writing product data before the mandatory ingestion use case is adopted.
+pub struct HourlyDiscoveryPlaceholderHandler;
+
+impl JobHandler for HourlyDiscoveryPlaceholderHandler {
+    fn job_type(&self) -> RuntimeJobType {
+        RuntimeJobType::SourceHourlyDiscovery
+    }
+
+    fn handle(&self, _job: TypedJob) -> JobHandlerFuture {
+        Box::pin(async {
+            JobHandlerResult::Failed(JobHandlerFailure::new(
+                "source hourly discovery is not implemented in M006",
+            ))
+        })
+    }
+}
 
 /// The two mandatory discovery modes established by the current source contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

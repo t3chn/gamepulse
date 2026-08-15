@@ -2,7 +2,7 @@
 
 - Status: adopted for workspace initialization
 - Scope: the GamePulse Rust workspace and its runtime
-- Last verified: 2026-08-14
+- Last verified: 2026-08-15
 - Requirements: [`docs/requirements.md`](docs/requirements.md)
 
 This file records only durable, non-obvious boundaries that contributors or
@@ -204,7 +204,8 @@ The repository contains the eight-package workspace harness, one compileable
 binary shell, a sabotage-tested Cargo graph gate, the bounded M002 direct-HTTP
 Metacritic source-contract canary in `gamepulse-worker-source`, M003's pure
 daily-crawl selection policy, M004's SQLite daily-crawl state adapter, and
-M005's durable job-queue foundation. M003 keeps day reset, numeric-ID
+M005's durable job-queue foundation, and M006's bounded in-process runtime.
+M003 keeps day reset, numeric-ID
 uniqueness, source-order selection, the 20-item cap, replay of a partially
 consumed browse page, and explicit browse exhaustion in the domain; the
 application owns the discovery and atomic state-commit ports. M004 durably
@@ -212,15 +213,29 @@ commits the per-day state and selected candidate slugs through that port. M005
 adds an application-owned `JobStore` port plus a SQLite adapter that durably
 deduplicates stable jobs, records claims and lease expiry, bounds attempts,
 fences claim tokens and clock transitions, rejects stale claim completion, and
-retains attempt history. The source worker provides only a deterministic mapping
-from its parsed listing to the daily-crawl application contract and does not
-issue a request as part of M003, M004, or M005.
+retains attempt history. M006 adds a Tokio task set in the binary process that
+derives durable hourly identities from a clock port, enqueues through `JobStore`,
+claims no more than its configured capacity, routes only the application-owned
+typed job kind, and joins started tasks after graceful shutdown stops future
+scheduling and claims. Completion and failure use the exact durable claim
+capability; stale or expired completion is not reported as current success.
+While accepting work, the production loop waits on task completion as well as
+the hourly timer and refills only capacity made available by a completed task;
+it does not poll or create an in-memory work queue. A biased shutdown branch
+prevents a ready shutdown signal from losing to the initial or later timer tick.
+The only currently wired source handler is an explicit deterministic placeholder:
+it makes no network request and writes no game, review, summary, or other
+product data, then takes the durable retry/terminal failure path. The source
+worker otherwise provides only a deterministic mapping from its parsed listing
+to the daily-crawl application contract and does not issue a request as part of
+M003 through M006.
 
-Scheduler and timer execution, queue dispatch and worker handlers, ingestion,
-summaries, all remaining application persistence, web behavior, media, LLM
-behavior, and deployment remain unimplemented. Passing CI proves the bounded
-workspace claims and deterministic canary, policy, state-adapter, and queue
-tests, not complete product behavior or complete architecture conformance.
+Metacritic ingestion, game and review persistence, summaries, web behavior,
+media, LLM behavior, and deployment remain unimplemented. Passing CI proves the
+bounded workspace claims and deterministic canary, policy, state-adapter,
+queue, and M006 runtime tests, not complete product behavior or complete
+architecture conformance. M006's scheduler identity, dispatcher-capacity, and
+stale-completion branches have focused mutation evidence.
 
 M003 requires targeted mutation testing because it introduces daily
 deduplication, crawl progression, and selection policy.
