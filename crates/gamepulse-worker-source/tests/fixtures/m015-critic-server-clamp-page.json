@@ -1,0 +1,22 @@
+{
+  "data": {
+    "items": [
+      { "id": "synthetic-clamp-1", "score": 9, "quote": null },
+      { "id": "synthetic-clamp-2", "score": 8, "quote": null },
+      { "id": "synthetic-clamp-3", "score": 7, "quote": null },
+      { "id": "synthetic-clamp-4", "score": 6, "quote": null },
+      { "id": "synthetic-clamp-5", "score": 5, "quote": null },
+      { "id": "synthetic-clamp-6", "score": 4, "quote": null },
+      { "id": "synthetic-clamp-7", "score": 3, "quote": null },
+      { "id": "synthetic-clamp-8", "score": 2, "quote": null },
+      { "id": "synthetic-clamp-9", "score": 1, "quote": null },
+      { "id": "synthetic-clamp-10", "score": 0, "quote": null }
+    ],
+    "totalResults": 12
+  },
+  "links": {
+    "next": {
+      "href": "https://backend.metacritic.com/reviews/metacritic/critic/games/example-game/web?offset=10&limit=10"
+    }
+  }
+}

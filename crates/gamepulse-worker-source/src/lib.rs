@@ -2139,6 +2139,7 @@ pub fn parse_listing_page(
                 offset,
                 limit,
                 total_results: envelope.data.total_results,
+                critic_first_page_item_count: None,
             },
         )?,
     })
@@ -2257,6 +2258,9 @@ pub fn parse_review_page(
         .into_iter()
         .map(|review| parse_review_marker(kind, review))
         .collect::<Result<Vec<_>, _>>()?;
+    let critic_first_page_item_count =
+        (kind == ReviewKind::Critic && offset == 0 && limit == REVIEW_PAGE_LIMIT)
+            .then_some(reviews.len());
 
     Ok(ReviewPage {
         kind,
@@ -2269,6 +2273,7 @@ pub fn parse_review_page(
                 offset,
                 limit,
                 total_results: envelope.data.total_results,
+                critic_first_page_item_count,
             },
         )?,
     })
@@ -2655,6 +2660,7 @@ struct ContinuationContext<'a> {
     offset: u32,
     limit: u32,
     total_results: u64,
+    critic_first_page_item_count: Option<usize>,
 }
 
 fn parse_continuation(
@@ -2673,9 +2679,6 @@ fn parse_continuation(
         .offset
         .checked_add(context.limit)
         .ok_or(SourceError::InvalidContinuation)?;
-    if u64::from(expected_offset) >= context.total_results {
-        return Err(SourceError::InvalidContinuation);
-    }
     let mut offset_seen = false;
     let mut limit_seen = false;
     let mut offset = None;
@@ -2701,12 +2704,49 @@ fn parse_continuation(
     }
     match (offset, limit) {
         (Some(offset), Some(limit))
-            if offset == expected_offset && limit == context.limit && limit > 0 =>
+            if (is_requested_page_continuation(&context, expected_offset, offset, limit)
+                || is_server_clamped_critic_first_page(&context, offset, limit))
+                && u64::from(offset) < context.total_results =>
         {
             Ok(Some(Continuation { offset, limit }))
         }
         _ => Err(SourceError::InvalidContinuation),
     }
+}
+
+fn is_requested_page_continuation(
+    context: &ContinuationContext<'_>,
+    expected_offset: u32,
+    continuation_offset: u32,
+    continuation_limit: u32,
+) -> bool {
+    continuation_offset == expected_offset
+        && continuation_limit == context.limit
+        && continuation_limit > 0
+        && context
+            .critic_first_page_item_count
+            .is_none_or(|item_count| u32::try_from(item_count) == Ok(context.limit))
+}
+
+fn is_server_clamped_critic_first_page(
+    context: &ContinuationContext<'_>,
+    continuation_offset: u32,
+    continuation_limit: u32,
+) -> bool {
+    let Some(item_count) = context.critic_first_page_item_count else {
+        return false;
+    };
+    if context.offset != 0 || context.limit != REVIEW_PAGE_LIMIT {
+        return false;
+    }
+    let Ok(effective_limit) = u32::try_from(item_count) else {
+        return false;
+    };
+    if effective_limit == 0 || effective_limit >= context.limit {
+        return false;
+    }
+    context.offset.checked_add(effective_limit) == Some(continuation_offset)
+        && continuation_limit == effective_limit
 }
 
 fn validate_backend_link(

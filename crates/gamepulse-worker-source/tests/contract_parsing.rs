@@ -14,6 +14,7 @@ const USER_REVIEWS: &str = include_str!("fixtures/user-review-page.json");
 const USER_SCORE: &str = include_str!("fixtures/user-score.json");
 const M011_CRITIC_REVIEWS: &str = include_str!("fixtures/m011-critic-review-page.json");
 const M011_USER_REVIEWS: &str = include_str!("fixtures/m011-user-review-page.json");
+const M015_CRITIC_SERVER_CLAMP: &str = include_str!("fixtures/m015-critic-server-clamp-page.json");
 
 fn example_game() -> GameIdentity {
     GameIdentity {
@@ -175,6 +176,92 @@ fn maps_only_one_bounded_first_page_into_separate_synthetic_review_inputs() {
     assert_eq!(critic_input.excerpts().len(), 2);
     assert_eq!(user_input.excerpts().len(), 2);
     assert_ne!(critic_input.content_hash(), user_input.content_hash());
+}
+
+#[test]
+fn accepts_only_the_verified_server_clamp_for_the_first_critic_page() {
+    let page = parse_review_page(
+        ReviewKind::Critic,
+        "example-game",
+        0,
+        20,
+        M015_CRITIC_SERVER_CLAMP,
+    )
+    .expect("verified server clamp must parse");
+    let input = map_review_page_to_input(
+        SourceProductId::new(101).expect("test identity must be valid"),
+        &page,
+    )
+    .expect("server-clamped first page must remain eligible for bounded ingestion");
+
+    assert_eq!(page.reviews.len(), 10);
+    assert_eq!(page.total_results, 12);
+    assert_eq!(
+        page.next,
+        Some(gamepulse_worker_source::Continuation {
+            offset: 10,
+            limit: 10,
+        })
+    );
+    assert!(input.excerpts().is_empty());
+
+    let host_mismatch =
+        M015_CRITIC_SERVER_CLAMP.replace("backend.metacritic.com", "invalid.example.test");
+    let scheme_mismatch = M015_CRITIC_SERVER_CLAMP.replacen("https://", "http://", 1);
+    let path_mismatch = M015_CRITIC_SERVER_CLAMP.replace(
+        "/reviews/metacritic/critic/games/example-game/web",
+        "/reviews/metacritic/critic/games/other-game/web",
+    );
+    let non_advancing = M015_CRITIC_SERVER_CLAMP.replace("offset=10&limit=10", "offset=0&limit=10");
+    let inconsistent_limit =
+        M015_CRITIC_SERVER_CLAMP.replace("offset=10&limit=10", "offset=10&limit=9");
+    let duplicate_offset =
+        M015_CRITIC_SERVER_CLAMP.replace("offset=10&limit=10", "offset=10&offset=10&limit=10");
+    let duplicate_limit =
+        M015_CRITIC_SERVER_CLAMP.replace("offset=10&limit=10", "offset=10&limit=10&limit=10");
+    let total_boundary =
+        M015_CRITIC_SERVER_CLAMP.replace("\"totalResults\": 12", "\"totalResults\": 10");
+    let requested_limit_bypass = M015_CRITIC_SERVER_CLAMP
+        .replace("\"totalResults\": 12", "\"totalResults\": 30")
+        .replace("offset=10&limit=10", "offset=20&limit=20");
+    let item_count_mismatch = M015_CRITIC_SERVER_CLAMP.replace(
+        "      { \"id\": \"synthetic-clamp-10\", \"score\": 0, \"quote\": null }",
+        "      { \"id\": \"synthetic-clamp-10\", \"score\": 0, \"quote\": null },\n      { \"id\": \"synthetic-clamp-11\", \"score\": 0, \"quote\": null }",
+    );
+
+    for body in [
+        host_mismatch.as_str(),
+        scheme_mismatch.as_str(),
+        path_mismatch.as_str(),
+        non_advancing.as_str(),
+        inconsistent_limit.as_str(),
+        duplicate_offset.as_str(),
+        duplicate_limit.as_str(),
+        total_boundary.as_str(),
+        requested_limit_bypass.as_str(),
+        item_count_mismatch.as_str(),
+    ] {
+        assert!(matches!(
+            parse_review_page(ReviewKind::Critic, "example-game", 0, 20, body),
+            Err(SourceError::InvalidContinuation)
+        ));
+    }
+
+    let user_path = M015_CRITIC_SERVER_CLAMP.replace("/critic/", "/user/");
+    assert!(matches!(
+        parse_review_page(ReviewKind::User, "example-game", 0, 20, &user_path),
+        Err(SourceError::InvalidContinuation)
+    ));
+    assert!(matches!(
+        parse_review_page(
+            ReviewKind::Critic,
+            "example-game",
+            u32::MAX,
+            20,
+            M015_CRITIC_SERVER_CLAMP,
+        ),
+        Err(SourceError::InvalidContinuation)
+    ));
 }
 
 #[test]

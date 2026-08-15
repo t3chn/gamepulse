@@ -152,6 +152,18 @@ M011's offline fixture vertical requests only `offset=0` with `limit=20` for
 each kind and never follows a review continuation. It maps bounded synthetic
 excerpt fields as untrusted input; critic and user data must not be combined.
 
+The critic endpoint has one first-page compatibility rule for the observed
+backend clamp. When that exact M011 critic request returns fewer than 20 parsed
+items, its continuation is accepted only when the continuation remains on the
+exact critic backend path and establishes one effective page size: it has one
+positive `limit` smaller than 20, its `offset` equals the requested offset plus
+that limit, and that limit equals the parsed-item count. The normal host,
+scheme, duplicate-query-key, arithmetic-overflow, and `totalResults` boundary
+checks still apply. Thus an `offset=0&limit=20` request with ten parsed items
+and `totalResults=12` can accept only `offset=10&limit=10`. This exception does
+not apply to finder/list continuations, user reviews, later critic pages, or a
+review continuation that M011 would follow.
+
 ## Remaining risks
 
 - The backend is a public site implementation, not a versioned public API.
