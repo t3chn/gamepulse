@@ -268,11 +268,29 @@ source handlers and separate SQLite adapters; the dispatcher alone continues
 to settle all claims. Deterministic fixtures cover the full scheduler-to-reopen
 path, the duplicate-conflict rollback, and malformed, source, mapping, and
 store failure settlement without partial snapshots. Reviews, summaries,
-runs/run items, web behavior, media, LLM behavior, live source requests, and
-deployment remain unimplemented. Passing CI proves the bounded workspace
+runs/run_items, media, LLM behavior, live source requests, and deployment remain
+unimplemented.
+
+M010 adds an application-owned catalogue read port and read models over the
+M008/M009 snapshot tables. The SQLite adapter performs deterministic
+case-insensitive title search, platform filtering, and rating sorting: a
+selected platform uses that platform's Metascore, while an unfiltered catalogue
+uses each game's maximum Metascore; explicit score-null, title, and identity
+tie-breakers keep the result stable. A stored detail reads platform scores,
+developers, the original cover descriptor, and video link without manufacturing
+source URLs. Since this snapshot schema has no genres, similar games are
+selected only from SQLite rows that share a persisted platform or developer;
+shared-count ordering falls back to source-product identity. `gamepulse-web`
+owns the Axum/Askama server-rendered `/games` and `/games/{id}` delivery
+adapter, while the binary injects a separate SQLite read connection and binds
+the embedded server in the same process as the unchanged runtime. Fixture tests
+seed snapshots through the accepted upsert boundary and never open a listener.
+
+Passing CI proves the bounded workspace
 claims and deterministic canary, policy, state-adapter, queue, M006 runtime,
 M007 discovery handler, M008 snapshot foundation, and M009 offline vertical; it
-does not prove complete product behavior or complete architecture conformance.
+also proves M010's deterministic offline catalogue fixtures. It does not prove
+complete product behavior or complete architecture conformance.
 M006's scheduler identity, dispatcher-capacity, and stale-completion branches
 have focused mutation evidence; M009's three allowed manual mutation attempts
 were exhausted before the correction pass, which adds no further mutation run.

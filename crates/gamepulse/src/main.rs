@@ -8,7 +8,8 @@ use gamepulse_application::{
     HourlyJobSchedule, JobHandler, JobHandlerRegistry, RuntimeJobType, SourceIngestionJobSchedule,
 };
 use gamepulse_storage_sqlite::{
-    SqliteDailyCrawlStateStore, SqliteGameSnapshotStore, SqliteJobStore,
+    SqliteDailyCrawlStateStore, SqliteGameCatalogueReadStore, SqliteGameSnapshotStore,
+    SqliteJobStore,
 };
 use gamepulse_worker_source::{
     HourlyDiscoveryHandler, MetacriticCanaryClient, MetacriticDailyCrawlSource,
@@ -32,6 +33,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &database_path,
     )?));
     let game_snapshots = Arc::new(Mutex::new(SqliteGameSnapshotStore::open(&database_path)?));
+    let catalogue = Arc::new(Mutex::new(SqliteGameCatalogueReadStore::open(
+        &database_path,
+    )?));
     let source_client = MetacriticCanaryClient::new()?;
     let source_port = MetacriticDailyCrawlSource::new(source_client.clone());
     let schedule = HourlyJobSchedule::new(RuntimeJobType::SourceHourlyDiscovery, 3)?;
@@ -51,11 +55,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ingestion_handler,
     ])?);
     let mut runtime = Runtime::new(store, Arc::new(SystemRuntimeClock), config, handlers);
-
-    runtime
-        .run_until_shutdown(async {
+    let http_address =
+        std::env::var("GAMEPULSE_HTTP_ADDRESS").unwrap_or_else(|_| "127.0.0.1:3000".to_owned());
+    let listener = tokio::net::TcpListener::bind(&http_address).await?;
+    let web_server = axum::serve(listener, gamepulse_web::catalogue_router(catalogue))
+        .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+        });
+
+    let runtime_result = async {
+        runtime
+            .run_until_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+    };
+    let web_result = async {
+        web_server
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+    };
+    tokio::try_join!(runtime_result, web_result)?;
     Ok(())
 }

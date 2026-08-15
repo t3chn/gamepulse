@@ -26,6 +26,341 @@ pub trait GameSnapshotStore {
     fn upsert_snapshot(&mut self, snapshot: &GameSnapshot) -> Result<(), Self::Error>;
 }
 
+/// The compact fields rendered on a catalogue card.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogueGameCard {
+    source_product_id: SourceProductId,
+    title: String,
+    highest_metascore: Option<u8>,
+    platforms: Vec<String>,
+    developers: Vec<String>,
+}
+
+impl CatalogueGameCard {
+    pub fn new(
+        source_product_id: SourceProductId,
+        title: impl Into<String>,
+        highest_metascore: Option<u8>,
+        platforms: Vec<String>,
+        developers: Vec<String>,
+    ) -> Self {
+        Self {
+            source_product_id,
+            title: title.into(),
+            highest_metascore,
+            platforms,
+            developers,
+        }
+    }
+
+    pub const fn source_product_id(&self) -> SourceProductId {
+        self.source_product_id
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub const fn highest_metascore(&self) -> Option<u8> {
+        self.highest_metascore
+    }
+
+    pub fn platforms(&self) -> &[String] {
+        &self.platforms
+    }
+
+    pub fn developers(&self) -> &[String] {
+        &self.developers
+    }
+}
+
+/// One persisted platform score displayed on a catalogue detail page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CataloguePlatformScore {
+    source_platform_id: u64,
+    source_slug: String,
+    metascore: Option<u8>,
+    userscore: Option<f64>,
+}
+
+impl CataloguePlatformScore {
+    pub fn new(
+        source_platform_id: u64,
+        source_slug: impl Into<String>,
+        metascore: Option<u8>,
+        userscore: Option<f64>,
+    ) -> Self {
+        Self {
+            source_platform_id,
+            source_slug: source_slug.into(),
+            metascore,
+            userscore,
+        }
+    }
+
+    pub const fn source_platform_id(&self) -> u64 {
+        self.source_platform_id
+    }
+
+    pub fn source_slug(&self) -> &str {
+        &self.source_slug
+    }
+
+    pub const fn metascore(&self) -> Option<u8> {
+        self.metascore
+    }
+
+    pub const fn userscore(&self) -> Option<f64> {
+        self.userscore
+    }
+}
+
+/// The stored cover descriptor rendered as source metadata, never as a fabricated URL.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogueCoverDescriptor {
+    bucket_path: String,
+    bucket_type: String,
+    filename: String,
+    kind: String,
+}
+
+impl CatalogueCoverDescriptor {
+    pub fn new(
+        bucket_path: impl Into<String>,
+        bucket_type: impl Into<String>,
+        filename: impl Into<String>,
+        kind: impl Into<String>,
+    ) -> Self {
+        Self {
+            bucket_path: bucket_path.into(),
+            bucket_type: bucket_type.into(),
+            filename: filename.into(),
+            kind: kind.into(),
+        }
+    }
+
+    pub fn bucket_path(&self) -> &str {
+        &self.bucket_path
+    }
+
+    pub fn bucket_type(&self) -> &str {
+        &self.bucket_type
+    }
+
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+}
+
+/// One stored candidate selected from the SQLite-only similarity fallback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimilarCatalogueGame {
+    source_product_id: SourceProductId,
+    title: String,
+}
+
+impl SimilarCatalogueGame {
+    pub fn new(source_product_id: SourceProductId, title: impl Into<String>) -> Self {
+        Self {
+            source_product_id,
+            title: title.into(),
+        }
+    }
+
+    pub const fn source_product_id(&self) -> SourceProductId {
+        self.source_product_id
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+}
+
+/// The complete stored representation needed by the server-rendered game page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CatalogueGameDetail {
+    source_product_id: SourceProductId,
+    source_slug: String,
+    title: String,
+    description: String,
+    cover: Option<CatalogueCoverDescriptor>,
+    video_url: Option<String>,
+    platform_scores: Vec<CataloguePlatformScore>,
+    developers: Vec<String>,
+    similar_games: Vec<SimilarCatalogueGame>,
+}
+
+impl CatalogueGameDetail {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        source_product_id: SourceProductId,
+        source_slug: impl Into<String>,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        cover: Option<CatalogueCoverDescriptor>,
+        video_url: Option<String>,
+        platform_scores: Vec<CataloguePlatformScore>,
+        developers: Vec<String>,
+        similar_games: Vec<SimilarCatalogueGame>,
+    ) -> Self {
+        Self {
+            source_product_id,
+            source_slug: source_slug.into(),
+            title: title.into(),
+            description: description.into(),
+            cover,
+            video_url,
+            platform_scores,
+            developers,
+            similar_games,
+        }
+    }
+
+    pub const fn source_product_id(&self) -> SourceProductId {
+        self.source_product_id
+    }
+
+    pub fn source_slug(&self) -> &str {
+        &self.source_slug
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn cover(&self) -> Option<&CatalogueCoverDescriptor> {
+        self.cover.as_ref()
+    }
+
+    pub fn video_url(&self) -> Option<&str> {
+        self.video_url.as_deref()
+    }
+
+    pub fn platform_scores(&self) -> &[CataloguePlatformScore] {
+        &self.platform_scores
+    }
+
+    pub fn developers(&self) -> &[String] {
+        &self.developers
+    }
+
+    pub fn similar_games(&self) -> &[SimilarCatalogueGame] {
+        &self.similar_games
+    }
+}
+
+/// The title and platform filters for the always-rating-sorted catalogue.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CatalogueQuery {
+    title_search: Option<String>,
+    platform_slug: Option<String>,
+}
+
+impl CatalogueQuery {
+    pub fn new(title_search: Option<String>, platform_slug: Option<String>) -> Self {
+        Self {
+            title_search: normalize_catalogue_filter(title_search),
+            platform_slug: normalize_catalogue_filter(platform_slug),
+        }
+    }
+
+    pub fn title_search(&self) -> Option<&str> {
+        self.title_search.as_deref()
+    }
+
+    pub fn platform_slug(&self) -> Option<&str> {
+        self.platform_slug.as_deref()
+    }
+}
+
+fn normalize_catalogue_filter(value: Option<String>) -> Option<String> {
+    value.and_then(|value| (!value.trim().is_empty()).then_some(value))
+}
+
+/// The persisted platform values available as catalogue filters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CataloguePlatformFilter {
+    source_slug: String,
+}
+
+impl CataloguePlatformFilter {
+    pub fn new(source_slug: impl Into<String>) -> Self {
+        Self {
+            source_slug: source_slug.into(),
+        }
+    }
+
+    pub fn source_slug(&self) -> &str {
+        &self.source_slug
+    }
+}
+
+/// The complete data required to render one catalogue response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CataloguePage {
+    games: Vec<CatalogueGameCard>,
+    platform_filters: Vec<CataloguePlatformFilter>,
+}
+
+impl CataloguePage {
+    pub fn new(
+        games: Vec<CatalogueGameCard>,
+        platform_filters: Vec<CataloguePlatformFilter>,
+    ) -> Self {
+        Self {
+            games,
+            platform_filters,
+        }
+    }
+
+    pub fn games(&self) -> &[CatalogueGameCard] {
+        &self.games
+    }
+
+    pub fn platform_filters(&self) -> &[CataloguePlatformFilter] {
+        &self.platform_filters
+    }
+}
+
+/// Application-owned read boundary over durable game snapshots.
+pub trait GameCatalogueReadPort {
+    type Error;
+
+    fn list_catalogue(&mut self, query: &CatalogueQuery) -> Result<CataloguePage, Self::Error>;
+
+    fn game_detail(
+        &mut self,
+        source_product_id: SourceProductId,
+    ) -> Result<Option<CatalogueGameDetail>, Self::Error>;
+}
+
+/// Read one deterministic catalogue page through the application-owned port.
+pub fn load_catalogue<P>(port: &mut P, query: &CatalogueQuery) -> Result<CataloguePage, P::Error>
+where
+    P: GameCatalogueReadPort,
+{
+    port.list_catalogue(query)
+}
+
+/// Read one persisted game detail through the application-owned port.
+pub fn load_catalogue_game<P>(
+    port: &mut P,
+    source_product_id: SourceProductId,
+) -> Result<Option<CatalogueGameDetail>, P::Error>
+where
+    P: GameCatalogueReadPort,
+{
+    port.game_detail(source_product_id)
+}
+
 /// Persist one previously validated inner snapshot through the application-owned boundary.
 pub fn upsert_game_snapshot<S>(store: &mut S, snapshot: &GameSnapshot) -> Result<(), S::Error>
 where

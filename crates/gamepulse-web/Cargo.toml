@@ -7,6 +7,8 @@ publish = false
 description = "Server-rendered web delivery adapter for GamePulse"
 
 [dependencies]
+askama.workspace = true
+axum.workspace = true
 gamepulse-application.workspace = true
 gamepulse-domain.workspace = true
 

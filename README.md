@@ -22,8 +22,15 @@ discovery handler: the exact durable hourly reference derives a UTC crawl day,
 the adapter requests New Releases first and newest-first browse later, and the
 existing SQLite daily-crawl commit succeeds before the durable job does.
 Fixture-only tests cover those paths; they do not call the public source.
-Game/detail/review ingestion and persistence, summaries, the web UI, media,
-LLM, and deployment remain unimplemented.
+M008 adds the offline game-snapshot foundation and atomic SQLite replacement
+write for game, platform-score, developer, cover-descriptor, and video-link
+data. M009 derives one durable source-ingestion job per selected candidate and
+wires the bounded offline scheduler-to-snapshot vertical with fixture-only
+coverage. M010 adds the embedded, server-rendered catalogue at `/games` and
+`/games/{id}`: it reads only persisted SQLite snapshots, supports
+case-insensitive title search, platform filtering, rating sorting, and
+SQLite-only similar-game links. Review persistence and summaries, runs/run_items,
+SSE, media, LLM, and deployment remain unimplemented.
 
 ## Baseline architecture
 
@@ -54,6 +61,11 @@ mise run architecture
 mise run ci
 cargo run --locked -p gamepulse
 ```
+
+The composed binary serves the catalogue on `127.0.0.1:3000` by default; set
+`GAMEPULSE_HTTP_ADDRESS` to an explicit bind address when needed. It reads the
+SQLite path selected by `GAMEPULSE_DATABASE_PATH` and never fetches catalogue
+data on a page request.
 
 `mise run ci` checks formatting, Clippy with warnings denied, and all current
 tests. The architecture task verifies the exact declared internal Cargo graph
