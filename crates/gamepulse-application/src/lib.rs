@@ -82,6 +82,21 @@ pub trait DailyCrawlSourcePort {
     fn discover(&mut self, request: CrawlDiscoveryRequest) -> Result<DiscoveryPage, Self::Error>;
 }
 
+/// The asynchronous source-worker boundary for an hourly discovery attempt.
+///
+/// The application owns request selection and durable commit policy. Outer source adapters own
+/// request execution, source-native parsing, and mapping into `DiscoveryPage`; this future is
+/// intentionally expressed with `std::future::Future` so the application remains independent of
+/// a particular async runtime.
+pub trait AsyncDailyCrawlSourcePort: Send + Sync {
+    type Error;
+    type DiscoverFuture<'a>: Future<Output = Result<DiscoveryPage, Self::Error>> + Send + 'a
+    where
+        Self: 'a;
+
+    fn discover(&self, request: CrawlDiscoveryRequest) -> Self::DiscoverFuture<'_>;
+}
+
 /// The sole persistence boundary for this milestone.
 ///
 /// `commit` must make the next daily state and its selected candidates visible together, or make
@@ -224,6 +239,53 @@ where
         .map_err(DailyCrawlError::InvalidCommit)?;
 
     state_port.commit(commit).map_err(DailyCrawlError::Commit)?;
+
+    Ok(DailyCrawlOutcome::Selected(DailyCrawlSelection {
+        request,
+        selected,
+        state,
+    }))
+}
+
+/// Plan, asynchronously discover, select, and atomically publish one daily-crawl transition.
+///
+/// `load_state` completes before the source future is created, and `commit_state` runs only after
+/// that future resolves. A worker can therefore acquire its SQLite mutex separately for load and
+/// commit, without holding a lock or transaction across the awaited source request.
+pub async fn execute_async_daily_crawl<L, C, D, StateError>(
+    load_state: L,
+    source_port: &D,
+    commit_state: C,
+    day: CrawlDayKey,
+) -> Result<DailyCrawlOutcome, DailyCrawlError<StateError, D::Error>>
+where
+    L: FnOnce(&CrawlDayKey) -> Result<Option<DailyCrawlState>, StateError>,
+    C: FnOnce(DailyCrawlCommit) -> Result<(), StateError>,
+    D: AsyncDailyCrawlSourcePort,
+{
+    let expected_previous_state = load_state(&day).map_err(DailyCrawlError::Load)?;
+    let discovery = match prepare_daily_crawl(day, expected_previous_state.clone()) {
+        DailyCrawlAction::Discover(discovery) => discovery,
+        DailyCrawlAction::Exhausted(state) => return Ok(DailyCrawlOutcome::Exhausted(state)),
+    };
+    let request = discovery.request();
+    let page = source_port
+        .discover(request)
+        .await
+        .map_err(DailyCrawlError::Source)?;
+    let transition = select_daily_crawl(
+        discovery,
+        page.candidates()
+            .iter()
+            .map(DiscoveryCandidate::source_product_id),
+        page.next_browse_cursor(),
+    );
+    let selected = selected_candidates(&page, &transition);
+    let state = transition.next_state().clone();
+    let commit = DailyCrawlCommit::new(expected_previous_state, state.clone(), selected.clone())
+        .map_err(DailyCrawlError::InvalidCommit)?;
+
+    commit_state(commit).map_err(DailyCrawlError::Commit)?;
 
     Ok(DailyCrawlOutcome::Selected(DailyCrawlSelection {
         request,

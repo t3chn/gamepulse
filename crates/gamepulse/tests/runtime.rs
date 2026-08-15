@@ -14,7 +14,6 @@ use gamepulse_application::{
     JobTimestamp, RuntimeJobType, TypedJob,
 };
 use gamepulse_storage_sqlite::SqliteJobStore;
-use gamepulse_worker_source::HourlyDiscoveryPlaceholderHandler;
 use runtime::{
     Runtime, RuntimeClock, RuntimeClockError, RuntimeConfig, RuntimeTaskOutcome, SchedulerOutcome,
 };
@@ -418,16 +417,16 @@ async fn configured_concurrency_is_never_exceeded() {
 }
 
 #[tokio::test]
-async fn unsupported_and_placeholder_routing_cannot_report_source_ingestion_success() {
+async fn unsupported_and_failing_handler_routing_cannot_report_source_discovery_success() {
     let store = store();
     enqueue(&store, "unsupported-job", "unsupported.job-type", 1);
     let clock = Arc::new(ManualClock::new(7_200));
-    let placeholder: Arc<dyn JobHandler> = Arc::new(HourlyDiscoveryPlaceholderHandler);
+    let failing_handler: Arc<dyn JobHandler> = Arc::new(ImmediateHandler::fails());
     let mut runtime = Runtime::new(
         store.clone(),
         clock,
         config(1, 1, 30),
-        registry(placeholder),
+        registry(failing_handler),
     );
     runtime.schedule_hourly().expect("job must schedule");
 
@@ -436,7 +435,7 @@ async fn unsupported_and_placeholder_routing_cannot_report_source_ingestion_succ
         runtime
             .join_all()
             .await
-            .expect("placeholder task must join")
+            .expect("failing handler task must join")
             .settled,
         [RuntimeTaskOutcome::Failed(JobFailureResult::Failed)]
     );
@@ -445,7 +444,7 @@ async fn unsupported_and_placeholder_routing_cannot_report_source_ingestion_succ
         runtime
             .join_all()
             .await
-            .expect("placeholder task must join")
+            .expect("failing handler task must join")
             .settled,
         [RuntimeTaskOutcome::Failed(JobFailureResult::Failed)]
     );

@@ -3,6 +3,9 @@
 //! Direct-HTTP Metacritic source contract canary.
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -11,8 +14,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use gamepulse_application::{
+    AsyncDailyCrawlSourcePort, CrawlDayKey, CrawlDiscoveryRequest, DailyCrawlStatePort,
     DiscoveryCandidate, DiscoveryPage, JobHandler, JobHandlerFailure, JobHandlerFuture,
-    JobHandlerResult, RuntimeJobType, TypedJob,
+    JobHandlerResult, RuntimeJobType, TypedJob, execute_async_daily_crawl,
 };
 use gamepulse_domain::BrowseCursor;
 
@@ -21,23 +25,148 @@ const NEW_RELEASES_LIST_LIMIT: u32 = 20;
 const NEWEST_BROWSE_LIST_LIMIT: u32 = 24;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
+const HOURLY_WORK_REFERENCE_PREFIX: &str = "hour-slot:";
+const HOURLY_SCHEDULE_SECONDS: u64 = 60 * 60;
+const HOURS_PER_UTC_DAY: u64 = 24;
+const MAX_SCHEDULED_HOUR_SLOT: u64 = (i64::MAX as u64) / HOURLY_SCHEDULE_SECONDS;
+const HOURLY_DISCOVERY_FAILURE: &str = "source hourly discovery failed";
 
-/// M006's deliberately bounded source-lane handler.
+/// Translate the exact durable hourly schedule reference into its UTC calendar day.
 ///
-/// It proves typed routing and durable retry behavior without fetching Metacritic
-/// or writing product data before the mandatory ingestion use case is adopted.
-pub struct HourlyDiscoveryPlaceholderHandler;
+/// This rejects anything that could not have been emitted by `HourlyJobSchedule`, never reads a
+/// local timezone or wall clock, and bounds the result to a four-digit `YYYY-MM-DD` day key.
+pub fn crawl_day_key_from_hourly_work_reference(
+    work_reference: &str,
+) -> Result<CrawlDayKey, HourlyWorkReferenceError> {
+    let hour_slot = work_reference
+        .strip_prefix(HOURLY_WORK_REFERENCE_PREFIX)
+        .ok_or(HourlyWorkReferenceError::Malformed)?;
+    if hour_slot.is_empty()
+        || !hour_slot.bytes().all(|byte| byte.is_ascii_digit())
+        || (hour_slot.len() > 1 && hour_slot.starts_with('0'))
+    {
+        return Err(HourlyWorkReferenceError::Malformed);
+    }
+    let hour_slot = hour_slot
+        .parse::<u64>()
+        .map_err(|_| HourlyWorkReferenceError::Overflow)?;
+    if hour_slot > MAX_SCHEDULED_HOUR_SLOT {
+        return Err(HourlyWorkReferenceError::Overflow);
+    }
 
-impl JobHandler for HourlyDiscoveryPlaceholderHandler {
+    let days_since_epoch = hour_slot / HOURS_PER_UTC_DAY;
+    let (year, month, day) = civil_date_from_unix_days(days_since_epoch as i64);
+    if !(0..=9_999).contains(&year) {
+        return Err(HourlyWorkReferenceError::OutOfRange);
+    }
+
+    CrawlDayKey::new(format!("{year:04}-{month:02}-{day:02}"))
+        .map_err(|_| HourlyWorkReferenceError::OutOfRange)
+}
+
+/// Validation errors for the one durable hourly work-reference shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HourlyWorkReferenceError {
+    Malformed,
+    Overflow,
+    OutOfRange,
+}
+
+impl fmt::Display for HourlyWorkReferenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Malformed => formatter.write_str("hourly work reference is malformed"),
+            Self::Overflow => formatter.write_str("hourly work reference overflows"),
+            Self::OutOfRange => formatter.write_str("hourly work reference is out of range"),
+        }
+    }
+}
+
+impl std::error::Error for HourlyWorkReferenceError {}
+
+/// Convert a non-negative count of UTC days since 1970-01-01 to the proleptic Gregorian date.
+/// The arithmetic is integer-only and does not consult a clock, locale, or operating-system zone.
+fn civil_date_from_unix_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let shifted = days_since_epoch + 719_468;
+    let era = shifted / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    (year, month as u32, day as u32)
+}
+
+/// M007's source-lane handler for one durable hourly discovery attempt.
+///
+/// It owns only source-side invocation. The application owns selection and commit policy; the
+/// SQLite-backed state port is acquired separately before and after the awaited source request.
+pub struct HourlyDiscoveryHandler<S, T> {
+    state_port: Arc<Mutex<S>>,
+    source_port: Arc<T>,
+}
+
+impl<S, T> HourlyDiscoveryHandler<S, T> {
+    pub fn new(state_port: Arc<Mutex<S>>, source_port: T) -> Self {
+        Self {
+            state_port,
+            source_port: Arc::new(source_port),
+        }
+    }
+}
+
+enum HourlyStateAccessError<E> {
+    Poisoned,
+    Port(E),
+}
+
+impl<S, T> JobHandler for HourlyDiscoveryHandler<S, T>
+where
+    S: DailyCrawlStatePort + Send + 'static,
+    S::Error: Send + 'static,
+    T: AsyncDailyCrawlSourcePort + Send + Sync + 'static,
+    T::Error: Send + 'static,
+{
     fn job_type(&self) -> RuntimeJobType {
         RuntimeJobType::SourceHourlyDiscovery
     }
 
-    fn handle(&self, _job: TypedJob) -> JobHandlerFuture {
-        Box::pin(async {
-            JobHandlerResult::Failed(JobHandlerFailure::new(
-                "source hourly discovery is not implemented in M006",
-            ))
+    fn handle(&self, job: TypedJob) -> JobHandlerFuture {
+        let state_for_load = Arc::clone(&self.state_port);
+        let state_for_commit = Arc::clone(&self.state_port);
+        let source_port = Arc::clone(&self.source_port);
+        Box::pin(async move {
+            let Ok(day) = crawl_day_key_from_hourly_work_reference(job.work_ref()) else {
+                return JobHandlerResult::Failed(JobHandlerFailure::new(HOURLY_DISCOVERY_FAILURE));
+            };
+            let outcome = execute_async_daily_crawl(
+                move |day| {
+                    let mut state = state_for_load
+                        .lock()
+                        .map_err(|_| HourlyStateAccessError::Poisoned)?;
+                    state.load(day).map_err(HourlyStateAccessError::Port)
+                },
+                source_port.as_ref(),
+                move |commit| {
+                    let mut state = state_for_commit
+                        .lock()
+                        .map_err(|_| HourlyStateAccessError::Poisoned)?;
+                    state.commit(commit).map_err(HourlyStateAccessError::Port)
+                },
+                day,
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => JobHandlerResult::Succeeded,
+                Err(_) => {
+                    JobHandlerResult::Failed(JobHandlerFailure::new(HOURLY_DISCOVERY_FAILURE))
+                }
+            }
         })
     }
 }
@@ -146,6 +275,94 @@ pub fn map_listing_page_for_daily_crawl(
     ))
 }
 
+/// Transport boundary for one source-native listing response.
+///
+/// The M007 adapter supplies mode, offset, and contract limit. Implementations perform only the
+/// bounded direct-HTTP exchange (or a deterministic fixture exchange in tests) and return the
+/// untrusted response body for the source adapter to parse.
+pub trait ListingTransport: Send + Sync {
+    type Error;
+    type FetchFuture<'a>: Future<Output = Result<String, Self::Error>> + Send + 'a
+    where
+        Self: 'a;
+
+    fn fetch_listing(&self, mode: ListMode, offset: u32, limit: u32) -> Self::FetchFuture<'_>;
+}
+
+/// The source-worker adapter from application discovery requests to Metacritic list requests.
+///
+/// It preserves the source contract's `New Releases`-first and newest-first browse modes, parses
+/// only in the source lane, and maps the result into the application-owned `DiscoveryPage`.
+pub struct MetacriticDailyCrawlSource<T> {
+    transport: T,
+}
+
+impl<T> MetacriticDailyCrawlSource<T> {
+    pub fn new(transport: T) -> Self {
+        Self { transport }
+    }
+}
+
+impl<T> AsyncDailyCrawlSourcePort for MetacriticDailyCrawlSource<T>
+where
+    T: ListingTransport,
+    T::Error: Send,
+{
+    type Error = DailyCrawlSourceError<T::Error>;
+    type DiscoverFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<DiscoveryPage, Self::Error>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn discover(&self, request: CrawlDiscoveryRequest) -> Self::DiscoverFuture<'_> {
+        Box::pin(async move {
+            let (mode, offset, limit) = match request {
+                CrawlDiscoveryRequest::NewReleases => {
+                    (ListMode::NewReleases, 0, NEW_RELEASES_LIST_LIMIT)
+                }
+                CrawlDiscoveryRequest::NewestBrowse { cursor } => {
+                    let offset = cursor
+                        .map(BrowseCursor::value)
+                        .unwrap_or(0)
+                        .try_into()
+                        .map_err(|_| DailyCrawlSourceError::CursorOutOfRange)?;
+                    (ListMode::NewestBrowse, offset, NEWEST_BROWSE_LIST_LIMIT)
+                }
+            };
+            let body = self
+                .transport
+                .fetch_listing(mode, offset, limit)
+                .await
+                .map_err(DailyCrawlSourceError::Transport)?;
+            let page = parse_listing_page(mode, offset, limit, &body)
+                .map_err(DailyCrawlSourceError::Parse)?;
+            map_listing_page_for_daily_crawl(&page).map_err(DailyCrawlSourceError::Mapping)
+        })
+    }
+}
+
+/// Source-lane errors before they are reduced to the handler's opaque failure signal.
+#[derive(Debug)]
+pub enum DailyCrawlSourceError<E> {
+    CursorOutOfRange,
+    Transport(E),
+    Parse(SourceError),
+    Mapping(DailyCrawlMappingError),
+}
+
+impl<E: fmt::Display> fmt::Display for DailyCrawlSourceError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CursorOutOfRange => formatter.write_str("browse cursor is outside source bounds"),
+            Self::Transport(error) => write!(formatter, "listing transport failed: {error}"),
+            Self::Parse(error) => write!(formatter, "listing parse failed: {error}"),
+            Self::Mapping(error) => write!(formatter, "listing mapping failed: {error}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for DailyCrawlSourceError<E> {}
+
 /// An image descriptor as supplied by the product endpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImageDescriptor {
@@ -250,13 +467,13 @@ impl MetacriticCanaryClient {
 
     /// Fetch the first daily `New Releases` selection with its verified limit of 20.
     pub async fn fetch_new_releases(&self) -> Result<ListingPage, SourceError> {
-        self.fetch_listing(ListMode::NewReleases, 0, NEW_RELEASES_LIST_LIMIT)
+        self.fetch_listing_page(ListMode::NewReleases, 0, NEW_RELEASES_LIST_LIMIT)
             .await
     }
 
     /// Fetch a later newest-first browse page at a caller-supplied source offset.
     pub async fn fetch_newest_browse_page(&self, offset: u32) -> Result<ListingPage, SourceError> {
-        self.fetch_listing(ListMode::NewestBrowse, offset, NEWEST_BROWSE_LIST_LIMIT)
+        self.fetch_listing_page(ListMode::NewestBrowse, offset, NEWEST_BROWSE_LIST_LIMIT)
             .await
     }
 
@@ -300,19 +517,28 @@ impl MetacriticCanaryClient {
         parse_review_page(kind, slug, offset, limit, &body)
     }
 
-    async fn fetch_listing(
+    async fn fetch_listing_page(
         &self,
         mode: ListMode,
         offset: u32,
         limit: u32,
     ) -> Result<ListingPage, SourceError> {
+        let body = self.fetch_listing_text(mode, offset, limit).await?;
+        parse_listing_page(mode, offset, limit, &body)
+    }
+
+    async fn fetch_listing_text(
+        &self,
+        mode: ListMode,
+        offset: u32,
+        limit: u32,
+    ) -> Result<String, SourceError> {
         if limit == 0 {
             return Err(SourceError::InvalidLimit);
         }
 
         let url = self.listing_url(mode, offset, limit);
-        let body = self.get_text(url).await?;
-        parse_listing_page(mode, offset, limit, &body)
+        self.get_text(url).await
     }
 
     fn endpoint(&self, segments: &[&str]) -> Url {
@@ -438,6 +664,18 @@ impl MetacriticCanaryClient {
             append_response_chunk(&mut body, chunk.as_ref())?;
         }
         decode_response_body(body)
+    }
+}
+
+impl ListingTransport for MetacriticCanaryClient {
+    type Error = SourceError;
+    type FetchFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<String, Self::Error>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn fetch_listing(&self, mode: ListMode, offset: u32, limit: u32) -> Self::FetchFuture<'_> {
+        Box::pin(async move { self.fetch_listing_text(mode, offset, limit).await })
     }
 }
 
@@ -1122,6 +1360,118 @@ struct RawReview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    const LISTING_FIXTURE: &str = include_str!("../tests/fixtures/listing-page.json");
+
+    struct FixtureListingTransport {
+        responses: Mutex<VecDeque<Result<String, std::convert::Infallible>>>,
+        calls: Mutex<Vec<(ListMode, u32, u32)>>,
+    }
+
+    impl FixtureListingTransport {
+        fn new(
+            responses: impl IntoIterator<Item = Result<String, std::convert::Infallible>>,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(ListMode, u32, u32)> {
+            self.calls
+                .lock()
+                .expect("fixture transport calls must not be poisoned")
+                .clone()
+        }
+    }
+
+    impl ListingTransport for FixtureListingTransport {
+        type Error = std::convert::Infallible;
+        type FetchFuture<'a>
+            = Pin<Box<dyn Future<Output = Result<String, Self::Error>> + Send + 'a>>
+        where
+            Self: 'a;
+
+        fn fetch_listing(&self, mode: ListMode, offset: u32, limit: u32) -> Self::FetchFuture<'_> {
+            self.calls
+                .lock()
+                .expect("fixture transport calls must not be poisoned")
+                .push((mode, offset, limit));
+            let response = self
+                .responses
+                .lock()
+                .expect("fixture transport responses must not be poisoned")
+                .pop_front()
+                .expect("fixture transport needs one response per call");
+            Box::pin(async move { response })
+        }
+    }
+
+    #[test]
+    fn hourly_work_references_map_to_utc_days_without_a_wall_clock() {
+        assert_eq!(
+            crawl_day_key_from_hourly_work_reference("hour-slot:0")
+                .expect("Unix epoch hour must be valid")
+                .as_str(),
+            "1970-01-01"
+        );
+        assert_eq!(
+            crawl_day_key_from_hourly_work_reference("hour-slot:24")
+                .expect("second UTC day must be valid")
+                .as_str(),
+            "1970-01-02"
+        );
+    }
+
+    #[test]
+    fn hourly_work_references_reject_non_schedule_shapes_overflow_and_out_of_range_days() {
+        assert_eq!(
+            crawl_day_key_from_hourly_work_reference("hour-slot:01"),
+            Err(HourlyWorkReferenceError::Malformed)
+        );
+        assert_eq!(
+            crawl_day_key_from_hourly_work_reference("hour-slot:2562047788015216"),
+            Err(HourlyWorkReferenceError::Overflow)
+        );
+        assert_eq!(
+            crawl_day_key_from_hourly_work_reference("hour-slot:100000000"),
+            Err(HourlyWorkReferenceError::OutOfRange)
+        );
+    }
+
+    #[tokio::test]
+    async fn m007_fixture_transport_maps_new_releases_then_newest_browse() {
+        let browse_fixture = LISTING_FIXTURE
+            .replace("\"totalResults\": 42", "\"totalResults\": 72")
+            .replace("offset=20&limit=20", "offset=48&limit=24");
+        let transport =
+            FixtureListingTransport::new([Ok(LISTING_FIXTURE.to_owned()), Ok(browse_fixture)]);
+        let source = MetacriticDailyCrawlSource::new(transport);
+
+        let first = source
+            .discover(CrawlDiscoveryRequest::NewReleases)
+            .await
+            .expect("fixture new releases must map");
+        let browse = source
+            .discover(CrawlDiscoveryRequest::NewestBrowse {
+                cursor: Some(BrowseCursor::new(24)),
+            })
+            .await
+            .expect("fixture newest browse must map");
+
+        assert_eq!(
+            source.transport.calls(),
+            [
+                (ListMode::NewReleases, 0, NEW_RELEASES_LIST_LIMIT),
+                (ListMode::NewestBrowse, 24, NEWEST_BROWSE_LIST_LIMIT),
+            ]
+        );
+        assert_eq!(first.candidates()[0].source_product_id().value(), 101);
+        assert_eq!(browse.next_browse_cursor(), Some(BrowseCursor::new(48)));
+    }
 
     #[test]
     fn request_urls_preserve_each_verified_contract() {

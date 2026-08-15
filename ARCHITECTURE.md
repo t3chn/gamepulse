@@ -203,39 +203,52 @@ prove complete architecture conformance and must not be reported as such.
 The repository contains the eight-package workspace harness, one compileable
 binary shell, a sabotage-tested Cargo graph gate, the bounded M002 direct-HTTP
 Metacritic source-contract canary in `gamepulse-worker-source`, M003's pure
-daily-crawl selection policy, M004's SQLite daily-crawl state adapter, and
-M005's durable job-queue foundation, and M006's bounded in-process runtime.
-M003 keeps day reset, numeric-ID
-uniqueness, source-order selection, the 20-item cap, replay of a partially
-consumed browse page, and explicit browse exhaustion in the domain; the
-application owns the discovery and atomic state-commit ports. M004 durably
-commits the per-day state and selected candidate slugs through that port. M005
-adds an application-owned `JobStore` port plus a SQLite adapter that durably
-deduplicates stable jobs, records claims and lease expiry, bounds attempts,
-fences claim tokens and clock transitions, rejects stale claim completion, and
-retains attempt history. M006 adds a Tokio task set in the binary process that
-derives durable hourly identities from a clock port, enqueues through `JobStore`,
-claims no more than its configured capacity, routes only the application-owned
-typed job kind, and joins started tasks after graceful shutdown stops future
-scheduling and claims. Completion and failure use the exact durable claim
-capability; stale or expired completion is not reported as current success.
-While accepting work, the production loop waits on task completion as well as
-the hourly timer and refills only capacity made available by a completed task;
-it does not poll or create an in-memory work queue. A biased shutdown branch
-prevents a ready shutdown signal from losing to the initial or later timer tick.
-The only currently wired source handler is an explicit deterministic placeholder:
-it makes no network request and writes no game, review, summary, or other
-product data, then takes the durable retry/terminal failure path. The source
-worker otherwise provides only a deterministic mapping from its parsed listing
-to the daily-crawl application contract and does not issue a request as part of
-M003 through M006.
+daily-crawl selection policy, M004's SQLite daily-crawl state adapter, M005's
+durable job-queue foundation, M006's bounded in-process runtime, and M007's
+hourly source-discovery handler. M003 keeps day reset, numeric-ID uniqueness,
+source-order selection, the 20-item cap, replay of a partially consumed browse
+page, and explicit browse exhaustion in the domain; the application owns the
+discovery and atomic state-commit ports. M004 durably commits the per-day state
+and selected candidate slugs through that port. M005 adds an application-owned
+`JobStore` port plus a SQLite adapter that durably deduplicates stable jobs,
+records claims and lease expiry, bounds attempts, fences claim tokens and clock
+transitions, rejects stale claim completion, and retains attempt history. M006
+adds a Tokio task set in the binary process that derives durable hourly
+identities from a clock port, enqueues through `JobStore`, claims no more than
+its configured capacity, routes only the application-owned typed job kind, and
+joins started tasks after graceful shutdown stops future scheduling and claims.
+Completion and failure use the exact durable claim capability; stale or expired
+completion is not reported as current success. While accepting work, the
+production loop waits on task completion as well as the hourly timer and refills
+only capacity made available by a completed task; it does not poll or create an
+in-memory work queue. A biased shutdown branch prevents a ready shutdown signal
+from losing to the initial or later timer tick.
 
-Metacritic ingestion, game and review persistence, summaries, web behavior,
-media, LLM behavior, and deployment remain unimplemented. Passing CI proves the
-bounded workspace claims and deterministic canary, policy, state-adapter,
-queue, and M006 runtime tests, not complete product behavior or complete
-architecture conformance. M006's scheduler identity, dispatcher-capacity, and
-stale-completion branches have focused mutation evidence.
+M007 replaces the production placeholder with a source-lane handler that accepts
+only M006's `hour-slot:<canonical decimal>` durable work reference and derives a
+bounded UTC `YYYY-MM-DD` crawl key without consulting a local timezone or wall
+clock. The application exposes an async source port without a Tokio dependency;
+the worker adapter maps its requests to the M002 direct-HTTP list contract,
+using New Releases first and the newest-first browse cursor thereafter, then
+parses and maps untrusted list data into the existing M003 policy. The binary
+alone injects the source adapter and SQLite daily-crawl port. The handler takes
+the SQLite mutex separately for state load and atomic commit, never across the
+awaited source request. It reports success only after the daily-crawl commit;
+malformed references and source, mapping, validation, load, or commit errors
+become the existing opaque handler failure so the durable queue alone retains
+retry, terminal, claim, and lease ownership. Focused fixture transport tests
+cover request mapping and a runtime integration covers durable settlement and
+SQLite reopen. They do not call the public source.
+
+M007 does not fetch game details or persist games, platforms, scores,
+developers, descriptions, trailers, reviews, review summaries, similar games,
+or web data. Game/review ingestion, summaries, web behavior, media, LLM
+behavior, and deployment remain unimplemented. Passing CI proves the bounded
+workspace claims and deterministic canary, policy, state-adapter, queue, M006
+runtime, and M007 discovery-handler tests, not complete product behavior or
+complete architecture conformance. M006's scheduler identity,
+dispatcher-capacity, and stale-completion branches have focused mutation
+evidence.
 
 M003 requires targeted mutation testing because it introduces daily
 deduplication, crawl progression, and selection policy.

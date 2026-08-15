@@ -16,10 +16,14 @@ boundary. M005 implements the application-owned durable job queue contract and
 its SQLite adapter: stable job deduplication, explicit claims and leases,
 bounded retries, terminal states, stale-claim rejection, reopen persistence,
 execution-attempt history, monotonic clock transitions, and non-reusable claim
-tokens.
-Scheduler and timer execution, queue dispatch and worker handlers, durable
-ingestion, all remaining application persistence, summaries, the web UI, media,
-LLM, and deployment are not implemented yet.
+tokens. M006 adds the bounded in-process hourly scheduler, durable dispatcher,
+and typed handler lifecycle. M007 replaces its source placeholder with an async
+discovery handler: the exact durable hourly reference derives a UTC crawl day,
+the adapter requests New Releases first and newest-first browse later, and the
+existing SQLite daily-crawl commit succeeds before the durable job does.
+Fixture-only tests cover those paths; they do not call the public source.
+Game/detail/review ingestion and persistence, summaries, the web UI, media,
+LLM, and deployment remain unimplemented.
 
 ## Baseline architecture
 
