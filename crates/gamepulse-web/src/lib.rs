@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Server-rendered HTTP, SSE, and embedded UI adapter.
+//! Server-rendered HTTP and embedded UI adapter.
 
 use std::sync::{Arc, Mutex};
 
@@ -12,7 +12,8 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use gamepulse_application::{
     CatalogueGameDetail, CataloguePage, CatalogueQuery, CatalogueReviewSummary,
-    GameCatalogueReadPort, SourceProductId, load_catalogue, load_catalogue_game,
+    GameCatalogueReadPort, ServiceReadinessPort, SourceProductId, load_catalogue,
+    load_catalogue_game,
 };
 
 const EMPTY_PLATFORMS: &str = "No stored platforms";
@@ -28,6 +29,84 @@ where
         .route("/games", get(list_games::<P>))
         .route("/games/{id}", get(show_game::<P>))
         .with_state(CatalogueState { catalogue })
+}
+
+/// Build the complete HTTP surface, including liveness and durable-store readiness.
+pub fn service_router<P, R>(catalogue: Arc<Mutex<P>>, readiness_probe: Arc<R>) -> Router
+where
+    P: GameCatalogueReadPort + Send + 'static,
+    P::Error: Send + 'static,
+    R: ServiceReadinessPort + 'static,
+    R::Error: Send + 'static,
+{
+    Router::new()
+        .route("/health/live", get(liveness))
+        .route("/health/ready", get(readiness::<R>))
+        .with_state(ReadinessState {
+            readiness: readiness_probe,
+        })
+        .merge(catalogue_router(catalogue))
+}
+
+/// Build the safe HTTP surface used while the configured durable store is unavailable.
+pub fn unavailable_service_router<R>(readiness_probe: Arc<R>) -> Router
+where
+    R: ServiceReadinessPort + 'static,
+    R::Error: Send + 'static,
+{
+    Router::new()
+        .route("/health/live", get(liveness))
+        .route("/health/ready", get(readiness::<R>))
+        .route("/games", get(database_unavailable))
+        .route("/games/{id}", get(database_unavailable))
+        .with_state(ReadinessState {
+            readiness: readiness_probe,
+        })
+}
+
+struct ReadinessState<R> {
+    readiness: Arc<R>,
+}
+
+impl<R> Clone for ReadinessState<R> {
+    fn clone(&self) -> Self {
+        Self {
+            readiness: Arc::clone(&self.readiness),
+        }
+    }
+}
+
+async fn liveness() -> Response {
+    liveness_response().await
+}
+
+/// Return liveness without touching SQLite, source adapters, or worker scheduling.
+pub async fn liveness_response() -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn readiness<R>(State(state): State<ReadinessState<R>>) -> Response
+where
+    R: ServiceReadinessPort + 'static,
+    R::Error: Send + 'static,
+{
+    readiness_response(&*state.readiness).await
+}
+
+/// Map the configured durable-store readiness port to an intentionally empty HTTP response.
+pub async fn readiness_response<R>(readiness: &R) -> Response
+where
+    R: ServiceReadinessPort,
+{
+    if readiness.check_readiness().is_ok() {
+        StatusCode::OK.into_response()
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    }
+}
+
+async fn database_unavailable() -> Response {
+    StatusCode::SERVICE_UNAVAILABLE.into_response()
 }
 
 struct CatalogueState<P> {

@@ -2,6 +2,8 @@
 
 mod runtime;
 
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use gamepulse_application::{
@@ -9,7 +11,7 @@ use gamepulse_application::{
     RuntimeJobTypeFilter, SourceIngestionJobSchedule,
 };
 use gamepulse_storage_sqlite::{
-    SqliteDailyCrawlStateStore, SqliteGameCatalogueReadStore, SqliteJobStore,
+    SqliteDailyCrawlStateStore, SqliteGameCatalogueReadStore, SqliteJobStore, SqliteReadinessProbe,
     SqliteReviewSummaryStore,
 };
 use gamepulse_worker_llm::{LocalExtractiveReviewSummarizer, ReviewSummaryHandler};
@@ -21,6 +23,72 @@ use gamepulse_worker_source::{
 use runtime::{Runtime, RuntimeConfig, SystemRuntimeClock};
 use tokio::sync::Notify;
 
+const DATABASE_PATH_ENV: &str = "GAMEPULSE_DATABASE_PATH";
+const HTTP_ADDRESS_ENV: &str = "GAMEPULSE_HTTP_ADDRESS";
+const SOURCE_WORK_ENABLED_ENV: &str = "GAMEPULSE_SOURCE_WORK_ENABLED";
+
+struct RuntimeEnvironment {
+    database_path: PathBuf,
+    http_address: SocketAddr,
+    source_work_enabled: bool,
+}
+
+struct RuntimeStorage {
+    store: Arc<Mutex<SqliteJobStore>>,
+    daily_crawl_state: Arc<Mutex<SqliteDailyCrawlStateStore>>,
+    review_summaries: Arc<Mutex<SqliteReviewSummaryStore>>,
+    catalogue: Arc<Mutex<SqliteGameCatalogueReadStore>>,
+}
+
+impl RuntimeStorage {
+    fn open(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        let path = path.as_ref();
+        Ok(Self {
+            store: Arc::new(Mutex::new(SqliteJobStore::open(path)?)),
+            daily_crawl_state: Arc::new(Mutex::new(SqliteDailyCrawlStateStore::open(path)?)),
+            review_summaries: Arc::new(Mutex::new(SqliteReviewSummaryStore::open(path)?)),
+            catalogue: Arc::new(Mutex::new(SqliteGameCatalogueReadStore::open(path)?)),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeEnvironmentError;
+
+impl std::fmt::Display for RuntimeEnvironmentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GamePulse environment configuration is invalid")
+    }
+}
+
+impl std::error::Error for RuntimeEnvironmentError {}
+
+impl RuntimeEnvironment {
+    fn load() -> Result<Self, RuntimeEnvironmentError> {
+        let database_path = std::env::var(DATABASE_PATH_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or(RuntimeEnvironmentError)?;
+        let http_address = std::env::var(HTTP_ADDRESS_ENV)
+            .ok()
+            .and_then(|value| value.parse::<SocketAddr>().ok())
+            .ok_or(RuntimeEnvironmentError)?;
+        let source_work_enabled = match std::env::var(SOURCE_WORK_ENABLED_ENV) {
+            Ok(value) if value == "true" => true,
+            Ok(value) if value == "false" => false,
+            Ok(_) | Err(std::env::VarError::NotUnicode(_)) => return Err(RuntimeEnvironmentError),
+            Err(std::env::VarError::NotPresent) => true,
+        };
+        Ok(Self {
+            database_path,
+            http_address,
+            source_work_enabled,
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if run().await.is_err() {
@@ -30,16 +98,12 @@ async fn main() {
 
 /// The composition root owns concrete SQLite, clock, scheduler, and source-lane wiring.
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let database_path =
-        std::env::var("GAMEPULSE_DATABASE_PATH").unwrap_or_else(|_| "gamepulse.sqlite3".to_owned());
-    let store = Arc::new(Mutex::new(SqliteJobStore::open(&database_path)?));
-    let daily_crawl_state = Arc::new(Mutex::new(SqliteDailyCrawlStateStore::open(
-        &database_path,
-    )?));
-    let review_summaries = Arc::new(Mutex::new(SqliteReviewSummaryStore::open(&database_path)?));
-    let catalogue = Arc::new(Mutex::new(SqliteGameCatalogueReadStore::open(
-        &database_path,
-    )?));
+    let environment = RuntimeEnvironment::load()?;
+    let readiness = Arc::new(SqliteReadinessProbe::new(&environment.database_path));
+    let storage = match RuntimeStorage::open(&environment.database_path) {
+        Ok(storage) => storage,
+        Err(_) => return serve_unready_http(environment.http_address, readiness).await,
+    };
     let source_client = MetacriticCanaryClient::new()?;
     let public_html_cover = PublicHtmlCoverEnricher::new(MetacriticPublicHtmlTransport::new()?);
     let source_port = MetacriticDailyCrawlSource::new(source_client.clone());
@@ -51,12 +115,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let llm_config = RuntimeConfig::worker_only("gamepulse-llm-runtime", 300, 1)?
         .with_claim_filter(RuntimeJobTypeFilter::llm_lane());
     let source_handler: Arc<dyn JobHandler> = Arc::new(HourlyDiscoveryHandler::new(
-        daily_crawl_state,
+        storage.daily_crawl_state,
         source_port,
         source_ingestion_schedule,
     ));
     let ingestion_handler: Arc<dyn JobHandler> = Arc::new(ReviewSourceIngestionHandler::new(
-        review_summaries.clone(),
+        storage.review_summaries.clone(),
         MetacriticGameReviewSource::with_public_cover_enricher(source_client, public_html_cover),
         review_summary_schedule,
     ));
@@ -65,40 +129,46 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ingestion_handler,
     ])?);
     let llm_handler: Arc<dyn JobHandler> = Arc::new(ReviewSummaryHandler::new(
-        review_summaries,
+        storage.review_summaries,
         LocalExtractiveReviewSummarizer,
     ));
     let llm_handlers = Arc::new(JobHandlerRegistry::new([llm_handler])?);
     let wakeup = Arc::new(Notify::new());
     let mut source_runtime = Runtime::new(
-        store.clone(),
+        storage.store.clone(),
         Arc::new(SystemRuntimeClock),
         source_config,
         source_handlers,
     )
     .with_wakeup(wakeup.clone());
     let mut llm_runtime = Runtime::new(
-        store,
+        storage.store,
         Arc::new(SystemRuntimeClock),
         llm_config,
         llm_handlers,
     )
     .with_wakeup(wakeup.clone());
-    let http_address =
-        std::env::var("GAMEPULSE_HTTP_ADDRESS").unwrap_or_else(|_| "127.0.0.1:3000".to_owned());
-    let listener = tokio::net::TcpListener::bind(&http_address).await?;
-    let web_server = axum::serve(listener, gamepulse_web::catalogue_router(catalogue))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        });
+    let listener = tokio::net::TcpListener::bind(environment.http_address).await?;
+    let web_server = axum::serve(
+        listener,
+        gamepulse_web::service_router(storage.catalogue, readiness),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    });
 
     let source_runtime_result = async {
-        source_runtime
-            .run_until_shutdown_with_wakeup(wakeup.clone(), async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await
-            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+        if environment.source_work_enabled {
+            source_runtime
+                .run_until_shutdown_with_wakeup(wakeup.clone(), async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await
+                .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+        } else {
+            let _ = tokio::signal::ctrl_c().await;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
     };
     let llm_runtime_result = async {
         llm_runtime
@@ -115,4 +185,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     tokio::try_join!(source_runtime_result, llm_runtime_result, web_result)?;
     Ok(())
+}
+
+async fn serve_unready_http(
+    http_address: SocketAddr,
+    readiness: Arc<SqliteReadinessProbe>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(http_address).await?;
+    axum::serve(
+        listener,
+        gamepulse_web::unavailable_service_router(readiness),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+    .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
 }

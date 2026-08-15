@@ -332,6 +332,22 @@ without introducing `runs`/`run_items`, the proposed more-than-four
 parse-or-validation-failure batch disablement remains an operational revisit
 condition rather than durable run state.
 
+M013 adds local delivery readiness without changing the one-binary,
+one-process topology. `gamepulse-web` owns `GET /health/live` and
+`GET /health/ready`; the first returns without a database or external-source
+dependency, while the second calls an application-owned readiness port only.
+The SQLite adapter reopens the configured persistent database read-only and
+checks database integrity, the adopted migration version, and required schema
+structure without applying migrations, claiming jobs, or invoking a source
+adapter. The composition root alone
+supplies that adapter and the explicitly configured bind address. If SQLite
+cannot initialize, the binary serves only liveness/readiness and returns no
+catalogue data; it composes neither worker runtime nor source client. A local
+source-work disablement is limited to offline binary smoke evidence; the live
+source canary remains a separate, explicit action. The container remains a
+non-root wrapper around the sole binary and mounts SQLite outside the image;
+one replica with one persistent volume is the only supported deployment shape.
+
 Passing CI proves the bounded workspace
 claims and deterministic canary, policy, state-adapter, queue, M006 runtime,
 M007 discovery handler, M008 snapshot foundation, and M009 offline vertical; it
@@ -341,6 +357,12 @@ complete product behavior or complete architecture conformance.
 M006's scheduler identity, dispatcher-capacity, and stale-completion branches
 have focused mutation evidence; M009's three allowed manual mutation attempts
 were exhausted before the correction pass, which adds no further mutation run.
+
+M013 adds focused local liveness/readiness response coverage and SQLite schema
+readiness coverage. Mutation testing is not applicable to the thin readiness
+adapter and status mapping: its two observable branches are deterministic,
+covered directly, and it owns no critical state-machine, lease, retry,
+deduplication, crawl-progression, run-finalization, or selection-policy rule.
 
 M003 requires targeted mutation testing because it introduces daily
 deduplication, crawl progression, and selection policy.

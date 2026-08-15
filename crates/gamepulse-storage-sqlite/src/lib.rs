@@ -9,14 +9,15 @@ mod review_summary;
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gamepulse_application::{
     BrowseCursor, BrowseProgress, CrawlDayKey, DailyCrawlCommit, DailyCrawlState,
-    DailyCrawlStatePort, DiscoveryCandidate, SourceProductId,
+    DailyCrawlStatePort, DiscoveryCandidate, ServiceReadinessPort, SourceProductId,
 };
 use rusqlite::{
-    Connection, Error, OptionalExtension, Params, Transaction, TransactionBehavior, ffi, params,
+    Connection, Error, OpenFlags, OptionalExtension, Params, Transaction, TransactionBehavior, ffi,
+    params,
 };
 
 pub use catalogue::{GameCatalogueReadStoreError, SqliteGameCatalogueReadStore};
@@ -35,6 +36,60 @@ const GAME_SNAPSHOT_MIGRATION_0003: &str = include_str!("../migrations/0003_game
 const REVIEW_SUMMARY_MIGRATION_0004: &str = include_str!("../migrations/0004_review_summaries.sql");
 const PUBLIC_COVER_URL_MIGRATION_0005: &str =
     include_str!("../migrations/0005_public_cover_url.sql");
+
+/// Read-only SQLite readiness adapter for the configured persistent database.
+///
+/// It intentionally reopens the path for every check so a replacement, removal,
+/// or broken mount cannot be hidden by the process's long-lived write handles.
+/// It checks database integrity, the exact migration version, and the required
+/// schema structure without invoking startup's write-only constraint probes.
+pub struct SqliteReadinessProbe {
+    path: PathBuf,
+}
+
+impl SqliteReadinessProbe {
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
+    }
+}
+
+impl ServiceReadinessPort for SqliteReadinessProbe {
+    type Error = SqliteReadinessError;
+
+    fn check_readiness(&self) -> Result<(), SqliteReadinessError> {
+        let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|_| SqliteReadinessError)?;
+        let version = connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .map_err(|_| SqliteReadinessError)?;
+        if version != SCHEMA_VERSION {
+            return Err(SqliteReadinessError);
+        }
+        validate_required_schema_structure(&connection).map_err(|_| SqliteReadinessError)?;
+        let integrity = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+            .map_err(|_| SqliteReadinessError)?;
+        if integrity == "ok" {
+            Ok(())
+        } else {
+            Err(SqliteReadinessError)
+        }
+    }
+}
+
+/// Opaque readiness failure: HTTP callers receive no database or path detail.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SqliteReadinessError;
+
+impl fmt::Display for SqliteReadinessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SQLite readiness check failed")
+    }
+}
+
+impl std::error::Error for SqliteReadinessError {}
 
 type ForeignKeyDefinition<'a> = (
     i64,
@@ -403,8 +458,27 @@ fn validate_owned_schema(connection: &mut Connection) -> Result<(), DailyCrawlSt
     validate_review_summary_schema(connection)
 }
 
+/// Read-only portion of the owned-schema validator used by readiness.
+///
+/// Startup additionally runs write-only constraint probes; readiness must not.
+fn validate_required_schema_structure(
+    connection: &Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    validate_daily_crawl_schema_structure(connection)?;
+    validate_job_queue_schema_structure(connection)?;
+    validate_game_snapshot_schema_structure(connection)?;
+    validate_review_summary_schema(connection)
+}
+
 fn validate_daily_crawl_schema(
     connection: &mut Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    validate_daily_crawl_schema_structure(connection)?;
+    validate_constraint_behavior(connection)
+}
+
+fn validate_daily_crawl_schema_structure(
+    connection: &Connection,
 ) -> Result<(), DailyCrawlStateStoreError> {
     validate_table_columns(
         connection,
@@ -478,10 +552,17 @@ fn validate_daily_crawl_schema(
             ),
         ],
     )?;
-    validate_constraint_behavior(connection)
+    Ok(())
 }
 
 fn validate_job_queue_schema(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError> {
+    validate_job_queue_schema_structure(connection)?;
+    validate_job_queue_constraint_behavior(connection)
+}
+
+fn validate_job_queue_schema_structure(
+    connection: &Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
     validate_table_columns(
         connection,
         "jobs",
@@ -532,11 +613,19 @@ fn validate_job_queue_schema(connection: &mut Connection) -> Result<(), DailyCra
             "NONE",
         )],
     )?;
-    validate_job_queue_constraint_behavior(connection)
+    Ok(())
 }
 
 fn validate_game_snapshot_schema(
     connection: &mut Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    validate_game_snapshot_schema_structure(connection)?;
+    validate_game_snapshot_constraint_behavior(connection)?;
+    validate_public_cover_url_constraint_behavior(connection)
+}
+
+fn validate_game_snapshot_schema_structure(
+    connection: &Connection,
 ) -> Result<(), DailyCrawlStateStoreError> {
     validate_table_columns(
         connection,
@@ -554,12 +643,18 @@ fn validate_game_snapshot_schema(
             ("public_cover_url", "TEXT", 0, 0),
         ],
     )?;
-    validate_game_snapshot_schema_relations_and_constraints(connection)?;
-    validate_public_cover_url_constraint_behavior(connection)
+    validate_game_snapshot_schema_relations_and_constraints_structure(connection)
 }
 
 fn validate_game_snapshot_schema_before_public_cover(
     connection: &mut Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    validate_game_snapshot_schema_before_public_cover_structure(connection)?;
+    validate_game_snapshot_constraint_behavior(connection)
+}
+
+fn validate_game_snapshot_schema_before_public_cover_structure(
+    connection: &Connection,
 ) -> Result<(), DailyCrawlStateStoreError> {
     validate_table_columns(
         connection,
@@ -576,11 +671,11 @@ fn validate_game_snapshot_schema_before_public_cover(
             ("video_url", "TEXT", 0, 0),
         ],
     )?;
-    validate_game_snapshot_schema_relations_and_constraints(connection)
+    validate_game_snapshot_schema_relations_and_constraints_structure(connection)
 }
 
-fn validate_game_snapshot_schema_relations_and_constraints(
-    connection: &mut Connection,
+fn validate_game_snapshot_schema_relations_and_constraints_structure(
+    connection: &Connection,
 ) -> Result<(), DailyCrawlStateStoreError> {
     validate_table_columns(
         connection,
@@ -617,7 +712,7 @@ fn validate_game_snapshot_schema_relations_and_constraints(
     )];
     validate_foreign_key_groups(connection, "game_platform_scores", &game_foreign_key)?;
     validate_foreign_key_groups(connection, "game_developers", &game_foreign_key)?;
-    validate_game_snapshot_constraint_behavior(connection)
+    Ok(())
 }
 
 fn validate_public_cover_url_constraint_behavior(
@@ -648,7 +743,7 @@ fn validate_public_cover_url_constraint_behavior(
 }
 
 fn validate_review_summary_schema(
-    connection: &mut Connection,
+    connection: &Connection,
 ) -> Result<(), DailyCrawlStateStoreError> {
     validate_table_columns(
         connection,

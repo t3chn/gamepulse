@@ -69,6 +69,22 @@ The result includes:
 - complete visible project AI prompts and responses, with raw JSONL accepted as
   an optional transport format.
 
+## Local delivery readiness
+
+The single binary exposes a dependency-free liveness endpoint and a separate
+readiness endpoint. Liveness must not contact a source or require SQLite.
+Readiness may inspect only the configured SQLite database and its required
+migrations; it must not schedule durable jobs or begin source work. A failed
+readiness check returns a non-success response without disclosing an
+operational path or database error. An unavailable SQLite database must not
+prevent liveness from starting; catalogue delivery and worker execution remain
+unavailable until readiness succeeds.
+
+The delivery container runs the existing sole binary as a non-root user. Its
+SQLite file is supplied through persistent storage outside the image. SQLite
+supports exactly one application replica; a multi-replica shape is out of
+scope until the architecture revisit condition is met.
+
 ## Adopted interpretations
 
 These are architecture decisions rather than quoted assignment facts:

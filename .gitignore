@@ -1,6 +1,7 @@
 /target/
 /data/
 /cache/
+/var/
 
 .env
 .env.*

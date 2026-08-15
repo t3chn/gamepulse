@@ -33,7 +33,9 @@ SQLite-only similar-game links. M011 adds the fully offline review-to-summary ve
 stored refresh keeps bounded critic and user review inputs separate, atomically schedules one
 fingerprint-fenced local summary job per kind, and renders persisted likes/dislikes or an explicit
 unavailable state on the detail page. The fallback is deterministic and local; it does not use a
-provider. Runs/run_items, SSE, media, external LLM/provider integration, and deployment remain
+provider. M013 adds local delivery readiness: non-dependent liveness, SQLite/schema readiness,
+an explicit offline source-work switch for smoke evidence, and a non-root container definition.
+Runs/run_items, SSE, media, external LLM/provider integration, and an actual deployment remain
 unimplemented.
 
 ## Baseline architecture
@@ -55,7 +57,7 @@ Read the canonical documents before implementation:
 - [agent rules](AGENTS.md);
 - [AI correspondence policy](docs/ai/README.md).
 
-## Development
+## Local build and run
 
 The project pins Rust through `mise`.
 
@@ -63,13 +65,75 @@ The project pins Rust through `mise`.
 mise install
 mise run architecture
 mise run ci
+```
+
+The binary requires these explicit environment variables:
+
+- `GAMEPULSE_DATABASE_PATH`: an absolute writable SQLite file path on persistent local
+  storage; it is created and migrated at process startup. Do not use an
+  in-memory database for delivery.
+- `GAMEPULSE_HTTP_ADDRESS`: an IP socket address and port, such as
+  `127.0.0.1:3000` or `0.0.0.0:3000`. Host names are rejected so startup never
+  performs address resolution.
+
+`GAMEPULSE_SOURCE_WORK_ENABLED` is optional and defaults to `true`. Set it to
+`false` only for a local offline smoke or UI inspection: it prevents the source
+lane from scheduling or claiming work, but does not alter stored data. Page
+requests themselves never fetch catalogue data.
+
+```bash
+mkdir -p var
+export GAMEPULSE_DATABASE_PATH="$PWD/var/gamepulse.sqlite3"
+export GAMEPULSE_HTTP_ADDRESS="127.0.0.1:3000"
+export GAMEPULSE_SOURCE_WORK_ENABLED="false"
 cargo run --locked -p gamepulse
 ```
 
-The composed binary serves the catalogue on `127.0.0.1:3000` by default; set
-`GAMEPULSE_HTTP_ADDRESS` to an explicit bind address when needed. It reads the
-SQLite path selected by `GAMEPULSE_DATABASE_PATH` and never fetches catalogue
-data on a page request.
+Once the process is listening, `GET /health/live` returns `200 OK` without
+opening SQLite or a network connection. `GET /health/ready` returns `200 OK`
+only when the configured SQLite file can be reopened read-only and has the
+required migrated schema version and structure; otherwise it returns `503 Service
+Unavailable` with an empty body. If SQLite cannot initialize, liveness still returns `200` while
+readiness and catalogue routes return `503`; neither endpoint schedules jobs or
+starts source work.
+
+## Container delivery boundary
+
+`Dockerfile` is a multi-stage, `--locked` build of the existing `gamepulse`
+binary. The runtime image uses a non-root user and declares
+`/var/lib/gamepulse` as the persistent SQLite mount point; the image contains
+no SQLite database. A local image build and run, when separately authorized,
+use the same explicit variables:
+
+```bash
+docker build --tag gamepulse:local .
+docker run --rm -p 3000:3000 \
+  -e GAMEPULSE_HTTP_ADDRESS=0.0.0.0:3000 \
+  -e GAMEPULSE_DATABASE_PATH=/var/lib/gamepulse/gamepulse.sqlite3 \
+  -e GAMEPULSE_SOURCE_WORK_ENABLED=true \
+  -v gamepulse-data:/var/lib/gamepulse \
+  gamepulse:local
+```
+
+SQLite has one durable writer and GamePulse supports exactly one replica with
+one persistent volume claim. Do not scale this image horizontally or add a
+database/queue service. Exact deployment namespace, host/TLS route, immutable
+image digest, PVC name/class, and production source-work authorization are
+handoff TODOs; they are intentionally not inferred here.
+
+The source lane and the opt-in public canary are separate. Enabling ordinary
+source work may make Metacritic requests through the normal runtime. The canary
+below remains the only deliberate contract probe and is never part of health,
+readiness, or an offline smoke.
+
+### Mandatory and optional status
+
+| Area | Status |
+| --- | --- |
+| Stored catalogue, detail, mandatory review summaries | Implemented with deterministic local coverage |
+| Local delivery readiness and container definition | Implemented locally; deployment handoff remains TODO |
+| Metacritic live canary | Explicit opt-in only |
+| Runs/run_items, SSE, manual trigger, YouTube/media, external LLM | Not implemented |
 
 `mise run ci` checks formatting, Clippy with warnings denied, and all current
 tests. The architecture task verifies the exact declared internal Cargo graph
@@ -102,8 +166,10 @@ candidate evaluation unless a separate written license is added later.
 
 ## Solution cost
 
-- Accepted milestones: M003 and M004.
-- Coverage: partial; excludes shared pre-instrumentation work and cost-instrumentation setup. README formatting is outside the estimate.
+- Coverage TODO: the verified totals below cover accepted M003 and M004 only.
+  M005-M013, shared pre-instrumentation work, and cost-instrumentation setup
+  have not yet been reconciled into a final estimate; README formatting remains
+  outside that coverage.
 - API-equivalent estimate (not an invoice): $44.95953076.
 - Effective tokens: 2,684,859.
 - Cache savings: $267.87101184.

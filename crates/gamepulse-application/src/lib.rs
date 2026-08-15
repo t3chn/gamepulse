@@ -383,6 +383,16 @@ pub trait GameCatalogueReadPort {
     ) -> Result<Option<CatalogueGameDetail>, Self::Error>;
 }
 
+/// Application-owned readiness boundary for the configured durable store.
+///
+/// Implementations must not schedule work, invoke a source, or expose
+/// operational details through their error type.
+pub trait ServiceReadinessPort: Send + Sync {
+    type Error;
+
+    fn check_readiness(&self) -> Result<(), Self::Error>;
+}
+
 /// Read one deterministic catalogue page through the application-owned port.
 pub fn load_catalogue<P>(port: &mut P, query: &CatalogueQuery) -> Result<CataloguePage, P::Error>
 where
