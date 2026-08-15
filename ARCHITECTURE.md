@@ -203,21 +203,24 @@ prove complete architecture conformance and must not be reported as such.
 The repository contains the eight-package workspace harness, one compileable
 binary shell, a sabotage-tested Cargo graph gate, the bounded M002 direct-HTTP
 Metacritic source-contract canary in `gamepulse-worker-source`, M003's pure
-daily-crawl selection policy, and M004's SQLite daily-crawl state adapter. M003
-keeps day reset, numeric-ID uniqueness, source-order selection, the 20-item
-cap, replay of a partially consumed browse page, and explicit browse exhaustion
-in the domain; the application owns the discovery and atomic state-commit ports.
-M004 durably commits the per-day state and selected candidate slugs through that
-port. The source worker provides only a deterministic mapping from its parsed
-listing to that application contract and does not issue a request as part of
-M003 or M004.
+daily-crawl selection policy, M004's SQLite daily-crawl state adapter, and
+M005's durable job-queue foundation. M003 keeps day reset, numeric-ID
+uniqueness, source-order selection, the 20-item cap, replay of a partially
+consumed browse page, and explicit browse exhaustion in the domain; the
+application owns the discovery and atomic state-commit ports. M004 durably
+commits the per-day state and selected candidate slugs through that port. M005
+adds an application-owned `JobStore` port plus a SQLite adapter that durably
+deduplicates stable jobs, records claims and lease expiry, bounds attempts,
+fences claim tokens and clock transitions, rejects stale claim completion, and
+retains attempt history. The source worker provides only a deterministic mapping
+from its parsed listing to the daily-crawl application contract and does not
+issue a request as part of M003, M004, or M005.
 
-Scheduler and timer execution, the generic durable queue, queue dispatch,
-leases, retries, ingestion, summaries, all remaining application persistence,
-web behavior, media, LLM behavior, deployment, and M005 remain unimplemented.
-Passing CI proves the bounded workspace claims and deterministic canary and
-policy tests, not complete product behavior or complete architecture
-conformance.
+Scheduler and timer execution, queue dispatch and worker handlers, ingestion,
+summaries, all remaining application persistence, web behavior, media, LLM
+behavior, and deployment remain unimplemented. Passing CI proves the bounded
+workspace claims and deterministic canary, policy, state-adapter, and queue
+tests, not complete product behavior or complete architecture conformance.
 
 M003 requires targeted mutation testing because it introduces daily
 deduplication, crawl progression, and selection policy.

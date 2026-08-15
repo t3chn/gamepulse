@@ -310,3 +310,602 @@ pub enum DailyCrawlError<StateError, SourceError> {
     InvalidCommit(DailyCrawlCommitError),
     Commit(StateError),
 }
+
+/// The largest application-owned opaque queue value accepted at the boundary.
+///
+/// Job work references and failure descriptions are untrusted data. The queue
+/// persists them for observability but never interprets or logs them.
+pub const JOB_TEXT_MAX_BYTES: usize = 4_096;
+
+/// A deterministic clock value supplied by the caller. Queue policy does not
+/// read the system clock so claims, expiry, and retry behavior remain testable.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct JobTimestamp(i64);
+
+impl JobTimestamp {
+    pub fn new(value: i64) -> Result<Self, JobInputError> {
+        if value < 0 {
+            return Err(JobInputError::NegativeTimestamp);
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn value(self) -> i64 {
+        self.0
+    }
+}
+
+/// An immutable job description supplied when work first enters the queue.
+#[derive(Clone, Eq, PartialEq)]
+pub struct JobRequest {
+    identity: String,
+    job_type: String,
+    work_ref: String,
+    max_attempts: u32,
+    created_at: JobTimestamp,
+}
+
+impl JobRequest {
+    pub fn new(
+        identity: impl Into<String>,
+        job_type: impl Into<String>,
+        work_ref: impl Into<String>,
+        max_attempts: u32,
+        created_at: JobTimestamp,
+    ) -> Result<Self, JobInputError> {
+        let identity = identity.into();
+        let job_type = job_type.into();
+        let work_ref = work_ref.into();
+        validate_job_text("job identity", &identity)?;
+        validate_job_text("job type", &job_type)?;
+        validate_job_text("job work reference", &work_ref)?;
+        if max_attempts == 0 {
+            return Err(JobInputError::ZeroMaxAttempts);
+        }
+
+        Ok(Self {
+            identity,
+            job_type,
+            work_ref,
+            max_attempts,
+            created_at,
+        })
+    }
+
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub fn job_type(&self) -> &str {
+        &self.job_type
+    }
+
+    pub fn work_ref(&self) -> &str {
+        &self.work_ref
+    }
+
+    pub const fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+
+    pub const fn created_at(&self) -> JobTimestamp {
+        self.created_at
+    }
+}
+
+impl fmt::Debug for JobRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobRequest")
+            .field("identity", &self.identity)
+            .field("job_type", &self.job_type)
+            .field("work_ref_bytes", &self.work_ref.len())
+            .field("max_attempts", &self.max_attempts)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+/// A worker and deterministic lease duration used to claim one ready job.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobClaimRequest {
+    worker_id: String,
+    claimed_at: JobTimestamp,
+    lease_expires_at: JobTimestamp,
+}
+
+impl JobClaimRequest {
+    pub fn new(
+        worker_id: impl Into<String>,
+        claimed_at: JobTimestamp,
+        lease_duration: i64,
+    ) -> Result<Self, JobInputError> {
+        let worker_id = worker_id.into();
+        validate_job_text("worker identity", &worker_id)?;
+        if lease_duration <= 0 {
+            return Err(JobInputError::NonPositiveLeaseDuration);
+        }
+        let lease_expires_at = claimed_at
+            .value()
+            .checked_add(lease_duration)
+            .ok_or(JobInputError::LeaseExpiryOverflow)?;
+
+        Ok(Self {
+            worker_id,
+            claimed_at,
+            lease_expires_at: JobTimestamp(lease_expires_at),
+        })
+    }
+
+    pub fn worker_id(&self) -> &str {
+        &self.worker_id
+    }
+
+    pub const fn claimed_at(&self) -> JobTimestamp {
+        self.claimed_at
+    }
+
+    pub const fn lease_expires_at(&self) -> JobTimestamp {
+        self.lease_expires_at
+    }
+}
+
+/// The durable lifecycle state of one job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobStatus {
+    Ready,
+    Claimed,
+    Succeeded,
+    Failed,
+}
+
+impl JobStatus {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
+    }
+}
+
+/// The observable durable state of one deduplicated job.
+#[derive(Clone, Eq, PartialEq)]
+pub struct JobRecord {
+    identity: String,
+    job_type: String,
+    work_ref: String,
+    max_attempts: u32,
+    attempt_count: u32,
+    status: JobStatus,
+    created_at: JobTimestamp,
+    updated_at: JobTimestamp,
+    claimed_by: Option<String>,
+    lease_expires_at: Option<JobTimestamp>,
+    terminal_at: Option<JobTimestamp>,
+    last_error: Option<String>,
+}
+
+impl JobRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn restored(
+        identity: String,
+        job_type: String,
+        work_ref: String,
+        max_attempts: u32,
+        attempt_count: u32,
+        status: JobStatus,
+        created_at: JobTimestamp,
+        updated_at: JobTimestamp,
+        claimed_by: Option<String>,
+        lease_expires_at: Option<JobTimestamp>,
+        terminal_at: Option<JobTimestamp>,
+        last_error: Option<String>,
+    ) -> Self {
+        Self {
+            identity,
+            job_type,
+            work_ref,
+            max_attempts,
+            attempt_count,
+            status,
+            created_at,
+            updated_at,
+            claimed_by,
+            lease_expires_at,
+            terminal_at,
+            last_error,
+        }
+    }
+
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub fn job_type(&self) -> &str {
+        &self.job_type
+    }
+
+    pub fn work_ref(&self) -> &str {
+        &self.work_ref
+    }
+
+    pub const fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+
+    pub const fn attempt_count(&self) -> u32 {
+        self.attempt_count
+    }
+
+    pub const fn status(&self) -> JobStatus {
+        self.status
+    }
+
+    pub const fn created_at(&self) -> JobTimestamp {
+        self.created_at
+    }
+
+    pub const fn updated_at(&self) -> JobTimestamp {
+        self.updated_at
+    }
+
+    pub fn claimed_by(&self) -> Option<&str> {
+        self.claimed_by.as_deref()
+    }
+
+    pub const fn lease_expires_at(&self) -> Option<JobTimestamp> {
+        self.lease_expires_at
+    }
+
+    pub const fn terminal_at(&self) -> Option<JobTimestamp> {
+        self.terminal_at
+    }
+
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+}
+
+impl fmt::Debug for JobRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobRecord")
+            .field("identity", &self.identity)
+            .field("job_type", &self.job_type)
+            .field("work_ref_bytes", &self.work_ref.len())
+            .field("max_attempts", &self.max_attempts)
+            .field("attempt_count", &self.attempt_count)
+            .field("status", &self.status)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("claimed", &self.claimed_by.is_some())
+            .field("lease_expires_at", &self.lease_expires_at)
+            .field("terminal_at", &self.terminal_at)
+            .field("has_last_error", &self.last_error.is_some())
+            .finish()
+    }
+}
+
+/// A single-use claim capability. The queue creates it after persisting the
+/// claimed job and rejects completion or failure from an obsolete claim token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobClaim {
+    identity: String,
+    worker_id: String,
+    claim_token: u32,
+    claimed_at: JobTimestamp,
+    lease_expires_at: JobTimestamp,
+}
+
+impl JobClaim {
+    /// Reconstruct a claim capability from durable adapter state.
+    pub fn restored(
+        identity: String,
+        worker_id: String,
+        claim_token: u32,
+        claimed_at: JobTimestamp,
+        lease_expires_at: JobTimestamp,
+    ) -> Self {
+        Self {
+            identity,
+            worker_id,
+            claim_token,
+            claimed_at,
+            lease_expires_at,
+        }
+    }
+
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub fn worker_id(&self) -> &str {
+        &self.worker_id
+    }
+
+    pub const fn claim_token(&self) -> u32 {
+        self.claim_token
+    }
+
+    pub const fn claimed_at(&self) -> JobTimestamp {
+        self.claimed_at
+    }
+
+    pub const fn lease_expires_at(&self) -> JobTimestamp {
+        self.lease_expires_at
+    }
+}
+
+/// A claimed job together with the capability required to finish that attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimedJob {
+    job: JobRecord,
+    claim: JobClaim,
+}
+
+impl ClaimedJob {
+    /// Create a claimed-job result after both the job and its active attempt
+    /// have been persisted by an adapter.
+    pub fn restored(job: JobRecord, claim: JobClaim) -> Self {
+        Self { job, claim }
+    }
+
+    pub fn job(&self) -> &JobRecord {
+        &self.job
+    }
+
+    pub fn claim(&self) -> &JobClaim {
+        &self.claim
+    }
+
+    pub fn into_claim(self) -> JobClaim {
+        self.claim
+    }
+}
+
+/// Completion input for an active claim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobCompletion {
+    claim: JobClaim,
+    completed_at: JobTimestamp,
+}
+
+impl JobCompletion {
+    pub fn new(claim: JobClaim, completed_at: JobTimestamp) -> Result<Self, JobInputError> {
+        if completed_at < claim.claimed_at {
+            return Err(JobInputError::CompletionBeforeClaim);
+        }
+        Ok(Self {
+            claim,
+            completed_at,
+        })
+    }
+
+    pub fn claim(&self) -> &JobClaim {
+        &self.claim
+    }
+
+    pub const fn completed_at(&self) -> JobTimestamp {
+        self.completed_at
+    }
+}
+
+/// Failure input for an active claim. The error is stored as opaque data and
+/// must not be treated as executable content or written to logs by adapters.
+#[derive(Clone, Eq, PartialEq)]
+pub struct JobFailure {
+    claim: JobClaim,
+    failed_at: JobTimestamp,
+    error: String,
+}
+
+impl JobFailure {
+    pub fn new(
+        claim: JobClaim,
+        failed_at: JobTimestamp,
+        error: impl Into<String>,
+    ) -> Result<Self, JobInputError> {
+        if failed_at < claim.claimed_at {
+            return Err(JobInputError::FailureBeforeClaim);
+        }
+        let error = error.into();
+        validate_job_text("job failure description", &error)?;
+        Ok(Self {
+            claim,
+            failed_at,
+            error,
+        })
+    }
+
+    pub fn claim(&self) -> &JobClaim {
+        &self.claim
+    }
+
+    pub const fn failed_at(&self) -> JobTimestamp {
+        self.failed_at
+    }
+
+    pub fn error(&self) -> &str {
+        &self.error
+    }
+}
+
+impl fmt::Debug for JobFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobFailure")
+            .field("claim", &self.claim)
+            .field("failed_at", &self.failed_at)
+            .field("error_bytes", &self.error.len())
+            .finish()
+    }
+}
+
+/// The result of inserting a job whose identity is globally deduplicated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JobEnqueueResult {
+    Enqueued(JobRecord),
+    Duplicate(JobRecord),
+}
+
+/// The durable result of a failed execution attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobFailureResult {
+    ReadyForRetry,
+    Failed,
+}
+
+/// The immutable audit outcome of one execution attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobAttemptOutcome {
+    Active,
+    Succeeded,
+    RetryableFailure,
+    TerminalFailure,
+    Expired,
+}
+
+/// One persisted execution attempt, including the claim that owns it.
+#[derive(Clone, Eq, PartialEq)]
+pub struct JobAttempt {
+    attempt_number: u32,
+    claim_token: u32,
+    worker_id: String,
+    started_at: JobTimestamp,
+    finished_at: Option<JobTimestamp>,
+    outcome: JobAttemptOutcome,
+    error: Option<String>,
+}
+
+impl JobAttempt {
+    #[allow(clippy::too_many_arguments)]
+    pub fn restored(
+        attempt_number: u32,
+        claim_token: u32,
+        worker_id: String,
+        started_at: JobTimestamp,
+        finished_at: Option<JobTimestamp>,
+        outcome: JobAttemptOutcome,
+        error: Option<String>,
+    ) -> Self {
+        Self {
+            attempt_number,
+            claim_token,
+            worker_id,
+            started_at,
+            finished_at,
+            outcome,
+            error,
+        }
+    }
+
+    pub const fn attempt_number(&self) -> u32 {
+        self.attempt_number
+    }
+
+    pub const fn claim_token(&self) -> u32 {
+        self.claim_token
+    }
+
+    pub fn worker_id(&self) -> &str {
+        &self.worker_id
+    }
+
+    pub const fn started_at(&self) -> JobTimestamp {
+        self.started_at
+    }
+
+    pub const fn finished_at(&self) -> Option<JobTimestamp> {
+        self.finished_at
+    }
+
+    pub const fn outcome(&self) -> JobAttemptOutcome {
+        self.outcome
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
+impl fmt::Debug for JobAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobAttempt")
+            .field("attempt_number", &self.attempt_number)
+            .field("claim_token", &self.claim_token)
+            .field("worker_id", &self.worker_id)
+            .field("started_at", &self.started_at)
+            .field("finished_at", &self.finished_at)
+            .field("outcome", &self.outcome)
+            .field("has_error", &self.error.is_some())
+            .finish()
+    }
+}
+
+/// Application-owned durable queue boundary. Implementations must recover
+/// expired claims before selecting ready work and must atomically update a job
+/// and its attempt history for every lifecycle transition.
+pub trait JobStore {
+    type Error;
+
+    fn enqueue(&mut self, request: JobRequest) -> Result<JobEnqueueResult, Self::Error>;
+
+    fn claim_next(&mut self, request: JobClaimRequest) -> Result<Option<ClaimedJob>, Self::Error>;
+
+    fn complete(&mut self, completion: JobCompletion) -> Result<(), Self::Error>;
+
+    fn fail(&mut self, failure: JobFailure) -> Result<JobFailureResult, Self::Error>;
+
+    fn job(&mut self, identity: &str) -> Result<Option<JobRecord>, Self::Error>;
+
+    fn attempts(&mut self, identity: &str) -> Result<Vec<JobAttempt>, Self::Error>;
+}
+
+/// Validation failures at the application queue boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobInputError {
+    BlankText(&'static str),
+    TextTooLong(&'static str),
+    ZeroMaxAttempts,
+    NegativeTimestamp,
+    NonPositiveLeaseDuration,
+    LeaseExpiryOverflow,
+    CompletionBeforeClaim,
+    FailureBeforeClaim,
+}
+
+impl fmt::Display for JobInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BlankText(field) => write!(formatter, "{field} must not be blank"),
+            Self::TextTooLong(field) => {
+                write!(
+                    formatter,
+                    "{field} must not exceed {JOB_TEXT_MAX_BYTES} bytes"
+                )
+            }
+            Self::ZeroMaxAttempts => formatter.write_str("job maximum attempts must be positive"),
+            Self::NegativeTimestamp => formatter.write_str("job timestamp must not be negative"),
+            Self::NonPositiveLeaseDuration => {
+                formatter.write_str("job lease duration must be positive")
+            }
+            Self::LeaseExpiryOverflow => formatter.write_str("job lease expiry overflows"),
+            Self::CompletionBeforeClaim => {
+                formatter.write_str("job completion must not predate its claim")
+            }
+            Self::FailureBeforeClaim => {
+                formatter.write_str("job failure must not predate its claim")
+            }
+        }
+    }
+}
+
+impl std::error::Error for JobInputError {}
+
+fn validate_job_text(field: &'static str, value: &str) -> Result<(), JobInputError> {
+    if value.trim().is_empty() {
+        return Err(JobInputError::BlankText(field));
+    }
+    if value.len() > JOB_TEXT_MAX_BYTES {
+        return Err(JobInputError::TextTooLong(field));
+    }
+    Ok(())
+}

@@ -2,6 +2,8 @@
 
 //! SQLite implementations of GamePulse application ports.
 
+mod job_queue;
+
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
@@ -14,8 +16,12 @@ use rusqlite::{
     Connection, Error, OptionalExtension, Params, Transaction, TransactionBehavior, ffi, params,
 };
 
+pub use job_queue::{JobStoreError, SqliteJobStore};
+
 const DAILY_CRAWL_SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const DAILY_CRAWL_MIGRATION_0001: &str = include_str!("../migrations/0001_daily_crawl_state.sql");
+const JOB_QUEUE_MIGRATION_0002: &str = include_str!("../migrations/0002_job_queue.sql");
 
 type ForeignKeyDefinition<'a> = (
     i64,
@@ -32,6 +38,7 @@ type ForeignKeyDefinition<'a> = (
 enum ExpectedConstraint {
     Check,
     ForeignKey,
+    Unique,
 }
 
 impl ExpectedConstraint {
@@ -39,6 +46,7 @@ impl ExpectedConstraint {
         match self {
             Self::Check => ffi::SQLITE_CONSTRAINT_CHECK,
             Self::ForeignKey => ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+            Self::Unique => ffi::SQLITE_CONSTRAINT_UNIQUE,
         }
     }
 
@@ -46,6 +54,7 @@ impl ExpectedConstraint {
         match self {
             Self::Check => "CHECK",
             Self::ForeignKey => "FOREIGN KEY",
+            Self::Unique => "UNIQUE",
         }
     }
 }
@@ -70,10 +79,7 @@ impl SqliteDailyCrawlStateStore {
     }
 
     fn from_connection(mut connection: Connection) -> Result<Self, DailyCrawlStateStoreError> {
-        connection
-            .execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(DailyCrawlStateStoreError::database)?;
-        migrate(&mut connection)?;
+        initialize_connection(&mut connection)?;
         Ok(Self { connection })
     }
 
@@ -186,6 +192,15 @@ impl fmt::Display for DailyCrawlStateStoreError {
 
 impl std::error::Error for DailyCrawlStateStoreError {}
 
+pub(crate) fn initialize_connection(
+    connection: &mut Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(DailyCrawlStateStoreError::database)?;
+    migrate(connection)
+}
+
 fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError> {
     let version = connection
         .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
@@ -200,13 +215,31 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(DAILY_CRAWL_MIGRATION_0001)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
-                .pragma_update(None, "user_version", DAILY_CRAWL_SCHEMA_VERSION)
+                .execute_batch(JOB_QUEUE_MIGRATION_0002)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .commit()
                 .map_err(DailyCrawlStateStoreError::database)
         }
-        DAILY_CRAWL_SCHEMA_VERSION => Ok(()),
+        DAILY_CRAWL_SCHEMA_VERSION => {
+            validate_daily_crawl_schema(connection)?;
+            let transaction = connection
+                .transaction()
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(JOB_QUEUE_MIGRATION_0002)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .commit()
+                .map_err(DailyCrawlStateStoreError::database)
+        }
+        SCHEMA_VERSION => Ok(()),
         other => Err(DailyCrawlStateStoreError::malformed(format!(
             "unsupported schema version {other}"
         ))),
@@ -215,6 +248,13 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
 }
 
 fn validate_owned_schema(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError> {
+    validate_daily_crawl_schema(connection)?;
+    validate_job_queue_schema(connection)
+}
+
+fn validate_daily_crawl_schema(
+    connection: &mut Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
     validate_table_columns(
         connection,
         "crawl_days",
@@ -288,6 +328,60 @@ fn validate_owned_schema(connection: &mut Connection) -> Result<(), DailyCrawlSt
         ],
     )?;
     validate_constraint_behavior(connection)
+}
+
+fn validate_job_queue_schema(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError> {
+    validate_table_columns(
+        connection,
+        "jobs",
+        &[
+            ("job_identity", "TEXT", 1, 1),
+            ("job_type", "TEXT", 1, 0),
+            ("work_ref", "TEXT", 1, 0),
+            ("max_attempts", "INTEGER", 1, 0),
+            ("attempt_count", "INTEGER", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("updated_at", "INTEGER", 1, 0),
+            ("claimed_by", "TEXT", 0, 0),
+            ("lease_expires_at", "INTEGER", 0, 0),
+            ("claim_token", "INTEGER", 1, 0),
+            ("terminal_at", "INTEGER", 0, 0),
+            ("last_error", "TEXT", 0, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "job_attempts",
+        &[
+            ("job_identity", "TEXT", 1, 1),
+            ("attempt_number", "INTEGER", 1, 0),
+            ("claim_token", "INTEGER", 1, 2),
+            ("worker_id", "TEXT", 1, 0),
+            ("started_at", "INTEGER", 1, 0),
+            ("finished_at", "INTEGER", 0, 0),
+            ("outcome", "TEXT", 1, 0),
+            ("error", "TEXT", 0, 0),
+        ],
+    )?;
+
+    validate_table_layout(connection, "jobs", false)?;
+    validate_table_layout(connection, "job_attempts", true)?;
+    validate_foreign_key_groups(
+        connection,
+        "job_attempts",
+        &[(
+            0,
+            0,
+            "jobs",
+            "job_identity",
+            "job_identity",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE",
+        )],
+    )?;
+    validate_job_queue_constraint_behavior(connection)
 }
 
 fn validate_table_columns(
@@ -549,6 +643,153 @@ fn validate_constraints_in_transaction(
          VALUES (?1, ?2, ?3)",
         params![&first_relation_day_key, "2", "cross-pair"],
     )
+}
+
+fn validate_job_queue_constraint_behavior(
+    connection: &mut Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(DailyCrawlStateStoreError::database)?;
+    let validation = validate_job_queue_constraints_in_transaction(&transaction);
+    let rollback = transaction.rollback();
+
+    match (validation, rollback) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (_, Err(error)) => Err(DailyCrawlStateStoreError::database(error)),
+    }
+}
+
+fn validate_job_queue_constraints_in_transaction(
+    connection: &Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    let mut reserved_probe_job_identities = BTreeSet::new();
+    let valid_job_identity =
+        next_absent_probe_job_identity(connection, &mut reserved_probe_job_identities)?;
+    let missing_job_identity =
+        next_absent_probe_job_identity(connection, &mut reserved_probe_job_identities)?;
+
+    expect_constraint_rejection(
+        connection,
+        "blank job identity",
+        ExpectedConstraint::Check,
+        "INSERT INTO jobs (
+            job_identity, job_type, work_ref, max_attempts, attempt_count, state,
+            created_at, updated_at, claimed_by, lease_expires_at, claim_token, terminal_at,
+            last_error
+         ) VALUES (?1, 'queue', 'work', 1, 0, 'ready', 1, 1, NULL, NULL, 0, NULL, NULL)",
+        params!["   "],
+    )?;
+    expect_constraint_rejection(
+        connection,
+        "unknown job state",
+        ExpectedConstraint::Check,
+        "INSERT INTO jobs (
+            job_identity, job_type, work_ref, max_attempts, attempt_count, state,
+            created_at, updated_at, claimed_by, lease_expires_at, claim_token, terminal_at,
+            last_error
+         ) VALUES (?1, 'queue', 'work', 1, 0, 'unknown', 1, 1, NULL, NULL, 0, NULL, NULL)",
+        params![&valid_job_identity],
+    )?;
+    expect_constraint_rejection(
+        connection,
+        "claimed job without owner",
+        ExpectedConstraint::Check,
+        "INSERT INTO jobs (
+            job_identity, job_type, work_ref, max_attempts, attempt_count, state,
+            created_at, updated_at, claimed_by, lease_expires_at, claim_token, terminal_at,
+            last_error
+         ) VALUES (?1, 'queue', 'work', 1, 1, 'claimed', 1, 1, NULL, 2, 1, NULL, NULL)",
+        params![&valid_job_identity],
+    )?;
+    expect_constraint_rejection(
+        connection,
+        "job timestamp regression",
+        ExpectedConstraint::Check,
+        "INSERT INTO jobs (
+            job_identity, job_type, work_ref, max_attempts, attempt_count, state,
+            created_at, updated_at, claimed_by, lease_expires_at, claim_token, terminal_at,
+            last_error
+         ) VALUES (?1, 'queue', 'work', 1, 0, 'ready', 2, 1, NULL, NULL, 0, NULL, NULL)",
+        params![&valid_job_identity],
+    )?;
+    connection
+        .execute(
+            "INSERT INTO jobs (
+                job_identity, job_type, work_ref, max_attempts, attempt_count, state,
+                created_at, updated_at, claimed_by, lease_expires_at, claim_token, terminal_at,
+                last_error
+             ) VALUES (?1, 'queue', 'work', 1, 0, 'ready', 1, 1, NULL, NULL, 0, NULL, NULL)",
+            params![&valid_job_identity],
+        )
+        .map_err(DailyCrawlStateStoreError::database)?;
+    expect_constraint_rejection(
+        connection,
+        "zero queue attempt number",
+        ExpectedConstraint::Check,
+        "INSERT INTO job_attempts (
+            job_identity, attempt_number, claim_token, worker_id, started_at, finished_at,
+            outcome, error
+         ) VALUES (?1, 0, 1, 'worker', 1, NULL, 'active', NULL)",
+        params![&valid_job_identity],
+    )?;
+    expect_constraint_rejection(
+        connection,
+        "queue attempt foreign key",
+        ExpectedConstraint::ForeignKey,
+        "INSERT INTO job_attempts (
+            job_identity, attempt_number, claim_token, worker_id, started_at, finished_at,
+            outcome, error
+         ) VALUES (?1, 1, 1, 'worker', 1, NULL, 'active', NULL)",
+        params![&missing_job_identity],
+    )?;
+    connection
+        .execute(
+            "INSERT INTO job_attempts (
+                job_identity, attempt_number, claim_token, worker_id, started_at, finished_at,
+                outcome, error
+             ) VALUES (?1, 1, 1, 'worker', 1, NULL, 'active', NULL)",
+            params![&valid_job_identity],
+        )
+        .map_err(DailyCrawlStateStoreError::database)?;
+    expect_constraint_rejection(
+        connection,
+        "duplicate queue attempt number",
+        ExpectedConstraint::Unique,
+        "INSERT INTO job_attempts (
+            job_identity, attempt_number, claim_token, worker_id, started_at, finished_at,
+            outcome, error
+         ) VALUES (?1, 1, 2, 'worker', 1, NULL, 'active', NULL)",
+        params![&valid_job_identity],
+    )
+}
+
+fn next_absent_probe_job_identity(
+    connection: &Connection,
+    reserved_probe_job_identities: &mut BTreeSet<String>,
+) -> Result<String, DailyCrawlStateStoreError> {
+    let mut suffix = 0_u64;
+    loop {
+        let candidate = format!("__gamepulse_job_queue_validation_probe_{suffix}");
+        suffix = suffix.checked_add(1).ok_or_else(|| {
+            DailyCrawlStateStoreError::malformed(
+                "no absent job identity is available for validation",
+            )
+        })?;
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM jobs WHERE job_identity = ?1",
+                params![&candidate],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(DailyCrawlStateStoreError::database)?
+            .is_some();
+        if !exists && reserved_probe_job_identities.insert(candidate.clone()) {
+            return Ok(candidate);
+        }
+    }
 }
 
 fn next_absent_probe_day_key(
@@ -916,6 +1157,19 @@ mod tests {
             .expect("test schema version must set");
     }
 
+    fn create_version_two_schema(database: &TemporaryDatabase, queue_schema: &str) {
+        let connection = Connection::open(&database.path).expect("raw test database must open");
+        connection
+            .execute_batch(DAILY_CRAWL_MIGRATION_0001)
+            .expect("daily-crawl test schema must create");
+        connection
+            .execute_batch(queue_schema)
+            .expect("queue test schema must create");
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .expect("test schema version must set");
+    }
+
     fn insert_old_fixed_probe_collision_rows(connection: &Connection) {
         for day_key in [
             "completion-probe",
@@ -1014,7 +1268,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .expect("schema version must load");
 
-        assert_eq!(schema_version, DAILY_CRAWL_SCHEMA_VERSION);
+        assert_eq!(schema_version, SCHEMA_VERSION);
         assert_eq!(store.load(&day("2026-08-14")), Ok(None));
         let managed_rows = store
             .connection
@@ -1028,6 +1282,60 @@ mod tests {
             )
             .expect("managed row count must load");
         assert_eq!(managed_rows, 0);
+    }
+
+    #[test]
+    fn version_one_daily_crawl_database_upgrades_to_the_queue_schema_without_rewriting_state() {
+        let database = TemporaryDatabase::new("upgrade-v1-to-v2");
+        create_version_one_schema(&database, DAILY_CRAWL_MIGRATION_0001);
+        let crawl_day = day("2026-08-14");
+        let connection = Connection::open(&database.path).expect("raw test database must open");
+        connection
+            .execute(
+                "INSERT INTO crawl_days (day_key, new_releases_completed, browse_progress, browse_cursor)
+                 VALUES (?1, 1, 'continue', '24')",
+                params![crawl_day.as_str()],
+            )
+            .expect("test crawl state must insert");
+        connection
+            .execute(
+                "INSERT INTO crawl_day_selected_or_processed (day_key, source_product_id)
+                 VALUES (?1, '101')",
+                params![crawl_day.as_str()],
+            )
+            .expect("test crawl identity must insert");
+        drop(connection);
+
+        let mut store = database.open();
+        assert_eq!(
+            store.load(&crawl_day),
+            Ok(Some(state(
+                crawl_day.clone(),
+                [101],
+                true,
+                BrowseProgress::Continue(BrowseCursor::new(24)),
+            )))
+        );
+        let version = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("schema version must load");
+        assert_eq!(version, SCHEMA_VERSION);
+        let jobs = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get::<_, i64>(0))
+            .expect("queue table must be available");
+        assert_eq!(jobs, 0);
+    }
+
+    #[test]
+    fn version_two_schema_without_unique_attempt_number_rejects_reopen() {
+        let database = TemporaryDatabase::new("missing-queue-attempt-unique");
+        let schema =
+            JOB_QUEUE_MIGRATION_0002.replace("    UNIQUE (job_identity, attempt_number),\n", "");
+        create_version_two_schema(&database, &schema);
+
+        assert!(SqliteDailyCrawlStateStore::open(&database.path).is_err());
     }
 
     #[test]

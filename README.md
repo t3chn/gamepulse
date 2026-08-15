@@ -12,10 +12,14 @@ M003 plans New Releases first, then newest-first browse progression, with
 numeric-ID daily uniqueness, replay of a partially consumed browse page, and an
 atomic application-owned commit boundary. M004 implements the SQLite adapter
 that durably commits daily-crawl state and selected candidate slugs through that
-boundary.
-Scheduler and timer execution, the generic durable queue, durable ingestion,
-all remaining application persistence, summaries, the web UI, media, LLM,
-deployment, and M005 are not implemented yet.
+boundary. M005 implements the application-owned durable job queue contract and
+its SQLite adapter: stable job deduplication, explicit claims and leases,
+bounded retries, terminal states, stale-claim rejection, reopen persistence,
+execution-attempt history, monotonic clock transitions, and non-reusable claim
+tokens.
+Scheduler and timer execution, queue dispatch and worker handlers, durable
+ingestion, all remaining application persistence, summaries, the web UI, media,
+LLM, and deployment are not implemented yet.
 
 ## Baseline architecture
 
