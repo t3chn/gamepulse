@@ -114,7 +114,11 @@ domain -----------------------------------> no workspace crate
 - **Rule:** the first canary verifies list modes, pagination, stable identity,
   details, scores, trailer, genre, and both review kinds. Runtime uses direct
   HTTP when proven. Browser inspection is development evidence, not a baseline
-  runtime dependency.
+  runtime dependency. M012 permits one separate, optional public-HTML request
+  to `www.metacritic.com/game/{slug}/` per source game-ingestion attempt only
+  to read one validated `og:image` declaration. It is never used by catalogue
+  or detail reads, never derives a CDN URL, and cannot affect mandatory source
+  settlement.
 
 ### AD-8 — Keep the UI server-rendered and embedded
 
@@ -130,7 +134,13 @@ domain -----------------------------------> no workspace crate
   mandatory ingestion to fail or starve.
 - **Rule:** mandatory review summaries have higher priority than optional media
   work. A missing transcript is a terminal optional outcome. Optional failures
-  remain visible but cannot fail mandatory game processing.
+  remain visible but cannot fail mandatory game processing. M012 public cover
+  enrichment is a source-lane-only optional substep: one in-process,
+  low-concurrency HTML gate has a bounded timeout, body limit, disabled
+  redirects and retries, and an until-restart circuit for `403`, `429`, or
+  challenge-like HTML. A missing, malformed, duplicate, oversized, non-HTTPS,
+  or non-`www.metacritic.com` value persists no public cover URL while the
+  mandatory snapshot remains eligible to commit.
 
 ### AD-10 — Preserve the evaluation and secret boundary
 
@@ -161,7 +171,7 @@ by the binary rather than imported by workers or web.
 
 | State | Owner | Purpose |
 | --- | --- | --- |
-| Games and platform scores | `games`, `game_platform_scores` | Current source data |
+| Games, platform scores, and validated public cover URL | `games`, `game_platform_scores` | Current source data |
 | Review source snapshots | `review_snapshots` | Summary inputs and hashes |
 | Summary freshness and output | `summaries` | UI-visible LLM state |
 | Daily crawl progression | `crawl_days` | New Releases then browse ordering |
@@ -303,6 +313,25 @@ refresh. The catalogue detail read model and `/games/{id}` render only persisted
 outputs, including the unavailable state. All M011 tests use local synthetic fixtures and
 in-process HTTP rendering; they make no source or provider call.
 
+M012 adds one bounded optional public-HTML cover-enrichment substep to the
+source adapter. At most one GET to the public game page can be attempted for a
+game-ingestion attempt; the source-side gate permits one in-flight HTML request
+and skips rather than queues a competing attempt. It accepts exactly one
+effective, non-empty, bounded `og:image` declaration in HTML data context only
+when its once-decoded parsed URL is HTTPS with exact host
+`www.metacritic.com`; the accepted value is persisted atomically with the
+existing snapshot and rendered only from SQLite. The optional future runs beside
+mandatory source work but is dropped when that work settles first, so it cannot
+consume the mandatory job lease. The HTML client has its own timeout, body cap,
+no redirects, and no retries. `403` and `429` latch the until-restart circuit
+from response headers before any body read; challenge-like read HTML does too.
+All optional failure paths store no URL and leave snapshot, review refresh,
+queue settlement, daily selection, and summary behavior unchanged. Because the
+current source handler cannot observe the completion of its fixed 20-item batch
+without introducing `runs`/`run_items`, the proposed more-than-four
+parse-or-validation-failure batch disablement remains an operational revisit
+condition rather than durable run state.
+
 Passing CI proves the bounded workspace
 claims and deterministic canary, policy, state-adapter, queue, M006 runtime,
 M007 discovery handler, M008 snapshot foundation, and M009 offline vertical; it
@@ -330,6 +359,10 @@ shows one of:
   bounded concurrency;
 - accepted local transcription needs material CPU, GPU, or memory isolation;
 - a source requires a heavyweight browser runtime;
+- public HTML bot protection or HTML-schema drift makes optional cover
+  enrichment consistently unavailable, or an observable completed fixed
+  20-item source batch shows more than four public-cover parse-or-validation
+  failures and justifies an explicitly designed batch-level disablement model;
 - queue latency violates the evaluator-visible service contract.
 
 Any accepted crate merge, split, new internal edge, or runtime-topology change

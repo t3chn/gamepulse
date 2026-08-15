@@ -27,11 +27,14 @@ pub use review_summary::{ReviewSummaryStoreError, SqliteReviewSummaryStore};
 const DAILY_CRAWL_SCHEMA_VERSION: i64 = 1;
 const JOB_QUEUE_SCHEMA_VERSION: i64 = 2;
 const GAME_SNAPSHOT_SCHEMA_VERSION: i64 = 3;
-const SCHEMA_VERSION: i64 = 4;
+const REVIEW_SUMMARY_SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const DAILY_CRAWL_MIGRATION_0001: &str = include_str!("../migrations/0001_daily_crawl_state.sql");
 const JOB_QUEUE_MIGRATION_0002: &str = include_str!("../migrations/0002_job_queue.sql");
 const GAME_SNAPSHOT_MIGRATION_0003: &str = include_str!("../migrations/0003_game_snapshots.sql");
 const REVIEW_SUMMARY_MIGRATION_0004: &str = include_str!("../migrations/0004_review_summaries.sql");
+const PUBLIC_COVER_URL_MIGRATION_0005: &str =
+    include_str!("../migrations/0005_public_cover_url.sql");
 
 type ForeignKeyDefinition<'a> = (
     i64,
@@ -292,6 +295,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(REVIEW_SUMMARY_MIGRATION_0004)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(PUBLIC_COVER_URL_MIGRATION_0005)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -313,6 +319,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(REVIEW_SUMMARY_MIGRATION_0004)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(PUBLIC_COVER_URL_MIGRATION_0005)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -332,6 +341,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(REVIEW_SUMMARY_MIGRATION_0004)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(PUBLIC_COVER_URL_MIGRATION_0005)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -341,12 +353,33 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
         GAME_SNAPSHOT_SCHEMA_VERSION => {
             validate_daily_crawl_schema(connection)?;
             validate_job_queue_schema(connection)?;
-            validate_game_snapshot_schema(connection)?;
+            validate_game_snapshot_schema_before_public_cover(connection)?;
             let transaction = connection
                 .transaction()
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .execute_batch(REVIEW_SUMMARY_MIGRATION_0004)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(PUBLIC_COVER_URL_MIGRATION_0005)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .commit()
+                .map_err(DailyCrawlStateStoreError::database)
+        }
+        REVIEW_SUMMARY_SCHEMA_VERSION => {
+            validate_daily_crawl_schema(connection)?;
+            validate_job_queue_schema(connection)?;
+            validate_game_snapshot_schema_before_public_cover(connection)?;
+            validate_review_summary_schema(connection)?;
+            let transaction = connection
+                .transaction()
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(PUBLIC_COVER_URL_MIGRATION_0005)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -518,8 +551,37 @@ fn validate_game_snapshot_schema(
             ("cover_filename", "TEXT", 0, 0),
             ("cover_kind", "TEXT", 0, 0),
             ("video_url", "TEXT", 0, 0),
+            ("public_cover_url", "TEXT", 0, 0),
         ],
     )?;
+    validate_game_snapshot_schema_relations_and_constraints(connection)?;
+    validate_public_cover_url_constraint_behavior(connection)
+}
+
+fn validate_game_snapshot_schema_before_public_cover(
+    connection: &mut Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    validate_table_columns(
+        connection,
+        "games",
+        &[
+            ("source_product_id", "INTEGER", 1, 1),
+            ("source_slug", "TEXT", 1, 0),
+            ("title", "TEXT", 1, 0),
+            ("description", "TEXT", 1, 0),
+            ("cover_bucket_path", "TEXT", 0, 0),
+            ("cover_bucket_type", "TEXT", 0, 0),
+            ("cover_filename", "TEXT", 0, 0),
+            ("cover_kind", "TEXT", 0, 0),
+            ("video_url", "TEXT", 0, 0),
+        ],
+    )?;
+    validate_game_snapshot_schema_relations_and_constraints(connection)
+}
+
+fn validate_game_snapshot_schema_relations_and_constraints(
+    connection: &mut Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
     validate_table_columns(
         connection,
         "game_platform_scores",
@@ -556,6 +618,33 @@ fn validate_game_snapshot_schema(
     validate_foreign_key_groups(connection, "game_platform_scores", &game_foreign_key)?;
     validate_foreign_key_groups(connection, "game_developers", &game_foreign_key)?;
     validate_game_snapshot_constraint_behavior(connection)
+}
+
+fn validate_public_cover_url_constraint_behavior(
+    connection: &mut Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(DailyCrawlStateStoreError::database)?;
+    let mut reserved_probe_product_ids = BTreeSet::new();
+    let valid_product_id =
+        next_absent_probe_game_source_id(&transaction, &mut reserved_probe_product_ids)?;
+    let validation = expect_constraint_rejection(
+        &transaction,
+        "blank public cover URL",
+        ExpectedConstraint::Check,
+        "INSERT INTO games (
+            source_product_id, source_slug, title, description, public_cover_url
+         ) VALUES (?1, 'blank-public-cover', 'Blank Public Cover', 'Synthetic', '   ')",
+        params![valid_product_id],
+    );
+    let rollback = transaction.rollback();
+
+    match (validation, rollback) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (_, Err(error)) => Err(DailyCrawlStateStoreError::database(error)),
+    }
 }
 
 fn validate_review_summary_schema(
@@ -1643,6 +1732,63 @@ mod tests {
             .expect("test schema version must set");
     }
 
+    fn create_version_four_schema(database: &TemporaryDatabase) {
+        let connection = Connection::open(&database.path).expect("raw test database must open");
+        connection
+            .execute_batch(DAILY_CRAWL_MIGRATION_0001)
+            .expect("daily-crawl test schema must create");
+        connection
+            .execute_batch(JOB_QUEUE_MIGRATION_0002)
+            .expect("queue test schema must create");
+        connection
+            .execute_batch(GAME_SNAPSHOT_MIGRATION_0003)
+            .expect("snapshot test schema must create");
+        connection
+            .execute_batch(REVIEW_SUMMARY_MIGRATION_0004)
+            .expect("review-summary test schema must create");
+        connection
+            .pragma_update(None, "user_version", REVIEW_SUMMARY_SCHEMA_VERSION)
+            .expect("test schema version must set");
+    }
+
+    fn create_version_five_schema_without_public_cover_check(database: &TemporaryDatabase) {
+        let connection = Connection::open(&database.path).expect("raw test database must open");
+        connection
+            .execute_batch(DAILY_CRAWL_MIGRATION_0001)
+            .expect("daily-crawl test schema must create");
+        connection
+            .execute_batch(JOB_QUEUE_MIGRATION_0002)
+            .expect("queue test schema must create");
+        connection
+            .execute_batch(GAME_SNAPSHOT_MIGRATION_0003)
+            .expect("snapshot test schema must create");
+        connection
+            .execute_batch(REVIEW_SUMMARY_MIGRATION_0004)
+            .expect("review-summary test schema must create");
+        connection
+            .execute_batch("ALTER TABLE games ADD COLUMN public_cover_url TEXT;")
+            .expect("malformed public-cover schema must create");
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .expect("test schema version must set");
+    }
+
+    fn create_version_three_schema(database: &TemporaryDatabase) {
+        let connection = Connection::open(&database.path).expect("raw test database must open");
+        connection
+            .execute_batch(DAILY_CRAWL_MIGRATION_0001)
+            .expect("daily-crawl test schema must create");
+        connection
+            .execute_batch(JOB_QUEUE_MIGRATION_0002)
+            .expect("queue test schema must create");
+        connection
+            .execute_batch(GAME_SNAPSHOT_MIGRATION_0003)
+            .expect("snapshot test schema must create");
+        connection
+            .pragma_update(None, "user_version", GAME_SNAPSHOT_SCHEMA_VERSION)
+            .expect("test schema version must set");
+    }
+
     fn insert_old_fixed_probe_collision_rows(connection: &Connection) {
         for day_key in [
             "completion-probe",
@@ -1809,6 +1955,80 @@ mod tests {
         create_version_two_schema(&database, &schema);
 
         assert!(SqliteDailyCrawlStateStore::open(&database.path).is_err());
+    }
+
+    #[test]
+    fn version_four_database_adds_the_public_cover_column_on_reopen() {
+        let database = TemporaryDatabase::new("upgrade-v4-to-v5-public-cover");
+        create_version_four_schema(&database);
+
+        drop(SqliteDailyCrawlStateStore::open(&database.path).expect("database must migrate"));
+
+        let connection = Connection::open(&database.path).expect("migrated database must reopen");
+        let version = connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("schema version must load");
+        let public_cover_column = connection
+            .prepare("PRAGMA table_info(games)")
+            .expect("table info must prepare")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("table info must load")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("table info values must decode");
+
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(public_cover_column.contains(&"public_cover_url".to_owned()));
+    }
+
+    #[test]
+    fn public_cover_url_check_rejects_blank_and_whitespace_values() {
+        let database = TemporaryDatabase::new("public-cover-url-check");
+        drop(SqliteDailyCrawlStateStore::open(&database.path).expect("database must open"));
+        let connection = Connection::open(&database.path).expect("database must reopen");
+
+        for (source_product_id, value) in [(101_i64, ""), (102_i64, "   ")] {
+            expect_constraint_rejection(
+                &connection,
+                "blank public cover URL",
+                ExpectedConstraint::Check,
+                "INSERT INTO games (
+                    source_product_id, source_slug, title, description, public_cover_url
+                 ) VALUES (?1, 'blank-public-cover', 'Blank Public Cover', 'Synthetic', ?2)",
+                params![source_product_id, value],
+            )
+            .expect("public-cover check must reject blank values");
+        }
+    }
+
+    #[test]
+    fn version_five_schema_without_public_cover_check_rejects_reopen() {
+        let database = TemporaryDatabase::new("missing-public-cover-check");
+        create_version_five_schema_without_public_cover_check(&database);
+
+        assert!(SqliteDailyCrawlStateStore::open(&database.path).is_err());
+    }
+
+    #[test]
+    fn version_three_database_applies_the_review_and_public_cover_migrations_on_reopen() {
+        let database = TemporaryDatabase::new("upgrade-v3-to-v5-public-cover");
+        create_version_three_schema(&database);
+
+        drop(SqliteDailyCrawlStateStore::open(&database.path).expect("database must migrate"));
+
+        let connection = Connection::open(&database.path).expect("migrated database must reopen");
+        let version = connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("schema version must load");
+        let public_cover_column = connection
+            .prepare("PRAGMA table_info(games)")
+            .expect("table info must prepare")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("table info must load")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("table info values must decode");
+
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(public_cover_column.contains(&"public_cover_url".to_owned()));
     }
 
     #[test]

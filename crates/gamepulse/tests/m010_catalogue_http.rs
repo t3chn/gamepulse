@@ -10,8 +10,8 @@ use axum::body::to_bytes;
 use axum::http::StatusCode;
 use axum::response::Response;
 use gamepulse_application::{
-    GameCoverDescriptor, GameDeveloper, GamePlatformScore, GameSnapshot, GameVideoLink, Metascore,
-    SourceProductId, Userscore, upsert_game_snapshot,
+    GameCoverDescriptor, GameDeveloper, GamePlatformScore, GamePublicCoverUrl, GameSnapshot,
+    GameVideoLink, Metascore, SourceProductId, Userscore, upsert_game_snapshot,
 };
 use gamepulse_storage_sqlite::{SqliteGameCatalogueReadStore, SqliteGameSnapshotStore};
 
@@ -82,6 +82,10 @@ fn snapshot(
             .collect(),
     )
     .expect("test snapshot must be valid")
+    .with_public_cover_url(with_cover_and_video.then(|| {
+        GamePublicCoverUrl::new("https://www.metacritic.com/images/example-game.jpg")
+            .expect("test public cover URL must be valid")
+    }))
 }
 
 fn fixture_catalogue(database: &TemporaryDatabase) -> Arc<Mutex<SqliteGameCatalogueReadStore>> {
@@ -192,6 +196,8 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
         ],
     );
     assert!(all_games.contains("Metascore: Not stored"));
+    assert!(all_games.contains("src=\"https://www.metacritic.com/images/example-game.jpg\""));
+    assert!(all_games.contains("<p>Cover unavailable.</p>"));
 
     let (status, search) = read_response(
         gamepulse_web::catalogue_response(Arc::clone(&catalogue), Some("q=aLpHa")).await,
@@ -221,6 +227,8 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
         read_response(gamepulse_web::game_detail_response(Arc::clone(&catalogue), 101).await).await;
     assert_eq!(status, StatusCode::OK);
     assert!(detail.contains("Alpha &#60;untrusted&#62; description"));
+    assert!(detail.contains("src=\"https://www.metacritic.com/images/example-game.jpg\""));
+    assert!(detail.contains("onerror=\"this.onerror=null;this.replaceWith(document.createTextNode('Cover unavailable.'))\""));
     assert!(detail.contains("products/example"));
     assert!(detail.contains("href=\"https://video.example.test/embed\""));
     assert_in_order(
@@ -238,6 +246,7 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
         read_response(gamepulse_web::game_detail_response(Arc::clone(&catalogue), 104).await).await;
     assert_eq!(status, StatusCode::OK);
     assert!(linked_detail.contains("<h1>Delta</h1>"));
+    assert!(linked_detail.contains("<p>Cover unavailable.</p>"));
 
     let (status, empty) = read_response(
         gamepulse_web::catalogue_response(Arc::clone(&catalogue), Some("q=missing")).await,

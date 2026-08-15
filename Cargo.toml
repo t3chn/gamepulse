@@ -19,6 +19,7 @@ rust-version = "1.97"
 [workspace.dependencies]
 askama = "0.14.0"
 axum = { version = "0.8.8", default-features = false, features = ["http1", "tokio"] }
+html5ever = "0.39.0"
 gamepulse-application = { path = "crates/gamepulse-application" }
 gamepulse-domain = { path = "crates/gamepulse-domain" }
 gamepulse-storage-sqlite = { path = "crates/gamepulse-storage-sqlite" }

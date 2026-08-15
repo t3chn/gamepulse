@@ -217,6 +217,12 @@ fn decode_hex(value: u8) -> Option<u8> {
       <li>
         <article>
           <h2><a href="/games/{{ game.source_product_id }}">{{ game.title }}</a></h2>
+          {% match game.public_cover_url %}
+          {% when Some with (url) %}
+          <img src="{{ url }}" alt="Cover for {{ game.title }}" onerror="this.onerror=null;this.replaceWith(document.createTextNode('Cover unavailable.'))">
+          {% when None %}
+          <p>Cover unavailable.</p>
+          {% endmatch %}
           <p>Metascore: {% match game.highest_metascore %}{% when Some with (metascore) %}{{ metascore }}{% when None %}Not stored{% endmatch %}</p>
           <p>Platforms: {{ game.platforms }}</p>
           <p>Developers: {{ game.developers }}</p>
@@ -257,6 +263,7 @@ impl CatalogueTemplate {
                 .map(|game| CatalogueGameCardView {
                     source_product_id: game.source_product_id().value(),
                     title: game.title().to_owned(),
+                    public_cover_url: game.public_cover_url().map(str::to_owned),
                     highest_metascore: game.highest_metascore(),
                     platforms: display_values(game.platforms(), EMPTY_PLATFORMS),
                     developers: display_values(game.developers(), EMPTY_DEVELOPERS),
@@ -274,6 +281,7 @@ struct CataloguePlatformView {
 struct CatalogueGameCardView {
     source_product_id: u64,
     title: String,
+    public_cover_url: Option<String>,
     highest_metascore: Option<u8>,
     platforms: String,
     developers: String,
@@ -297,6 +305,15 @@ struct CatalogueGameCardView {
         <dt>Source slug</dt><dd>{{ game.source_slug }}</dd>
         <dt>Description</dt><dd>{{ game.description }}</dd>
       </dl>
+      <section>
+        <h2>Public cover</h2>
+        {% match game.public_cover_url %}
+        {% when Some with (url) %}
+        <img src="{{ url }}" alt="Cover for {{ game.title }}" onerror="this.onerror=null;this.replaceWith(document.createTextNode('Cover unavailable.'))">
+        {% when None %}
+        <p>Cover unavailable.</p>
+        {% endmatch %}
+      </section>
       <section>
         <h2>Stored cover descriptor</h2>
         {% match game.cover %}
@@ -412,6 +429,7 @@ impl GameDetailTemplate {
                     filename: cover.filename().to_owned(),
                     kind: cover.kind().to_owned(),
                 }),
+                public_cover_url: game.public_cover_url().map(str::to_owned),
                 video: game.video_url().map(|value| CatalogueVideoView {
                     value: value.to_owned(),
                     is_safe_href: is_safe_http_link(value),
@@ -464,6 +482,7 @@ struct CatalogueGameDetailView {
     title: String,
     description: String,
     cover: Option<CatalogueCoverView>,
+    public_cover_url: Option<String>,
     video: Option<CatalogueVideoView>,
     platform_scores: Vec<CataloguePlatformScoreView>,
     developers: String,

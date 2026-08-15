@@ -9,6 +9,7 @@ description = "Metacritic discovery and ingestion worker lane for GamePulse"
 [dependencies]
 gamepulse-application.workspace = true
 gamepulse-domain.workspace = true
+html5ever.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -2,13 +2,20 @@
 
 //! Direct-HTTP Metacritic source contract canary.
 
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::fmt;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
+use html5ever::tendril::{StrTendril, TendrilSink};
+use html5ever::tree_builder::{ElemName, ElementFlags, NodeOrText, QuirksMode, TreeSink};
+use html5ever::{Attribute, LocalName, Namespace, QualName, parse_document};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{Client, StatusCode, Url, redirect};
 use serde::Deserialize;
@@ -24,8 +31,9 @@ use gamepulse_application::{
     execute_async_source_ingestion, persist_game_review_refresh, upsert_game_snapshot,
 };
 use gamepulse_domain::{
-    BrowseCursor, GameCoverDescriptor, GameDeveloper, GamePlatformScore, GameSnapshot,
-    GameSnapshotValidationError, GameVideoLink, REVIEW_EXCERPT_MAX_BYTES, ReviewExcerpt,
+    BrowseCursor, GameCoverDescriptor, GameDeveloper, GamePlatformScore, GamePublicCoverUrl,
+    GameSnapshot, GameSnapshotValidationError, GameVideoLink, REVIEW_EXCERPT_MAX_BYTES,
+    ReviewExcerpt,
 };
 pub use gamepulse_domain::{Metascore, ReviewKind, Userscore};
 
@@ -41,6 +49,15 @@ const MAX_SCHEDULED_HOUR_SLOT: u64 = (i64::MAX as u64) / HOURLY_SCHEDULE_SECONDS
 const HOURLY_DISCOVERY_FAILURE: &str = "source hourly discovery failed";
 const SOURCE_INGESTION_FAILURE: &str = "source game ingestion failed";
 const REVIEW_PAGE_LIMIT: u32 = 20;
+const PUBLIC_HTML_BASE_URL: &str = "https://www.metacritic.com/";
+const PUBLIC_HTML_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_PUBLIC_HTML_RESPONSE_BYTES: usize = 262_144;
+const MAX_PUBLIC_COVER_URL_BYTES: usize = 2_048;
+const MAX_PUBLIC_HTML_PARSE_NODES: usize = 1_024;
+const MAX_PUBLIC_HTML_PARSE_DEPTH: usize = 64;
+const MAX_PUBLIC_HTML_ATTRIBUTES_PER_ELEMENT: usize = 64;
+const MAX_PUBLIC_HTML_ATTRIBUTE_BYTES: usize = 65_536;
+const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
 
 /// Translate the exact durable hourly schedule reference into its UTC calendar day.
 ///
@@ -472,6 +489,711 @@ pub trait GameIngestionTransport: Send + Sync {
     ) -> Self::FetchReviewPageFuture<'_>;
 }
 
+/// One already-bounded response from the optional public-HTML source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicHtmlResponse {
+    status: u16,
+    content_type: Option<String>,
+    content_length: Option<u64>,
+    body: Option<String>,
+}
+
+impl PublicHtmlResponse {
+    pub fn new(status: u16, content_type: Option<String>, body: impl Into<String>) -> Self {
+        let body = body.into();
+        Self {
+            status,
+            content_type,
+            content_length: u64::try_from(body.len()).ok(),
+            body: Some(body),
+        }
+    }
+}
+
+/// One optional HTML response whose status and headers are available before its body is read.
+pub trait PublicHtmlCoverResponse: Send {
+    type ReadBodyError;
+    type ReadBodyFuture<'a>: Future<Output = Result<String, Self::ReadBodyError>> + Send + 'a
+    where
+        Self: 'a;
+
+    fn status(&self) -> u16;
+
+    fn content_type(&self) -> Option<&str>;
+
+    fn content_length(&self) -> Option<u64>;
+
+    fn read_body(&mut self) -> Self::ReadBodyFuture<'_>;
+}
+
+impl PublicHtmlCoverResponse for PublicHtmlResponse {
+    type ReadBodyError = Infallible;
+    type ReadBodyFuture<'a>
+        = std::future::Ready<Result<String, Self::ReadBodyError>>
+    where
+        Self: 'a;
+
+    fn status(&self) -> u16 {
+        self.status
+    }
+
+    fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+
+    fn content_length(&self) -> Option<u64> {
+        self.content_length
+    }
+
+    fn read_body(&mut self) -> Self::ReadBodyFuture<'_> {
+        std::future::ready(Ok(self
+            .body
+            .take()
+            .expect("public HTML body must only be read once")))
+    }
+}
+
+/// Source-adapter seam for the one optional public game-page HTML request.
+pub trait PublicHtmlCoverTransport: Send + Sync {
+    type Error;
+    type Response: PublicHtmlCoverResponse;
+    type FetchFuture<'a>: Future<Output = Result<Self::Response, Self::Error>> + Send + 'a
+    where
+        Self: 'a;
+
+    fn fetch_public_game_html(&self, expected: GameIdentity) -> Self::FetchFuture<'_>;
+}
+
+/// Source-side port for optional public-cover enrichment. It intentionally cannot fail ingestion.
+pub trait OptionalPublicCoverEnricher: Send + Sync {
+    type EnrichFuture<'a>: Future<Output = Option<GamePublicCoverUrl>> + Send + 'a
+    where
+        Self: 'a;
+
+    fn enrich(&self, expected: GameIdentity) -> Self::EnrichFuture<'_>;
+}
+
+/// Explicit absent enrichment used by fixture-only paths that predate M012.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoPublicCoverEnricher;
+
+impl OptionalPublicCoverEnricher for NoPublicCoverEnricher {
+    type EnrichFuture<'a>
+        = Pin<Box<dyn Future<Output = Option<GamePublicCoverUrl>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn enrich(&self, _expected: GameIdentity) -> Self::EnrichFuture<'_> {
+        Box::pin(async { None })
+    }
+}
+
+#[derive(Default)]
+struct PublicHtmlGateState {
+    in_flight: bool,
+    circuit_open: bool,
+}
+
+struct PublicHtmlGatePermit {
+    state: Arc<Mutex<PublicHtmlGateState>>,
+}
+
+impl PublicHtmlGatePermit {
+    fn try_acquire(state: Arc<Mutex<PublicHtmlGateState>>) -> Option<Self> {
+        let mut guard = state.lock().ok()?;
+        if guard.in_flight || guard.circuit_open {
+            return None;
+        }
+        guard.in_flight = true;
+        drop(guard);
+        Some(Self { state })
+    }
+
+    fn open_circuit(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.circuit_open = true;
+        }
+    }
+}
+
+impl Drop for PublicHtmlGatePermit {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.in_flight = false;
+        }
+    }
+}
+
+/// A one-in-flight, until-restart-circuit wrapper around optional public HTML.
+#[derive(Clone)]
+pub struct PublicHtmlCoverEnricher<T> {
+    transport: Arc<T>,
+    gate: Arc<Mutex<PublicHtmlGateState>>,
+}
+
+impl<T> PublicHtmlCoverEnricher<T> {
+    pub fn new(transport: T) -> Self {
+        Self {
+            transport: Arc::new(transport),
+            gate: Arc::new(Mutex::new(PublicHtmlGateState::default())),
+        }
+    }
+}
+
+impl<T> OptionalPublicCoverEnricher for PublicHtmlCoverEnricher<T>
+where
+    T: PublicHtmlCoverTransport + Send + Sync + 'static,
+    T::Error: Send + 'static,
+{
+    type EnrichFuture<'a>
+        = Pin<Box<dyn Future<Output = Option<GamePublicCoverUrl>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn enrich(&self, expected: GameIdentity) -> Self::EnrichFuture<'_> {
+        let transport = Arc::clone(&self.transport);
+        let gate = Arc::clone(&self.gate);
+        Box::pin(async move {
+            let permit = PublicHtmlGatePermit::try_acquire(gate)?;
+            let mut response = transport.fetch_public_game_html(expected).await.ok()?;
+            if response.status() == StatusCode::FORBIDDEN.as_u16()
+                || response.status() == StatusCode::TOO_MANY_REQUESTS.as_u16()
+            {
+                permit.open_circuit();
+                return None;
+            }
+            if response.status() != StatusCode::OK.as_u16()
+                || !is_html_content_type(response.content_type())
+                || public_html_response_body_capacity(response.content_length()).is_err()
+            {
+                return None;
+            }
+            let body = response.read_body().await.ok()?;
+            if is_challenge_like_html(&body) {
+                permit.open_circuit();
+                return None;
+            }
+            parse_public_html_og_image(&body)
+        })
+    }
+}
+
+/// Parse exactly one untrusted Open Graph image declaration into the persisted source value.
+pub fn parse_public_html_og_image(html: &str) -> Option<GamePublicCoverUrl> {
+    if html.len() > MAX_PUBLIC_HTML_RESPONSE_BYTES {
+        return None;
+    }
+
+    parse_document(PublicHtmlOgImageSink::new(), Default::default()).one(html)
+}
+
+/// A deliberately narrow HTML5 tree sink for the optional public cover declaration.
+///
+/// It keeps no text, comments, or general attribute tree. The retained state is only enough to
+/// prove that a decoded `meta[property=og:image]` is a real descendant of `head`, not template
+/// content, and to reject duplicates and bounded-resource breaches.
+struct PublicHtmlOgImageSink {
+    state: RefCell<PublicHtmlOgImageState>,
+}
+
+struct PublicHtmlOgImageState {
+    nodes: Vec<PublicHtmlNode>,
+    attribute_bytes: usize,
+    next_overflow_handle: usize,
+    failed: bool,
+}
+
+struct PublicHtmlNode {
+    parent: Option<usize>,
+    name: Option<QualName>,
+    meta: Option<PublicHtmlMetaDeclaration>,
+    is_template_content: bool,
+    template_content: Option<usize>,
+}
+
+struct PublicHtmlMetaDeclaration {
+    content: Option<String>,
+    had_duplicate_attributes: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PublicHtmlElementName {
+    namespace: Namespace,
+    local: LocalName,
+}
+
+const DOCUMENT_NODE: usize = 0;
+
+impl PublicHtmlOgImageSink {
+    fn new() -> Self {
+        Self {
+            state: RefCell::new(PublicHtmlOgImageState::new()),
+        }
+    }
+}
+
+impl PublicHtmlOgImageState {
+    fn new() -> Self {
+        let mut nodes = Vec::with_capacity(MAX_PUBLIC_HTML_PARSE_NODES + 1);
+        nodes.push(PublicHtmlNode::document());
+        Self {
+            nodes,
+            attribute_bytes: 0,
+            next_overflow_handle: usize::MAX,
+            failed: false,
+        }
+    }
+
+    fn allocate_node(&mut self, node: PublicHtmlNode) -> usize {
+        if !self.can_allocate_nodes(1) {
+            return self.overflow_handle();
+        }
+        let handle = self.nodes.len();
+        self.nodes.push(node);
+        handle
+    }
+
+    fn can_allocate_nodes(&self, count: usize) -> bool {
+        self.nodes
+            .len()
+            .checked_add(count)
+            .is_some_and(|required| required <= MAX_PUBLIC_HTML_PARSE_NODES + 1)
+    }
+
+    fn overflow_handle(&mut self) -> usize {
+        self.failed = true;
+        let handle = self.next_overflow_handle;
+        self.next_overflow_handle = self.next_overflow_handle.saturating_sub(1);
+        handle
+    }
+
+    fn create_element(
+        &mut self,
+        name: QualName,
+        attributes: Vec<Attribute>,
+        flags: ElementFlags,
+    ) -> usize {
+        if !self.reserve_attribute_budget(&attributes) {
+            return self.overflow_handle();
+        }
+        let meta = is_html_element_name(&name, "meta")
+            .then(|| public_html_meta_declaration(&attributes, flags.had_duplicate_attributes))
+            .flatten();
+        if flags.template {
+            if !self.can_allocate_nodes(2) {
+                return self.overflow_handle();
+            }
+            let template = self.allocate_node(PublicHtmlNode::element(name, meta));
+            let content = self.allocate_node(PublicHtmlNode::template_content());
+            self.nodes[template].template_content = Some(content);
+            template
+        } else {
+            self.allocate_node(PublicHtmlNode::element(name, meta))
+        }
+    }
+
+    fn reserve_attribute_budget(&mut self, attributes: &[Attribute]) -> bool {
+        if attributes.len() > MAX_PUBLIC_HTML_ATTRIBUTES_PER_ELEMENT {
+            self.failed = true;
+            return false;
+        }
+        let Some(element_bytes) = attributes.iter().try_fold(0_usize, |total, attribute| {
+            total
+                .checked_add(attribute.name.ns.len())?
+                .checked_add(attribute.name.local.len())?
+                .checked_add(
+                    attribute
+                        .name
+                        .prefix
+                        .as_ref()
+                        .map_or(0, |prefix| prefix.len()),
+                )?
+                .checked_add(attribute.value.len())
+        }) else {
+            self.failed = true;
+            return false;
+        };
+        let Some(total) = self.attribute_bytes.checked_add(element_bytes) else {
+            self.failed = true;
+            return false;
+        };
+        if total > MAX_PUBLIC_HTML_ATTRIBUTE_BYTES {
+            self.failed = true;
+            return false;
+        }
+        self.attribute_bytes = total;
+        true
+    }
+
+    fn append_node(&mut self, parent: usize, child: usize) {
+        if parent >= self.nodes.len()
+            || child >= self.nodes.len()
+            || self.has_ancestor(parent, child)
+        {
+            self.failed = true;
+            return;
+        }
+        if self
+            .depth(parent)
+            .is_none_or(|depth| depth >= MAX_PUBLIC_HTML_PARSE_DEPTH)
+        {
+            self.failed = true;
+            return;
+        }
+        self.nodes[child].parent = Some(parent);
+    }
+
+    fn detach(&mut self, target: usize) {
+        if target >= self.nodes.len() {
+            self.failed = true;
+            return;
+        }
+        self.nodes[target].parent = None;
+    }
+
+    fn append_before_sibling(&mut self, sibling: usize, child: NodeOrText<usize>) {
+        let Some(parent) = self.nodes.get(sibling).and_then(|node| node.parent) else {
+            self.failed = true;
+            return;
+        };
+        self.append(parent, child);
+    }
+
+    fn append(&mut self, parent: usize, child: NodeOrText<usize>) {
+        if let NodeOrText::AppendNode(child) = child {
+            self.append_node(parent, child);
+        }
+    }
+
+    fn reparent_children(&mut self, node: usize, new_parent: usize) {
+        if node >= self.nodes.len() || new_parent >= self.nodes.len() {
+            self.failed = true;
+            return;
+        }
+        for child in DOCUMENT_NODE..self.nodes.len() {
+            if self.nodes[child].parent == Some(node) {
+                self.append_node(new_parent, child);
+            }
+        }
+    }
+
+    fn has_ancestor(&self, mut node: usize, expected: usize) -> bool {
+        for _ in DOCUMENT_NODE..=MAX_PUBLIC_HTML_PARSE_DEPTH {
+            if node == expected {
+                return true;
+            }
+            let Some(parent) = self.nodes.get(node).and_then(|entry| entry.parent) else {
+                return false;
+            };
+            node = parent;
+        }
+        true
+    }
+
+    fn depth(&self, mut node: usize) -> Option<usize> {
+        let mut depth = 0_usize;
+        while let Some(parent) = self.nodes.get(node)?.parent {
+            depth = depth.checked_add(1)?;
+            if depth > MAX_PUBLIC_HTML_PARSE_DEPTH {
+                return None;
+            }
+            node = parent;
+        }
+        Some(depth)
+    }
+
+    fn is_head_descendant(&self, mut node: usize) -> bool {
+        for _ in DOCUMENT_NODE..=MAX_PUBLIC_HTML_PARSE_DEPTH {
+            let Some(parent) = self.nodes.get(node).and_then(|entry| entry.parent) else {
+                return false;
+            };
+            let Some(parent_node) = self.nodes.get(parent) else {
+                return false;
+            };
+            if parent_node.is_template_content {
+                return false;
+            }
+            if parent_node
+                .name
+                .as_ref()
+                .is_some_and(|name| is_html_element_name(name, "head"))
+            {
+                return true;
+            }
+            node = parent;
+        }
+        false
+    }
+
+    fn finish(self) -> Option<GamePublicCoverUrl> {
+        if self.failed {
+            return None;
+        }
+        let mut declaration = None;
+        for node_index in DOCUMENT_NODE..self.nodes.len() {
+            let Some(meta) = self.nodes[node_index].meta.as_ref() else {
+                continue;
+            };
+            if !self.is_head_descendant(node_index) {
+                continue;
+            }
+            if meta.had_duplicate_attributes || declaration.is_some() {
+                return None;
+            }
+            declaration = Some(meta.content.as_deref());
+        }
+        declaration.flatten().and_then(validate_public_cover_url)
+    }
+}
+
+impl PublicHtmlNode {
+    fn document() -> Self {
+        Self {
+            parent: None,
+            name: None,
+            meta: None,
+            is_template_content: false,
+            template_content: None,
+        }
+    }
+
+    fn element(name: QualName, meta: Option<PublicHtmlMetaDeclaration>) -> Self {
+        Self {
+            parent: None,
+            name: Some(name),
+            meta,
+            is_template_content: false,
+            template_content: None,
+        }
+    }
+
+    fn template_content() -> Self {
+        Self {
+            parent: None,
+            name: None,
+            meta: None,
+            is_template_content: true,
+            template_content: None,
+        }
+    }
+}
+
+impl ElemName for PublicHtmlElementName {
+    fn ns(&self) -> &Namespace {
+        &self.namespace
+    }
+
+    fn local_name(&self) -> &LocalName {
+        &self.local
+    }
+}
+
+impl TreeSink for PublicHtmlOgImageSink {
+    type Handle = usize;
+    type Output = Option<GamePublicCoverUrl>;
+    type ElemName<'a>
+        = PublicHtmlElementName
+    where
+        Self: 'a;
+
+    fn finish(self) -> Self::Output {
+        self.state.into_inner().finish()
+    }
+
+    fn parse_error(&self, _: Cow<'static, str>) {
+        self.state.borrow_mut().failed = true;
+    }
+
+    fn get_document(&self) -> Self::Handle {
+        DOCUMENT_NODE
+    }
+
+    fn elem_name<'a>(&'a self, target: &'a Self::Handle) -> Self::ElemName<'a> {
+        let state = self.state.borrow();
+        match state.nodes.get(*target).and_then(|node| node.name.as_ref()) {
+            Some(name) => PublicHtmlElementName {
+                namespace: name.ns.clone(),
+                local: name.local.clone(),
+            },
+            None => PublicHtmlElementName {
+                namespace: Namespace::from(HTML_NAMESPACE),
+                local: LocalName::from("div"),
+            },
+        }
+    }
+
+    fn create_element(
+        &self,
+        name: QualName,
+        attributes: Vec<Attribute>,
+        flags: ElementFlags,
+    ) -> Self::Handle {
+        self.state
+            .borrow_mut()
+            .create_element(name, attributes, flags)
+    }
+
+    fn create_comment(&self, _: StrTendril) -> Self::Handle {
+        self.state
+            .borrow_mut()
+            .allocate_node(PublicHtmlNode::document())
+    }
+
+    fn create_pi(&self, _: StrTendril, _: StrTendril) -> Self::Handle {
+        self.state
+            .borrow_mut()
+            .allocate_node(PublicHtmlNode::document())
+    }
+
+    fn append(&self, parent: &Self::Handle, child: NodeOrText<Self::Handle>) {
+        self.state.borrow_mut().append(*parent, child);
+    }
+
+    fn append_based_on_parent_node(
+        &self,
+        element: &Self::Handle,
+        previous_element: &Self::Handle,
+        child: NodeOrText<Self::Handle>,
+    ) {
+        let mut state = self.state.borrow_mut();
+        if state
+            .nodes
+            .get(*element)
+            .and_then(|node| node.parent)
+            .is_some()
+        {
+            state.append_before_sibling(*element, child);
+        } else {
+            state.append(*previous_element, child);
+        }
+    }
+
+    fn append_doctype_to_document(&self, _: StrTendril, _: StrTendril, _: StrTendril) {}
+
+    fn get_template_contents(&self, target: &Self::Handle) -> Self::Handle {
+        let mut state = self.state.borrow_mut();
+        match state
+            .nodes
+            .get(*target)
+            .and_then(|node| node.template_content)
+        {
+            Some(content) => content,
+            None => state.overflow_handle(),
+        }
+    }
+
+    fn same_node(&self, first: &Self::Handle, second: &Self::Handle) -> bool {
+        first == second
+    }
+
+    fn set_quirks_mode(&self, _: QuirksMode) {}
+
+    fn append_before_sibling(&self, sibling: &Self::Handle, child: NodeOrText<Self::Handle>) {
+        self.state
+            .borrow_mut()
+            .append_before_sibling(*sibling, child);
+    }
+
+    fn add_attrs_if_missing(&self, target: &Self::Handle, _: Vec<Attribute>) {
+        let mut state = self.state.borrow_mut();
+        if state
+            .nodes
+            .get(*target)
+            .and_then(|node| node.meta.as_ref())
+            .is_some()
+        {
+            state.failed = true;
+        }
+    }
+
+    fn remove_from_parent(&self, target: &Self::Handle) {
+        self.state.borrow_mut().detach(*target);
+    }
+
+    fn reparent_children(&self, node: &Self::Handle, new_parent: &Self::Handle) {
+        self.state
+            .borrow_mut()
+            .reparent_children(*node, *new_parent);
+    }
+}
+
+fn is_html_element_name(name: &QualName, expected: &str) -> bool {
+    name.ns.as_ref() == HTML_NAMESPACE && name.local.as_ref().eq_ignore_ascii_case(expected)
+}
+
+fn public_html_meta_declaration(
+    attributes: &[Attribute],
+    had_duplicate_attributes: bool,
+) -> Option<PublicHtmlMetaDeclaration> {
+    let property_is_og_image = attributes.iter().any(|attribute| {
+        attribute.name.ns.is_empty()
+            && attribute
+                .name
+                .local
+                .as_ref()
+                .eq_ignore_ascii_case("property")
+            && attribute.value.eq_ignore_ascii_case("og:image")
+    });
+    if !property_is_og_image {
+        return None;
+    }
+    let content = attributes
+        .iter()
+        .find(|attribute| {
+            attribute.name.ns.is_empty()
+                && attribute
+                    .name
+                    .local
+                    .as_ref()
+                    .eq_ignore_ascii_case("content")
+        })
+        .and_then(|attribute| {
+            let value = attribute.value.trim();
+            (value.len() <= MAX_PUBLIC_COVER_URL_BYTES).then(|| value.to_owned())
+        });
+    Some(PublicHtmlMetaDeclaration {
+        content,
+        had_duplicate_attributes,
+    })
+}
+
+fn is_html_content_type(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/html"))
+}
+
+fn is_challenge_like_html(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    [
+        "cf-chl-",
+        "captcha",
+        "challenge-platform",
+        "verify you are human",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
+}
+
+fn validate_public_cover_url(value: &str) -> Option<GamePublicCoverUrl> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_PUBLIC_COVER_URL_BYTES {
+        return None;
+    }
+    let url = Url::parse(value).ok()?;
+    if url.scheme() != "https"
+        || !url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("www.metacritic.com"))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+    {
+        return None;
+    }
+    GamePublicCoverUrl::new(url.to_string()).ok()
+}
+
 /// Map one parsed product payload and the available per-platform Userscores into the inner model.
 ///
 /// This is deliberately request-free. Missing score responses remain `None`; supplied scores must
@@ -702,14 +1424,25 @@ where
 }
 
 /// Metacritic source adapter for M011's snapshot plus two bounded, kind-separated review inputs.
-pub struct MetacriticGameReviewSource<T> {
+pub struct MetacriticGameReviewSource<T, C = NoPublicCoverEnricher> {
     transport: Arc<T>,
+    public_cover_enricher: Arc<C>,
 }
 
-impl<T> MetacriticGameReviewSource<T> {
+impl<T> MetacriticGameReviewSource<T, NoPublicCoverEnricher> {
     pub fn new(transport: T) -> Self {
         Self {
             transport: Arc::new(transport),
+            public_cover_enricher: Arc::new(NoPublicCoverEnricher),
+        }
+    }
+}
+
+impl<T, C> MetacriticGameReviewSource<T, C> {
+    pub fn with_public_cover_enricher(transport: T, public_cover_enricher: C) -> Self {
+        Self {
+            transport: Arc::new(transport),
+            public_cover_enricher: Arc::new(public_cover_enricher),
         }
     }
 }
@@ -747,10 +1480,11 @@ impl<E> fmt::Display for MetacriticGameReviewError<E> {
 
 impl<E: std::error::Error + 'static> std::error::Error for MetacriticGameReviewError<E> {}
 
-impl<T> AsyncReviewSourceIngestionPort for MetacriticGameReviewSource<T>
+impl<T, C> AsyncReviewSourceIngestionPort for MetacriticGameReviewSource<T, C>
 where
     T: GameIngestionTransport + Send + Sync + 'static,
     T::Error: Send + 'static,
+    C: OptionalPublicCoverEnricher + Send + Sync + 'static,
 {
     type Error = MetacriticGameReviewError<T::Error>;
     type IngestFuture<'a>
@@ -760,48 +1494,67 @@ where
 
     fn ingest_reviews(&self, request: SourceIngestionRequest) -> Self::IngestFuture<'_> {
         let transport = Arc::clone(&self.transport);
+        let public_cover_enricher = Arc::clone(&self.public_cover_enricher);
         Box::pin(async move {
             let expected_game = GameIdentity {
                 id: GameId(request.source_product_id().value()),
                 slug: request.source_slug().to_owned(),
             };
-            let detail = transport
-                .fetch_game_detail(expected_game.clone())
-                .await
-                .map_err(MetacriticGameReviewError::Transport)?;
-            if detail.id != expected_game.id || detail.slug != expected_game.slug {
-                return Err(MetacriticGameReviewError::MismatchedGameIdentity);
-            }
-            let mut user_scores = Vec::with_capacity(detail.platforms.len());
-            for platform in detail.platforms.iter().cloned() {
-                user_scores.push(
-                    transport
-                        .fetch_platform_user_score(expected_game.clone(), platform)
-                        .await
-                        .map_err(MetacriticGameReviewError::Transport)?,
-                );
-            }
-            let snapshot = map_game_detail_to_snapshot(&detail, user_scores)
-                .map_err(MetacriticGameReviewError::Snapshot)?;
-            let mut inputs = BTreeMap::new();
-            for kind in ReviewKind::ALL {
-                let page = transport
-                    .fetch_review_page(expected_game.clone(), kind, 0, REVIEW_PAGE_LIMIT)
+            let mut cover_future = Some(Box::pin(
+                public_cover_enricher.enrich(expected_game.clone()),
+            ));
+            let mut completed_cover = None;
+            let mut mandatory_future = Box::pin(async move {
+                let detail = transport
+                    .fetch_game_detail(expected_game.clone())
                     .await
                     .map_err(MetacriticGameReviewError::Transport)?;
-                if page.kind != kind {
-                    return Err(MetacriticGameReviewError::MismatchedReviewKind);
+                if detail.id != expected_game.id || detail.slug != expected_game.slug {
+                    return Err(MetacriticGameReviewError::MismatchedGameIdentity);
                 }
-                let input = map_review_page_to_input(request.source_product_id(), &page)
-                    .map_err(MetacriticGameReviewError::ReviewInput)?;
-                inputs.insert(kind, input);
-            }
-            let critic = inputs
-                .remove(&ReviewKind::Critic)
-                .expect("all review kinds are requested");
-            let user = inputs
-                .remove(&ReviewKind::User)
-                .expect("all review kinds are requested");
+                let mut user_scores = Vec::with_capacity(detail.platforms.len());
+                for platform in detail.platforms.iter().cloned() {
+                    user_scores.push(
+                        transport
+                            .fetch_platform_user_score(expected_game.clone(), platform)
+                            .await
+                            .map_err(MetacriticGameReviewError::Transport)?,
+                    );
+                }
+                let snapshot = map_game_detail_to_snapshot(&detail, user_scores)
+                    .map_err(MetacriticGameReviewError::Snapshot)?;
+                let mut inputs = BTreeMap::new();
+                for kind in ReviewKind::ALL {
+                    let page = transport
+                        .fetch_review_page(expected_game.clone(), kind, 0, REVIEW_PAGE_LIMIT)
+                        .await
+                        .map_err(MetacriticGameReviewError::Transport)?;
+                    if page.kind != kind {
+                        return Err(MetacriticGameReviewError::MismatchedReviewKind);
+                    }
+                    let input = map_review_page_to_input(request.source_product_id(), &page)
+                        .map_err(MetacriticGameReviewError::ReviewInput)?;
+                    inputs.insert(kind, input);
+                }
+                let critic = inputs
+                    .remove(&ReviewKind::Critic)
+                    .expect("all review kinds are requested");
+                let user = inputs
+                    .remove(&ReviewKind::User)
+                    .expect("all review kinds are requested");
+                Ok((snapshot, critic, user))
+            });
+            let (snapshot, critic, user) = poll_fn(|context| {
+                if let Some(cover) = cover_future.as_mut()
+                    && let Poll::Ready(result) = cover.as_mut().poll(context)
+                {
+                    completed_cover = Some(result);
+                    cover_future = None;
+                }
+                mandatory_future.as_mut().poll(context)
+            })
+            .await?;
+            let snapshot = snapshot.with_public_cover_url(completed_cover.flatten());
             ReviewSourceIngestion::new(snapshot, critic, user)
                 .map_err(MetacriticGameReviewError::Ingestion)
         })
@@ -952,6 +1705,95 @@ pub enum ReviewInputMappingError {
 pub struct MetacriticCanaryClient {
     backend: Url,
     http: Client,
+}
+
+/// The separately bounded public-HTML transport used only for M012 cover enrichment.
+#[derive(Clone)]
+pub struct MetacriticPublicHtmlTransport {
+    public: Url,
+    http: Client,
+}
+
+/// Header-first response for the optional public-HTML lane.
+pub struct MetacriticPublicHtmlResponse {
+    status: u16,
+    content_type: Option<String>,
+    content_length: Option<u64>,
+    response: Option<reqwest::Response>,
+}
+
+impl MetacriticPublicHtmlTransport {
+    pub fn new() -> Result<Self, SourceError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("text/html"));
+        let http = Client::builder()
+            .default_headers(headers)
+            .redirect(redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .timeout(PUBLIC_HTML_REQUEST_TIMEOUT)
+            .build()
+            .map_err(SourceError::Http)?;
+        let public = Url::parse(PUBLIC_HTML_BASE_URL).map_err(|_| SourceError::InvalidEndpoint)?;
+        Ok(Self { public, http })
+    }
+
+    async fn fetch_public_game_html(
+        &self,
+        expected: &GameIdentity,
+    ) -> Result<MetacriticPublicHtmlResponse, SourceError> {
+        validate_slug(&expected.slug)?;
+        let mut url = self.public.clone();
+        url.set_path(&format!("/game/{}/", expected.slug));
+        let response = self.http.get(url).send().await.map_err(SourceError::Http)?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        Ok(MetacriticPublicHtmlResponse {
+            status,
+            content_type,
+            content_length: response.content_length(),
+            response: Some(response),
+        })
+    }
+}
+
+impl PublicHtmlCoverResponse for MetacriticPublicHtmlResponse {
+    type ReadBodyError = SourceError;
+    type ReadBodyFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<String, Self::ReadBodyError>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn status(&self) -> u16 {
+        self.status
+    }
+
+    fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+
+    fn content_length(&self) -> Option<u64> {
+        self.content_length
+    }
+
+    fn read_body(&mut self) -> Self::ReadBodyFuture<'_> {
+        let mut response = self
+            .response
+            .take()
+            .expect("public HTML body must only be read once");
+        Box::pin(async move {
+            let mut body = Vec::with_capacity(public_html_response_body_capacity(
+                response.content_length(),
+            )?);
+            while let Some(chunk) = response.chunk().await.map_err(SourceError::Http)? {
+                append_public_html_response_chunk(&mut body, chunk.as_ref())?;
+            }
+            String::from_utf8(body).map_err(|_| SourceError::InvalidResponseUtf8)
+        })
+    }
 }
 
 impl MetacriticCanaryClient {
@@ -1254,6 +2096,19 @@ impl GameIngestionTransport for MetacriticCanaryClient {
             )
             .await
         })
+    }
+}
+
+impl PublicHtmlCoverTransport for MetacriticPublicHtmlTransport {
+    type Error = SourceError;
+    type Response = MetacriticPublicHtmlResponse;
+    type FetchFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn fetch_public_game_html(&self, expected: GameIdentity) -> Self::FetchFuture<'_> {
+        Box::pin(async move { Self::fetch_public_game_html(self, &expected).await })
     }
 }
 
@@ -1755,12 +2610,36 @@ fn response_body_capacity(content_length: Option<u64>) -> Result<usize, SourceEr
     Ok(content_length)
 }
 
+fn public_html_response_body_capacity(content_length: Option<u64>) -> Result<usize, SourceError> {
+    let Some(content_length) = content_length else {
+        return Ok(0);
+    };
+    let content_length =
+        usize::try_from(content_length).map_err(|_| SourceError::ResponseTooLarge)?;
+    if content_length > MAX_PUBLIC_HTML_RESPONSE_BYTES {
+        return Err(SourceError::ResponseTooLarge);
+    }
+    Ok(content_length)
+}
+
 fn append_response_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), SourceError> {
     let next_length = body
         .len()
         .checked_add(chunk.len())
         .ok_or(SourceError::ResponseTooLarge)?;
     if next_length > MAX_RESPONSE_BYTES {
+        return Err(SourceError::ResponseTooLarge);
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn append_public_html_response_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), SourceError> {
+    let next_length = body
+        .len()
+        .checked_add(chunk.len())
+        .ok_or(SourceError::ResponseTooLarge)?;
+    if next_length > MAX_PUBLIC_HTML_RESPONSE_BYTES {
         return Err(SourceError::ResponseTooLarge);
     }
     body.extend_from_slice(chunk);

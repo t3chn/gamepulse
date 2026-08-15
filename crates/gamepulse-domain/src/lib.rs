@@ -146,6 +146,22 @@ impl GameVideoLink {
     }
 }
 
+/// A validated public cover URL that the source adapter may persist with a snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GamePublicCoverUrl(String);
+
+impl GamePublicCoverUrl {
+    pub fn new(value: impl Into<String>) -> Result<Self, GameSnapshotValidationError> {
+        let value = value.into();
+        validate_snapshot_text("public cover URL", &value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// One available platform and its independently optional scores.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GamePlatformScore {
@@ -217,6 +233,7 @@ pub struct GameSnapshot {
     title: String,
     description: String,
     cover: Option<GameCoverDescriptor>,
+    public_cover_url: Option<GamePublicCoverUrl>,
     video: Option<GameVideoLink>,
     platform_scores: Vec<GamePlatformScore>,
     developers: Vec<GameDeveloper>,
@@ -260,6 +277,7 @@ impl GameSnapshot {
             title,
             description,
             cover,
+            public_cover_url: None,
             video,
             platform_scores,
             developers,
@@ -284,6 +302,16 @@ impl GameSnapshot {
 
     pub fn cover(&self) -> Option<&GameCoverDescriptor> {
         self.cover.as_ref()
+    }
+
+    /// Attach one source-validated public cover URL without changing the original descriptor.
+    pub fn with_public_cover_url(mut self, public_cover_url: Option<GamePublicCoverUrl>) -> Self {
+        self.public_cover_url = public_cover_url;
+        self
+    }
+
+    pub fn public_cover_url(&self) -> Option<&GamePublicCoverUrl> {
+        self.public_cover_url.as_ref()
     }
 
     pub fn video(&self) -> Option<&GameVideoLink> {

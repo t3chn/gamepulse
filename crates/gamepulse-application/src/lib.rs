@@ -11,10 +11,10 @@ use std::sync::Arc;
 pub use gamepulse_domain::{
     APP_NAME, BrowseCursor, BrowseProgress, CrawlDayKey, CrawlDayKeyError, CrawlDiscoveryRequest,
     DailyCrawlAction, DailyCrawlState, DailyCrawlTransition, GameCoverDescriptor, GameDeveloper,
-    GamePlatformScore, GameSnapshot, GameSnapshotValidationError, GameVideoLink, Metascore,
-    MetascoreError, REVIEW_EXCERPT_MAX_BYTES, REVIEW_INPUT_LIMIT, ReviewExcerpt,
-    ReviewExcerptError, ReviewKind, SourceProductId, SourceProductIdError, Userscore,
-    UserscoreError,
+    GamePlatformScore, GamePublicCoverUrl, GameSnapshot, GameSnapshotValidationError,
+    GameVideoLink, Metascore, MetascoreError, REVIEW_EXCERPT_MAX_BYTES, REVIEW_INPUT_LIMIT,
+    ReviewExcerpt, ReviewExcerptError, ReviewKind, SourceProductId, SourceProductIdError,
+    Userscore, UserscoreError,
 };
 use gamepulse_domain::{prepare_daily_crawl, select_daily_crawl};
 
@@ -33,6 +33,7 @@ pub trait GameSnapshotStore {
 pub struct CatalogueGameCard {
     source_product_id: SourceProductId,
     title: String,
+    public_cover_url: Option<String>,
     highest_metascore: Option<u8>,
     platforms: Vec<String>,
     developers: Vec<String>,
@@ -42,6 +43,7 @@ impl CatalogueGameCard {
     pub fn new(
         source_product_id: SourceProductId,
         title: impl Into<String>,
+        public_cover_url: Option<String>,
         highest_metascore: Option<u8>,
         platforms: Vec<String>,
         developers: Vec<String>,
@@ -49,6 +51,7 @@ impl CatalogueGameCard {
         Self {
             source_product_id,
             title: title.into(),
+            public_cover_url,
             highest_metascore,
             platforms,
             developers,
@@ -61,6 +64,10 @@ impl CatalogueGameCard {
 
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    pub fn public_cover_url(&self) -> Option<&str> {
+        self.public_cover_url.as_deref()
     }
 
     pub const fn highest_metascore(&self) -> Option<u8> {
@@ -201,6 +208,7 @@ pub struct CatalogueGameDetail {
     title: String,
     description: String,
     cover: Option<CatalogueCoverDescriptor>,
+    public_cover_url: Option<String>,
     video_url: Option<String>,
     platform_scores: Vec<CataloguePlatformScore>,
     developers: Vec<String>,
@@ -217,6 +225,7 @@ impl CatalogueGameDetail {
         title: impl Into<String>,
         description: impl Into<String>,
         cover: Option<CatalogueCoverDescriptor>,
+        public_cover_url: Option<String>,
         video_url: Option<String>,
         platform_scores: Vec<CataloguePlatformScore>,
         developers: Vec<String>,
@@ -230,6 +239,7 @@ impl CatalogueGameDetail {
             title: title.into(),
             description: description.into(),
             cover,
+            public_cover_url,
             video_url,
             platform_scores,
             developers,
@@ -257,6 +267,10 @@ impl CatalogueGameDetail {
 
     pub fn cover(&self) -> Option<&CatalogueCoverDescriptor> {
         self.cover.as_ref()
+    }
+
+    pub fn public_cover_url(&self) -> Option<&str> {
+        self.public_cover_url.as_deref()
     }
 
     pub fn video_url(&self) -> Option<&str> {

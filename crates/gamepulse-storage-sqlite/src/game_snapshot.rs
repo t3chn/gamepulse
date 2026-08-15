@@ -73,8 +73,9 @@ pub(crate) fn upsert_snapshot_in_transaction(
                 cover_bucket_type,
                 cover_filename,
                 cover_kind,
-                video_url
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                video_url,
+                public_cover_url
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(source_product_id) DO UPDATE SET
                 source_slug = excluded.source_slug,
                 title = excluded.title,
@@ -83,7 +84,8 @@ pub(crate) fn upsert_snapshot_in_transaction(
                 cover_bucket_type = excluded.cover_bucket_type,
                 cover_filename = excluded.cover_filename,
                 cover_kind = excluded.cover_kind,
-                video_url = excluded.video_url",
+                video_url = excluded.video_url,
+                public_cover_url = excluded.public_cover_url",
             params![
                 source_product_id,
                 snapshot.source_slug(),
@@ -94,6 +96,7 @@ pub(crate) fn upsert_snapshot_in_transaction(
                 cover.map(|value| value.filename()),
                 cover.map(|value| value.kind()),
                 snapshot.video().map(|value| value.as_str()),
+                snapshot.public_cover_url().map(|value| value.as_str()),
             ],
         )
         .map_err(GameSnapshotStoreError::database)?;
@@ -197,8 +200,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use gamepulse_application::{
-        GameCoverDescriptor, GameDeveloper, GamePlatformScore, GameSnapshot, GameVideoLink,
-        Metascore, SourceProductId, Userscore, upsert_game_snapshot,
+        GameCoverDescriptor, GameDeveloper, GamePlatformScore, GamePublicCoverUrl, GameSnapshot,
+        GameVideoLink, Metascore, SourceProductId, Userscore, upsert_game_snapshot,
     };
     use rusqlite::params;
 
@@ -294,6 +297,10 @@ mod tests {
             vec![platform(7, "pc", Some(90), Some(9.0))],
             &["Replacement Studio"],
         )
+        .with_public_cover_url(Some(
+            GamePublicCoverUrl::new("https://www.metacritic.com/images/replacement.jpg")
+                .expect("test public cover URL must be valid"),
+        ))
     }
 
     fn row_count(store: &SqliteGameSnapshotStore, table: &str) -> i64 {
@@ -314,6 +321,17 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("test game slug must load")
+    }
+
+    fn public_cover_url(store: &SqliteGameSnapshotStore) -> Option<String> {
+        store
+            .connection
+            .query_row(
+                "SELECT public_cover_url FROM games WHERE source_product_id = 101",
+                [],
+                |row| row.get(0),
+            )
+            .expect("test public cover URL must load")
     }
 
     fn platform_ids(store: &SqliteGameSnapshotStore) -> Vec<i64> {
@@ -362,6 +380,10 @@ mod tests {
 
         assert_eq!(row_count(&store, "games"), 1);
         assert_eq!(source_slug(&store), "renamed-example-game");
+        assert_eq!(
+            public_cover_url(&store).as_deref(),
+            Some("https://www.metacritic.com/images/replacement.jpg")
+        );
         assert_eq!(platform_ids(&store), [7]);
         assert_eq!(developer_names(&store), ["Replacement Studio"]);
     }
@@ -391,6 +413,7 @@ mod tests {
         assert!(upsert_game_snapshot(&mut store, &replacement_snapshot()).is_err());
 
         assert_eq!(source_slug(&store), "example-game");
+        assert_eq!(public_cover_url(&store), None);
         assert_eq!(platform_ids(&store), [7, 8]);
         assert_eq!(developer_names(&store), ["Example Studio", "Second Studio"]);
     }
@@ -407,6 +430,10 @@ mod tests {
         let reopened = database.open();
         assert_eq!(row_count(&reopened, "games"), 1);
         assert_eq!(source_slug(&reopened), "renamed-example-game");
+        assert_eq!(
+            public_cover_url(&reopened).as_deref(),
+            Some("https://www.metacritic.com/images/replacement.jpg")
+        );
         assert_eq!(platform_ids(&reopened), [7]);
         assert_eq!(developer_names(&reopened), ["Replacement Studio"]);
     }

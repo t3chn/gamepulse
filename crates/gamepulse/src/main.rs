@@ -15,7 +15,8 @@ use gamepulse_storage_sqlite::{
 use gamepulse_worker_llm::{LocalExtractiveReviewSummarizer, ReviewSummaryHandler};
 use gamepulse_worker_source::{
     HourlyDiscoveryHandler, MetacriticCanaryClient, MetacriticDailyCrawlSource,
-    MetacriticGameReviewSource, ReviewSourceIngestionHandler,
+    MetacriticGameReviewSource, MetacriticPublicHtmlTransport, PublicHtmlCoverEnricher,
+    ReviewSourceIngestionHandler,
 };
 use runtime::{Runtime, RuntimeConfig, SystemRuntimeClock};
 use tokio::sync::Notify;
@@ -40,6 +41,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &database_path,
     )?));
     let source_client = MetacriticCanaryClient::new()?;
+    let public_html_cover = PublicHtmlCoverEnricher::new(MetacriticPublicHtmlTransport::new()?);
     let source_port = MetacriticDailyCrawlSource::new(source_client.clone());
     let schedule = HourlyJobSchedule::new(RuntimeJobType::SourceHourlyDiscovery, 3)?;
     let source_ingestion_schedule = SourceIngestionJobSchedule::new(3)?;
@@ -55,7 +57,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let ingestion_handler: Arc<dyn JobHandler> = Arc::new(ReviewSourceIngestionHandler::new(
         review_summaries.clone(),
-        MetacriticGameReviewSource::new(source_client),
+        MetacriticGameReviewSource::with_public_cover_enricher(source_client, public_html_cover),
         review_summary_schedule,
     ));
     let source_handlers = Arc::new(JobHandlerRegistry::new([

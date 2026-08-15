@@ -23,9 +23,45 @@ malformed required structure.
   disables reqwest retries.
 - The completed live-canary report records 20 New Releases items, a numeric
   total, and a continuation link; it did not retain a source payload.
-- The public HTML routes remain evidence surfaces rather than the runtime data
-  source: `/game/`, `/browse/game/all/all/all-time/new/`, and
-  `/game/{slug}/`.
+- The public HTML routes remain evidence surfaces rather than the mandatory
+  runtime data source: `/game/`, `/browse/game/all/all/all-time/new/`, and
+  `/game/{slug}/`. M012 makes one deliberately narrow exception for optional
+  cover enrichment, described below.
+
+## Optional public-HTML cover enrichment (M012)
+
+The source adapter may make at most one `GET` request to
+`https://www.metacritic.com/game/{slug}/` for a game-ingestion attempt. This
+request is never made by catalogue or detail rendering and is never used to
+probe, derive, download, proxy, or persist CDN/image bytes.
+
+- The separate HTML client has one in-flight gate, a bounded timeout and body
+  cap, redirects disabled, and retries disabled. A competing source attempt
+  skips cover enrichment rather than waits or opens another HTML request. The
+  optional future starts beside mandatory source work, but is dropped when that
+  work settles first; it never consumes the mandatory job lease.
+- The response is optional and untrusted. It may yield a cover URL only when
+  exactly one effective `meta` declaration in HTML data context names `og:image`
+  and its content is non-empty,
+  within the configured URL bound, parses as HTTPS, and has exact host
+  `www.metacritic.com`. Attribute character references decode once before
+  validation. Missing, duplicate, malformed, oversized, non-HTTPS,
+  credentialed, non-default-port, or other-host values fail closed to no public
+  cover URL.
+- HTTP `403` and `429` open the in-process circuit from headers before any body
+  validation or read. Challenge-like successfully read HTML also opens it.
+  Until process restart, the circuit prevents every further optional HTML
+  attempt. Other optional transport, status, content-type, size, body-read,
+  decode, parse, or validation failures also store no URL.
+- The accepted URL is persisted atomically with the ordinary game snapshot.
+  Optional HTML failure never changes mandatory detail, score, review, queue,
+  daily-selection, or review-summary outcomes.
+
+The current fixed 20-item discovery selection is not an observable completed
+ingestion batch at this boundary. Therefore M012 does not add `runs` or
+`run_items` for the proposed 20% safeguard. Revisit batch-level source cover
+enrichment disablement only when a completed fixed 20-item batch is observable;
+then disable after more than four parse-or-validation failures in that batch.
 
 ## Discovery lists
 
@@ -127,3 +163,6 @@ excerpt fields as untrusted input; critic and user data must not be combined.
   item ineligible.
 - The contract has no published rate-limit policy. A scheduler must add its own
   concurrency and retry policy in its dedicated milestone.
+- Public HTML is subject to bot protection and has no established stability or
+  availability guarantee. M012 treats it as a fail-closed optional enrichment,
+  not as a required cover-image contract.
