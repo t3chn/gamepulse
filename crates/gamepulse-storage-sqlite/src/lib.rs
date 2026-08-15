@@ -104,6 +104,10 @@ impl SqliteDailyCrawlStateStore {
         write_state(&transaction, commit.state())?;
         write_selected_or_processed(&transaction, commit.state())?;
         write_selected_candidates(&transaction, day, commit.selected())?;
+        for request in commit.jobs() {
+            job_queue::enqueue_derived_request(&transaction, request)
+                .map_err(|_| DailyCrawlStateStoreError::job_enqueue())?;
+        }
         transaction
             .commit()
             .map_err(DailyCrawlStateStoreError::database)
@@ -148,6 +152,51 @@ impl SqliteDailyCrawlStateStore {
             )
             .expect("test trigger must install");
     }
+
+    #[cfg(test)]
+    fn install_job_insert_failure_for_test(&self) {
+        self.connection
+            .execute_batch(
+                "CREATE TRIGGER fail_source_ingestion_job_insert
+                 BEFORE INSERT ON jobs
+                 BEGIN
+                     SELECT RAISE(ABORT, 'test source ingestion job insert failure');
+                 END;",
+            )
+            .expect("test trigger must install");
+    }
+
+    #[cfg(test)]
+    fn job_identities(&self) -> Vec<String> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT job_identity FROM jobs ORDER BY job_identity")
+            .expect("test job query must prepare");
+        statement
+            .query_map([], |row| row.get(0))
+            .expect("test job query must execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("test job rows must decode")
+    }
+
+    #[cfg(test)]
+    fn job_request_for(&self, identity: &str) -> Option<(String, String, u32)> {
+        self.connection
+            .query_row(
+                "SELECT job_type, work_ref, max_attempts FROM jobs WHERE job_identity = ?1",
+                params![identity],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        u32::try_from(row.get::<_, i64>(2)?)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, 0))?,
+                    ))
+                },
+            )
+            .optional()
+            .expect("test job request query must execute")
+    }
 }
 
 impl DailyCrawlStatePort for SqliteDailyCrawlStateStore {
@@ -175,6 +224,12 @@ impl DailyCrawlStateStoreError {
     fn database(error: rusqlite::Error) -> Self {
         Self {
             message: format!("SQLite daily crawl state operation failed: {error}"),
+        }
+    }
+
+    fn job_enqueue() -> Self {
+        Self {
+            message: "SQLite daily crawl job enqueue failed".to_owned(),
         }
     }
 
@@ -1321,6 +1376,8 @@ mod tests {
     use std::process;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use gamepulse_application::{JobTimestamp, SourceIngestionJobSchedule};
+
     use super::*;
 
     static NEXT_TEMPORARY_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -1384,6 +1441,20 @@ mod tests {
     ) -> DailyCrawlCommit {
         DailyCrawlCommit::new(expected_previous_state, state, selected)
             .expect("test commit must be valid")
+    }
+
+    fn commit_with_source_ingestion_jobs(
+        expected_previous_state: Option<DailyCrawlState>,
+        state: DailyCrawlState,
+        selected: Vec<DiscoveryCandidate>,
+        created_at: i64,
+    ) -> DailyCrawlCommit {
+        commit(expected_previous_state, state, selected)
+            .with_source_ingestion_jobs(
+                SourceIngestionJobSchedule::new(2).expect("schedule must be valid"),
+                JobTimestamp::new(created_at).expect("timestamp must be valid"),
+            )
+            .expect("source ingestion jobs must be valid")
     }
 
     fn create_version_one_schema(database: &TemporaryDatabase, schema: &str) {
@@ -1894,6 +1965,113 @@ mod tests {
         assert_eq!(
             store.selected_candidates_for_day(&crawl_day),
             vec![(1, "first".to_owned())]
+        );
+    }
+
+    #[test]
+    fn source_ingestion_job_insert_failure_rolls_back_state_candidates_and_jobs() {
+        let mut store = SqliteDailyCrawlStateStore::open_in_memory().expect("store must open");
+        let crawl_day = day("2026-08-14");
+        let next = state(crawl_day.clone(), [2], true, BrowseProgress::Initial);
+        store.install_job_insert_failure_for_test();
+
+        assert!(
+            store
+                .commit(commit_with_source_ingestion_jobs(
+                    None,
+                    next,
+                    vec![candidate(2, "second")],
+                    0,
+                ))
+                .is_err()
+        );
+
+        assert_eq!(store.load(&crawl_day), Ok(None));
+        assert!(store.selected_candidates_for_day(&crawl_day).is_empty());
+        assert!(store.job_identities().is_empty());
+    }
+
+    #[test]
+    fn source_ingestion_jobs_deduplicate_replay_and_allow_later_day_reprocess() {
+        let mut store = SqliteDailyCrawlStateStore::open_in_memory().expect("store must open");
+        let first_day = day("2026-08-14");
+        let first_state = state(first_day.clone(), [41], true, BrowseProgress::Initial);
+
+        store
+            .commit(commit_with_source_ingestion_jobs(
+                None,
+                first_state.clone(),
+                vec![candidate(41, "first-slug")],
+                0,
+            ))
+            .expect("first state and job must commit");
+        store
+            .commit(commit_with_source_ingestion_jobs(
+                Some(first_state.clone()),
+                first_state,
+                vec![candidate(41, "first-slug")],
+                1,
+            ))
+            .expect("replay must deduplicate the job");
+
+        let second_day = day("2026-08-15");
+        let second_state = state(second_day.clone(), [41], true, BrowseProgress::Initial);
+        store
+            .commit(commit_with_source_ingestion_jobs(
+                None,
+                second_state,
+                vec![candidate(41, "later-day-slug")],
+                2,
+            ))
+            .expect("later day must create a reprocess job");
+
+        assert_eq!(
+            store.job_identities(),
+            [
+                "source.game-ingestion:2026-08-14:41",
+                "source.game-ingestion:2026-08-15:41",
+            ]
+        );
+    }
+
+    #[test]
+    fn stale_same_day_slug_job_conflict_rolls_back_state_candidates_and_queue() {
+        let mut store = SqliteDailyCrawlStateStore::open_in_memory().expect("store must open");
+        let crawl_day = day("2026-08-14");
+        let committed = state(crawl_day.clone(), [41], true, BrowseProgress::Initial);
+
+        store
+            .commit(commit_with_source_ingestion_jobs(
+                None,
+                committed.clone(),
+                vec![candidate(41, "first-slug")],
+                0,
+            ))
+            .expect("initial state and job must commit");
+
+        assert!(
+            store
+                .commit(commit_with_source_ingestion_jobs(
+                    Some(committed.clone()),
+                    committed.clone(),
+                    vec![candidate(41, "renamed-slug")],
+                    1,
+                ))
+                .is_err()
+        );
+
+        assert_eq!(store.load(&crawl_day), Ok(Some(committed)));
+        assert_eq!(
+            store.selected_candidates_for_day(&crawl_day),
+            vec![(41, "first-slug".to_owned())]
+        );
+        assert_eq!(
+            store.job_request_for("source.game-ingestion:2026-08-14:41"),
+            Some((
+                "source.game-ingestion".to_owned(),
+                "metacritic-game:41:first-slug".to_owned(),
+                2,
+            ))
         );
     }
 

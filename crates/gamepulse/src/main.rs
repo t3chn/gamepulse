@@ -4,10 +4,15 @@ mod runtime;
 
 use std::sync::{Arc, Mutex};
 
-use gamepulse_application::{HourlyJobSchedule, JobHandler, JobHandlerRegistry, RuntimeJobType};
-use gamepulse_storage_sqlite::{SqliteDailyCrawlStateStore, SqliteJobStore};
+use gamepulse_application::{
+    HourlyJobSchedule, JobHandler, JobHandlerRegistry, RuntimeJobType, SourceIngestionJobSchedule,
+};
+use gamepulse_storage_sqlite::{
+    SqliteDailyCrawlStateStore, SqliteGameSnapshotStore, SqliteJobStore,
+};
 use gamepulse_worker_source::{
     HourlyDiscoveryHandler, MetacriticCanaryClient, MetacriticDailyCrawlSource,
+    MetacriticGameIngestionSource, SourceIngestionHandler,
 };
 use runtime::{Runtime, RuntimeConfig, SystemRuntimeClock};
 
@@ -26,12 +31,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let daily_crawl_state = Arc::new(Mutex::new(SqliteDailyCrawlStateStore::open(
         &database_path,
     )?));
-    let source_port = MetacriticDailyCrawlSource::new(MetacriticCanaryClient::new()?);
+    let game_snapshots = Arc::new(Mutex::new(SqliteGameSnapshotStore::open(&database_path)?));
+    let source_client = MetacriticCanaryClient::new()?;
+    let source_port = MetacriticDailyCrawlSource::new(source_client.clone());
     let schedule = HourlyJobSchedule::new(RuntimeJobType::SourceHourlyDiscovery, 3)?;
+    let source_ingestion_schedule = SourceIngestionJobSchedule::new(3)?;
     let config = RuntimeConfig::new("gamepulse-source-runtime", 300, 2, schedule)?;
-    let source_handler: Arc<dyn JobHandler> =
-        Arc::new(HourlyDiscoveryHandler::new(daily_crawl_state, source_port));
-    let handlers = Arc::new(JobHandlerRegistry::new([source_handler])?);
+    let source_handler: Arc<dyn JobHandler> = Arc::new(HourlyDiscoveryHandler::new(
+        daily_crawl_state,
+        source_port,
+        source_ingestion_schedule,
+    ));
+    let ingestion_handler: Arc<dyn JobHandler> = Arc::new(SourceIngestionHandler::new(
+        game_snapshots,
+        MetacriticGameIngestionSource::new(source_client),
+    ));
+    let handlers = Arc::new(JobHandlerRegistry::new([
+        source_handler,
+        ingestion_handler,
+    ])?);
     let mut runtime = Runtime::new(store, Arc::new(SystemRuntimeClock), config, handlers);
 
     runtime

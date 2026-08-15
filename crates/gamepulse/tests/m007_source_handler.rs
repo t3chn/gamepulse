@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use gamepulse_application::{
     BrowseProgress, CrawlDayKey, DailyCrawlCommit, DailyCrawlState, DailyCrawlStatePort,
     HourlyJobSchedule, JobHandler, JobHandlerRegistry, JobHandlerResult, JobRecord, JobStatus,
-    JobStore, JobTimestamp, RuntimeJobType, TypedJob,
+    JobStore, JobTimestamp, RuntimeJobType, SourceIngestionJobSchedule, TypedJob,
 };
 use gamepulse_storage_sqlite::{SqliteDailyCrawlStateStore, SqliteJobStore};
 use gamepulse_worker_source::{
@@ -173,6 +173,10 @@ fn fixture_browse_page() -> String {
         .replace("offset=20&limit=20", "offset=24&limit=24")
 }
 
+fn source_ingestion_schedule() -> SourceIngestionJobSchedule {
+    SourceIngestionJobSchedule::new(1).expect("source ingestion schedule must be valid")
+}
+
 fn result_is_failure(result: JobHandlerResult) -> bool {
     matches!(result, JobHandlerResult::Failed(_))
 }
@@ -188,8 +192,11 @@ async fn accepted_hourly_slot_commits_fixture_selection_settles_job_and_survives
     ));
     let transport = FixtureListingTransport::with_responses([Ok(LISTING_FIXTURE.to_owned())]);
     let source = MetacriticDailyCrawlSource::new(transport.clone());
-    let handler: Arc<dyn JobHandler> =
-        Arc::new(HourlyDiscoveryHandler::new(daily_state.clone(), source));
+    let handler: Arc<dyn JobHandler> = Arc::new(HourlyDiscoveryHandler::new(
+        daily_state.clone(),
+        source,
+        source_ingestion_schedule(),
+    ));
     let schedule = HourlyJobSchedule::new(RuntimeJobType::SourceHourlyDiscovery, 1)
         .expect("schedule must be valid");
     let config = RuntimeConfig::new("m007-test-worker", 30, 1, schedule)
@@ -249,6 +256,7 @@ async fn same_utc_day_browses_and_a_new_utc_day_restarts_new_releases() {
     let handler = HourlyDiscoveryHandler::new(
         state.clone(),
         MetacriticDailyCrawlSource::new(transport.clone()),
+        source_ingestion_schedule(),
     );
 
     assert!(matches!(
@@ -283,6 +291,7 @@ async fn malformed_or_overflowing_work_references_fail_without_source_or_state_c
     let handler = HourlyDiscoveryHandler::new(
         state.clone(),
         MetacriticDailyCrawlSource::new(transport.clone()),
+        source_ingestion_schedule(),
     );
 
     assert!(result_is_failure(
@@ -313,6 +322,7 @@ async fn source_or_commit_failure_returns_handler_failure_without_publishing_sta
     let source_failure_handler = HourlyDiscoveryHandler::new(
         source_failure_state.clone(),
         MetacriticDailyCrawlSource::new(source_failure_transport.clone()),
+        source_ingestion_schedule(),
     );
     assert!(result_is_failure(
         source_failure_handler
@@ -340,6 +350,7 @@ async fn source_or_commit_failure_returns_handler_failure_without_publishing_sta
     let commit_failure_handler = HourlyDiscoveryHandler::new(
         commit_failure_state.clone(),
         MetacriticDailyCrawlSource::new(commit_failure_transport.clone()),
+        source_ingestion_schedule(),
     );
     assert!(result_is_failure(
         commit_failure_handler

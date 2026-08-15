@@ -172,6 +172,7 @@ dependencies = [
  "gamepulse-worker-llm",
  "gamepulse-worker-media",
  "gamepulse-worker-source",
+ "rusqlite",
  "serde_json",
  "tokio",
 ]

@@ -87,32 +87,9 @@ impl JobStore for SqliteJobStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(JobStoreError::database)?;
-        let inserted = transaction
-            .execute(
-                "INSERT INTO jobs (
-                    job_identity, job_type, work_ref, max_attempts, attempt_count, state,
-                    created_at, updated_at, claimed_by, lease_expires_at, claim_token, terminal_at,
-                    last_error
-                 ) VALUES (?1, ?2, ?3, ?4, 0, 'ready', ?5, ?5, NULL, NULL, 0, NULL, NULL)
-                 ON CONFLICT(job_identity) DO NOTHING",
-                params![
-                    request.identity(),
-                    request.job_type(),
-                    request.work_ref(),
-                    i64::from(request.max_attempts()),
-                    request.created_at().value(),
-                ],
-            )
-            .map_err(JobStoreError::database)?;
-        let stored =
-            load_job(&transaction, request.identity())?.ok_or_else(JobStoreError::missing_job)?;
+        let result = enqueue_request(&transaction, &request)?;
         transaction.commit().map_err(JobStoreError::database)?;
-
-        Ok(if inserted == 1 {
-            JobEnqueueResult::Enqueued(stored.record)
-        } else {
-            JobEnqueueResult::Duplicate(stored.record)
-        })
+        Ok(result)
     }
 
     fn claim_next(
@@ -334,6 +311,67 @@ impl JobStore for SqliteJobStore {
     }
 }
 
+/// Insert one request through an existing transaction so another durable state transition can
+/// share the queue's identity/deduplication semantics without creating a nested transaction.
+pub(crate) fn enqueue_request(
+    transaction: &Transaction<'_>,
+    request: &JobRequest,
+) -> Result<JobEnqueueResult, JobStoreError> {
+    enqueue_request_with_duplicate_validation(transaction, request, false)
+}
+
+/// Insert a job derived by an atomic daily-crawl commit.
+///
+/// Unlike the general queue port, this boundary may only accept a replay when the durable job
+/// still exactly matches its deterministic derived request. This prevents a mutable candidate
+/// slug from advancing without changing the already-derived ingestion work reference.
+pub(crate) fn enqueue_derived_request(
+    transaction: &Transaction<'_>,
+    request: &JobRequest,
+) -> Result<JobEnqueueResult, JobStoreError> {
+    enqueue_request_with_duplicate_validation(transaction, request, true)
+}
+
+fn enqueue_request_with_duplicate_validation(
+    transaction: &Transaction<'_>,
+    request: &JobRequest,
+    require_exact_duplicate: bool,
+) -> Result<JobEnqueueResult, JobStoreError> {
+    let inserted = transaction
+        .execute(
+            "INSERT INTO jobs (
+                job_identity, job_type, work_ref, max_attempts, attempt_count, state,
+                created_at, updated_at, claimed_by, lease_expires_at, claim_token, terminal_at,
+                last_error
+             ) VALUES (?1, ?2, ?3, ?4, 0, 'ready', ?5, ?5, NULL, NULL, 0, NULL, NULL)
+             ON CONFLICT(job_identity) DO NOTHING",
+            params![
+                request.identity(),
+                request.job_type(),
+                request.work_ref(),
+                i64::from(request.max_attempts()),
+                request.created_at().value(),
+            ],
+        )
+        .map_err(JobStoreError::database)?;
+    let stored =
+        load_job(transaction, request.identity())?.ok_or_else(JobStoreError::missing_job)?;
+
+    if inserted == 1 {
+        return Ok(JobEnqueueResult::Enqueued(stored.record));
+    }
+
+    if require_exact_duplicate
+        && (stored.record.job_type() != request.job_type()
+            || stored.record.work_ref() != request.work_ref()
+            || stored.record.max_attempts() != request.max_attempts())
+    {
+        return Err(JobStoreError::duplicate_request_conflict());
+    }
+
+    Ok(JobEnqueueResult::Duplicate(stored.record))
+}
+
 /// A non-leaking error surface for SQLite queue operations and malformed durable state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JobStoreError {
@@ -356,6 +394,12 @@ impl JobStoreError {
     fn malformed(_detail: &'static str) -> Self {
         Self {
             message: "malformed persisted job queue state",
+        }
+    }
+
+    fn duplicate_request_conflict() -> Self {
+        Self {
+            message: "job identity conflicts with a different durable request",
         }
     }
 

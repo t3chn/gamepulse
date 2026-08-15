@@ -15,9 +15,12 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use gamepulse_application::{
-    AsyncDailyCrawlSourcePort, CrawlDayKey, CrawlDiscoveryRequest, DailyCrawlStatePort,
-    DiscoveryCandidate, DiscoveryPage, JobHandler, JobHandlerFailure, JobHandlerFuture,
-    JobHandlerResult, RuntimeJobType, TypedJob, execute_async_daily_crawl,
+    AsyncDailyCrawlSourcePort, AsyncSourceIngestionPort, CrawlDayKey, CrawlDiscoveryRequest,
+    DailyCrawlStatePort, DiscoveryCandidate, DiscoveryPage, GameSnapshotStore, JobHandler,
+    JobHandlerFailure, JobHandlerFuture, JobHandlerResult, RuntimeJobType,
+    SourceIngestionJobSchedule, SourceIngestionRequest, TypedJob,
+    execute_async_daily_crawl_with_source_ingestion_jobs, execute_async_source_ingestion,
+    upsert_game_snapshot,
 };
 use gamepulse_domain::{
     BrowseCursor, GameCoverDescriptor, GameDeveloper, GamePlatformScore, GameSnapshot,
@@ -35,6 +38,7 @@ const HOURLY_SCHEDULE_SECONDS: u64 = 60 * 60;
 const HOURS_PER_UTC_DAY: u64 = 24;
 const MAX_SCHEDULED_HOUR_SLOT: u64 = (i64::MAX as u64) / HOURLY_SCHEDULE_SECONDS;
 const HOURLY_DISCOVERY_FAILURE: &str = "source hourly discovery failed";
+const SOURCE_INGESTION_FAILURE: &str = "source game ingestion failed";
 
 /// Translate the exact durable hourly schedule reference into its UTC calendar day.
 ///
@@ -113,13 +117,19 @@ fn civil_date_from_unix_days(days_since_epoch: i64) -> (i64, u32, u32) {
 pub struct HourlyDiscoveryHandler<S, T> {
     state_port: Arc<Mutex<S>>,
     source_port: Arc<T>,
+    source_ingestion_schedule: SourceIngestionJobSchedule,
 }
 
 impl<S, T> HourlyDiscoveryHandler<S, T> {
-    pub fn new(state_port: Arc<Mutex<S>>, source_port: T) -> Self {
+    pub fn new(
+        state_port: Arc<Mutex<S>>,
+        source_port: T,
+        source_ingestion_schedule: SourceIngestionJobSchedule,
+    ) -> Self {
         Self {
             state_port,
             source_port: Arc::new(source_port),
+            source_ingestion_schedule,
         }
     }
 }
@@ -144,11 +154,12 @@ where
         let state_for_load = Arc::clone(&self.state_port);
         let state_for_commit = Arc::clone(&self.state_port);
         let source_port = Arc::clone(&self.source_port);
+        let source_ingestion_schedule = self.source_ingestion_schedule;
         Box::pin(async move {
             let Ok(day) = crawl_day_key_from_hourly_work_reference(job.work_ref()) else {
                 return JobHandlerResult::Failed(JobHandlerFailure::new(HOURLY_DISCOVERY_FAILURE));
             };
-            let outcome = execute_async_daily_crawl(
+            let outcome = execute_async_daily_crawl_with_source_ingestion_jobs(
                 move |day| {
                     let mut state = state_for_load
                         .lock()
@@ -163,6 +174,8 @@ where
                     state.commit(commit).map_err(HourlyStateAccessError::Port)
                 },
                 day,
+                source_ingestion_schedule,
+                job.created_at(),
             )
             .await;
 
@@ -429,6 +442,30 @@ impl PlatformUserScore {
     }
 }
 
+/// Source-adapter seam for one deterministic product ingestion attempt.
+///
+/// The implementation owns direct-HTTP exchange and parsing. It returns only source-native
+/// detail and Userscore values that are bound to the requested source identities.
+pub trait GameIngestionTransport: Send + Sync {
+    type Error;
+    type FetchDetailFuture<'a>: Future<Output = Result<GameDetail, Self::Error>> + Send + 'a
+    where
+        Self: 'a;
+    type FetchPlatformUserScoreFuture<'a>: Future<Output = Result<PlatformUserScore, Self::Error>>
+        + Send
+        + 'a
+    where
+        Self: 'a;
+
+    fn fetch_game_detail(&self, expected: GameIdentity) -> Self::FetchDetailFuture<'_>;
+
+    fn fetch_platform_user_score(
+        &self,
+        expected_game: GameIdentity,
+        expected_platform: PlatformDetail,
+    ) -> Self::FetchPlatformUserScoreFuture<'_>;
+}
+
 /// Map one parsed product payload and the available per-platform Userscores into the inner model.
 ///
 /// This is deliberately request-free. Missing score responses remain `None`; supplied scores must
@@ -514,6 +551,150 @@ pub fn map_game_detail_to_snapshot(
     .map_err(GameSnapshotMappingError::InvalidSnapshot)
 }
 
+/// Metacritic implementation of the application-owned source-ingestion port.
+///
+/// This adapter retains source-native transport, identity validation, and mapping. It never
+/// reaches the snapshot store, so persistence remains an application use-case boundary.
+pub struct MetacriticGameIngestionSource<T> {
+    transport: Arc<T>,
+}
+
+impl<T> MetacriticGameIngestionSource<T> {
+    pub fn new(transport: T) -> Self {
+        Self {
+            transport: Arc::new(transport),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum MetacriticGameIngestionError<E> {
+    Transport(E),
+    MismatchedGameIdentity,
+    Mapping(GameSnapshotMappingError),
+}
+
+impl<E> fmt::Display for MetacriticGameIngestionError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(_) => formatter.write_str("Metacritic game ingestion transport failed"),
+            Self::MismatchedGameIdentity => {
+                formatter.write_str("Metacritic game detail did not match the requested identity")
+            }
+            Self::Mapping(_) => formatter.write_str("Metacritic game snapshot mapping failed"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for MetacriticGameIngestionError<E> {}
+
+impl<T> AsyncSourceIngestionPort for MetacriticGameIngestionSource<T>
+where
+    T: GameIngestionTransport + Send + Sync + 'static,
+    T::Error: Send + 'static,
+{
+    type Error = MetacriticGameIngestionError<T::Error>;
+    type IngestFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<GameSnapshot, Self::Error>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn ingest(&self, request: SourceIngestionRequest) -> Self::IngestFuture<'_> {
+        let transport = Arc::clone(&self.transport);
+        Box::pin(async move {
+            let expected_game = GameIdentity {
+                id: GameId(request.source_product_id().value()),
+                slug: request.source_slug().to_owned(),
+            };
+            let detail = transport
+                .fetch_game_detail(expected_game.clone())
+                .await
+                .map_err(MetacriticGameIngestionError::Transport)?;
+            if detail.id != expected_game.id || detail.slug != expected_game.slug {
+                return Err(MetacriticGameIngestionError::MismatchedGameIdentity);
+            }
+
+            let mut user_scores = Vec::with_capacity(detail.platforms.len());
+            for platform in detail.platforms.iter().cloned() {
+                user_scores.push(
+                    transport
+                        .fetch_platform_user_score(expected_game.clone(), platform)
+                        .await
+                        .map_err(MetacriticGameIngestionError::Transport)?,
+                );
+            }
+            map_game_detail_to_snapshot(&detail, user_scores)
+                .map_err(MetacriticGameIngestionError::Mapping)
+        })
+    }
+}
+
+/// M009's thin source-lane adapter for one durable game-ingestion job.
+///
+/// Work-reference decoding and source-to-snapshot persistence orchestration are application-owned.
+/// The worker acquires its concrete snapshot store only after the application source future
+/// resolves, so no SQLite lock is held while a source call is awaited.
+pub struct SourceIngestionHandler<S, P> {
+    snapshot_store: Arc<Mutex<S>>,
+    source_port: Arc<P>,
+}
+
+impl<S, P> SourceIngestionHandler<S, P> {
+    pub fn new(snapshot_store: Arc<Mutex<S>>, source_port: P) -> Self {
+        Self {
+            snapshot_store,
+            source_port: Arc::new(source_port),
+        }
+    }
+}
+
+enum SnapshotStoreAccessError<E> {
+    Poisoned,
+    Port(E),
+}
+
+impl<S, P> JobHandler for SourceIngestionHandler<S, P>
+where
+    S: GameSnapshotStore + Send + 'static,
+    S::Error: Send + 'static,
+    P: AsyncSourceIngestionPort + Send + Sync + 'static,
+    P::Error: Send + 'static,
+{
+    fn job_type(&self) -> RuntimeJobType {
+        RuntimeJobType::SourceGameIngestion
+    }
+
+    fn handle(&self, job: TypedJob) -> JobHandlerFuture {
+        let snapshot_store = Arc::clone(&self.snapshot_store);
+        let source_port = Arc::clone(&self.source_port);
+        Box::pin(async move {
+            let Ok(request) = SourceIngestionRequest::from_work_reference(job.work_ref()) else {
+                return JobHandlerResult::Failed(JobHandlerFailure::new(SOURCE_INGESTION_FAILURE));
+            };
+
+            let outcome = execute_async_source_ingestion(
+                source_port.as_ref(),
+                move |snapshot| {
+                    let mut snapshot_store = snapshot_store
+                        .lock()
+                        .map_err(|_| SnapshotStoreAccessError::Poisoned)?;
+                    upsert_game_snapshot(&mut *snapshot_store, snapshot)
+                        .map_err(SnapshotStoreAccessError::Port)
+                },
+                request,
+            )
+            .await;
+
+            match outcome {
+                Ok(()) => JobHandlerResult::Succeeded,
+                Err(_) => {
+                    JobHandlerResult::Failed(JobHandlerFailure::new(SOURCE_INGESTION_FAILURE))
+                }
+            }
+        })
+    }
+}
+
 /// The per-platform Userscore response has an independent review count.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UserScoreSummary {
@@ -595,6 +776,28 @@ impl MetacriticCanaryClient {
         let url = self.platform_user_score_url(slug, platform_slug);
         let body = self.get_text(url).await?;
         parse_user_score_summary(slug, platform_slug, &body)
+    }
+
+    /// Fetch and bind one platform Userscore to the exact product and platform from a detail
+    /// response before it enters M009's snapshot mapper.
+    pub async fn fetch_platform_user_score_for_snapshot(
+        &self,
+        expected_game: &GameIdentity,
+        expected_platform: &PlatformDetail,
+    ) -> Result<PlatformUserScore, SourceError> {
+        validate_slug(&expected_game.slug)?;
+        validate_slug(&expected_platform.slug)?;
+        let url = self.platform_user_score_url(&expected_game.slug, &expected_platform.slug);
+        let body = self.get_text(url).await?;
+        parse_platform_user_score_for_snapshot(expected_game, expected_platform, &body).map_err(
+            |error| match error {
+                SnapshotUserScoreBindingError::Source(error) => error,
+                SnapshotUserScoreBindingError::InvalidGameIdentity
+                | SnapshotUserScoreBindingError::InvalidPlatformIdentity => SourceError::Decode {
+                    context: "user score identity",
+                },
+            },
+        )
     }
 
     pub async fn fetch_review_page(
@@ -773,6 +976,33 @@ impl ListingTransport for MetacriticCanaryClient {
 
     fn fetch_listing(&self, mode: ListMode, offset: u32, limit: u32) -> Self::FetchFuture<'_> {
         Box::pin(async move { self.fetch_listing_text(mode, offset, limit).await })
+    }
+}
+
+impl GameIngestionTransport for MetacriticCanaryClient {
+    type Error = SourceError;
+    type FetchDetailFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<GameDetail, Self::Error>> + Send + 'a>>
+    where
+        Self: 'a;
+    type FetchPlatformUserScoreFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<PlatformUserScore, Self::Error>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn fetch_game_detail(&self, expected: GameIdentity) -> Self::FetchDetailFuture<'_> {
+        Box::pin(async move { MetacriticCanaryClient::fetch_game_detail(self, &expected).await })
+    }
+
+    fn fetch_platform_user_score(
+        &self,
+        expected_game: GameIdentity,
+        expected_platform: PlatformDetail,
+    ) -> Self::FetchPlatformUserScoreFuture<'_> {
+        Box::pin(async move {
+            self.fetch_platform_user_score_for_snapshot(&expected_game, &expected_platform)
+                .await
+        })
     }
 }
 

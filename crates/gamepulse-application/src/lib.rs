@@ -34,6 +34,136 @@ where
     store.upsert_snapshot(snapshot)
 }
 
+/// A validated, source-agnostic input for one durable game-ingestion job.
+///
+/// The numeric product identity and source slug are carried together because the identity is
+/// stable while the slug remains mutable routing data. Source adapters apply any source-specific
+/// slug grammar before issuing a request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceIngestionRequest {
+    source_product_id: SourceProductId,
+    source_slug: String,
+}
+
+impl SourceIngestionRequest {
+    pub fn new(
+        source_product_id: u64,
+        source_slug: impl Into<String>,
+    ) -> Result<Self, SourceIngestionRequestError> {
+        let source_slug = source_slug.into();
+        if source_slug.is_empty() || source_slug.contains(':') {
+            return Err(SourceIngestionRequestError::InvalidSourceSlug);
+        }
+        Ok(Self {
+            source_product_id: SourceProductId::new(source_product_id)
+                .map_err(|_| SourceIngestionRequestError::InvalidSourceProductId)?,
+            source_slug,
+        })
+    }
+
+    /// Decode the canonical work reference emitted by `SourceIngestionJobSchedule`.
+    pub fn from_work_reference(work_reference: &str) -> Result<Self, SourceIngestionRequestError> {
+        let encoded = work_reference
+            .strip_prefix(SOURCE_INGESTION_WORK_REFERENCE_PREFIX)
+            .ok_or(SourceIngestionRequestError::MalformedWorkReference)?;
+        let (source_product_id, source_slug) = encoded
+            .split_once(':')
+            .ok_or(SourceIngestionRequestError::MalformedWorkReference)?;
+        if source_product_id.is_empty()
+            || !source_product_id.bytes().all(|byte| byte.is_ascii_digit())
+            || (source_product_id.len() > 1 && source_product_id.starts_with('0'))
+        {
+            return Err(SourceIngestionRequestError::MalformedWorkReference);
+        }
+        let source_product_id = source_product_id
+            .parse::<u64>()
+            .map_err(|_| SourceIngestionRequestError::MalformedWorkReference)?;
+        Self::new(source_product_id, source_slug)
+    }
+
+    pub fn source_product_id(&self) -> SourceProductId {
+        self.source_product_id
+    }
+
+    pub fn source_slug(&self) -> &str {
+        &self.source_slug
+    }
+
+    pub fn work_reference(&self) -> String {
+        format!(
+            "{SOURCE_INGESTION_WORK_REFERENCE_PREFIX}{}:{}",
+            self.source_product_id.value(),
+            self.source_slug
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceIngestionRequestError {
+    InvalidSourceProductId,
+    InvalidSourceSlug,
+    MalformedWorkReference,
+}
+
+impl fmt::Display for SourceIngestionRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSourceProductId => {
+                formatter.write_str("source ingestion product identity must be a positive number")
+            }
+            Self::InvalidSourceSlug => {
+                formatter.write_str("source ingestion slug must be non-empty and colon-free")
+            }
+            Self::MalformedWorkReference => {
+                formatter.write_str("malformed source ingestion work reference")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SourceIngestionRequestError {}
+
+/// Application-owned async source boundary for one fully mapped game snapshot.
+///
+/// The outer source adapter owns source-native requests, parsing, identity validation, and
+/// mapping. This port intentionally exposes only validated inner values to the use case.
+pub trait AsyncSourceIngestionPort: Send + Sync {
+    type Error;
+    type IngestFuture<'a>: Future<Output = Result<GameSnapshot, Self::Error>> + Send + 'a
+    where
+        Self: 'a;
+
+    fn ingest(&self, request: SourceIngestionRequest) -> Self::IngestFuture<'_>;
+}
+
+/// Invoke one source ingestion and atomically persist its resulting snapshot through the
+/// application-owned snapshot boundary.
+///
+/// The caller supplies a short persistence closure so an outer worker can acquire a concrete
+/// SQLite mutex only after the source future resolves.
+pub async fn execute_async_source_ingestion<P, C, StoreError>(
+    source_port: &P,
+    persist_snapshot: C,
+    request: SourceIngestionRequest,
+) -> Result<(), SourceIngestionError<P::Error, StoreError>>
+where
+    P: AsyncSourceIngestionPort,
+    C: FnOnce(&GameSnapshot) -> Result<(), StoreError>,
+{
+    let snapshot = source_port
+        .ingest(request)
+        .await
+        .map_err(SourceIngestionError::Source)?;
+    persist_snapshot(&snapshot).map_err(SourceIngestionError::Store)
+}
+
+/// The opaque application outcome categories for source ingestion.
+#[derive(Debug)]
+pub enum SourceIngestionError<SourceError, StoreError> {
+    Source(SourceError),
+    Store(StoreError),
+}
+
 /// A compact, source-adapter-mapped candidate. The slug is opaque to this policy;
 /// daily uniqueness always uses `source_product_id`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,6 +265,7 @@ pub struct DailyCrawlCommit {
     expected_previous_state: Option<DailyCrawlState>,
     state: DailyCrawlState,
     selected: Vec<DiscoveryCandidate>,
+    jobs: Vec<JobRequest>,
 }
 
 impl DailyCrawlCommit {
@@ -179,6 +310,7 @@ impl DailyCrawlCommit {
             expected_previous_state,
             state,
             selected,
+            jobs: Vec::new(),
         })
     }
 
@@ -192,6 +324,24 @@ impl DailyCrawlCommit {
 
     pub fn selected(&self) -> &[DiscoveryCandidate] {
         &self.selected
+    }
+
+    /// Attach exactly one durable source-ingestion job for each selected candidate.
+    ///
+    /// The storage adapter must commit these jobs in the same transaction as the crawl state and
+    /// selected candidates. The job identity is day-scoped, so replay is deduplicated while a
+    /// later daily selection can reprocess the same numeric source product identity.
+    pub fn with_source_ingestion_jobs(
+        mut self,
+        schedule: SourceIngestionJobSchedule,
+        created_at: JobTimestamp,
+    ) -> Result<Self, SourceIngestionJobScheduleError> {
+        self.jobs = schedule.requests_for(self.state.day(), &self.selected, created_at)?;
+        Ok(self)
+    }
+
+    pub fn jobs(&self) -> &[JobRequest] {
+        &self.jobs
     }
 }
 
@@ -314,6 +464,58 @@ where
     }))
 }
 
+/// Plan, asynchronously discover, and atomically publish a daily transition with its derived
+/// source-ingestion jobs.
+///
+/// Like `execute_async_daily_crawl`, the source future is awaited between the caller-controlled
+/// load and commit closures. The commit closure receives one value that contains state,
+/// candidates, and exactly one day-scoped source-ingestion job per selected candidate.
+pub async fn execute_async_daily_crawl_with_source_ingestion_jobs<L, C, D, StateError>(
+    load_state: L,
+    source_port: &D,
+    commit_state: C,
+    day: CrawlDayKey,
+    schedule: SourceIngestionJobSchedule,
+    created_at: JobTimestamp,
+) -> Result<DailyCrawlOutcome, DailyCrawlError<StateError, D::Error>>
+where
+    L: FnOnce(&CrawlDayKey) -> Result<Option<DailyCrawlState>, StateError>,
+    C: FnOnce(DailyCrawlCommit) -> Result<(), StateError>,
+    D: AsyncDailyCrawlSourcePort,
+{
+    let expected_previous_state = load_state(&day).map_err(DailyCrawlError::Load)?;
+    let discovery = match prepare_daily_crawl(day, expected_previous_state.clone()) {
+        DailyCrawlAction::Discover(discovery) => discovery,
+        DailyCrawlAction::Exhausted(state) => return Ok(DailyCrawlOutcome::Exhausted(state)),
+    };
+    let request = discovery.request();
+    let page = source_port
+        .discover(request)
+        .await
+        .map_err(DailyCrawlError::Source)?;
+    let transition = select_daily_crawl(
+        discovery,
+        page.candidates()
+            .iter()
+            .map(DiscoveryCandidate::source_product_id),
+        page.next_browse_cursor(),
+    );
+    let selected = selected_candidates(&page, &transition);
+    let state = transition.next_state().clone();
+    let commit = DailyCrawlCommit::new(expected_previous_state, state.clone(), selected.clone())
+        .map_err(DailyCrawlError::InvalidCommit)?
+        .with_source_ingestion_jobs(schedule, created_at)
+        .map_err(DailyCrawlError::JobSchedule)?;
+
+    commit_state(commit).map_err(DailyCrawlError::Commit)?;
+
+    Ok(DailyCrawlOutcome::Selected(DailyCrawlSelection {
+        request,
+        selected,
+        state,
+    }))
+}
+
 fn selected_candidates(
     page: &DiscoveryPage,
     transition: &DailyCrawlTransition,
@@ -393,6 +595,7 @@ pub enum DailyCrawlError<StateError, SourceError> {
     Load(StateError),
     Source(SourceError),
     InvalidCommit(DailyCrawlCommitError),
+    JobSchedule(SourceIngestionJobScheduleError),
     Commit(StateError),
 }
 
@@ -995,30 +1198,103 @@ fn validate_job_text(field: &'static str, value: &str) -> Result<(), JobInputErr
     Ok(())
 }
 
-/// The one M006 job type scheduled by the bounded hourly runtime.
+/// The typed M006/M009 jobs accepted by the bounded runtime.
 ///
-/// This type is deliberately narrower than the product's future source, media,
-/// and summary work. Adding another execution kind requires an explicitly
-/// adopted application use case rather than accepting an arbitrary queue string.
+/// Adding another execution kind requires an explicitly adopted application use case rather than
+/// accepting an arbitrary queue string.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RuntimeJobType {
     SourceHourlyDiscovery,
+    SourceGameIngestion,
 }
 
 impl RuntimeJobType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SourceHourlyDiscovery => "source.hourly-discovery",
+            Self::SourceGameIngestion => "source.game-ingestion",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "source.hourly-discovery" => Some(Self::SourceHourlyDiscovery),
+            "source.game-ingestion" => Some(Self::SourceGameIngestion),
             _ => None,
         }
     }
 }
+
+/// The canonical opaque work-reference prefix for one Metacritic source-ingestion job.
+pub const SOURCE_INGESTION_WORK_REFERENCE_PREFIX: &str = "metacritic-game:";
+
+/// Application-owned policy for a source-ingestion job derived from a selected candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceIngestionJobSchedule {
+    max_attempts: u32,
+}
+
+impl SourceIngestionJobSchedule {
+    pub fn new(max_attempts: u32) -> Result<Self, JobInputError> {
+        if max_attempts == 0 {
+            return Err(JobInputError::ZeroMaxAttempts);
+        }
+        Ok(Self { max_attempts })
+    }
+
+    pub const fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+
+    /// Build one day-scoped, replay-deduplicated request per selected candidate.
+    pub fn requests_for(
+        self,
+        day: &CrawlDayKey,
+        selected: &[DiscoveryCandidate],
+        created_at: JobTimestamp,
+    ) -> Result<Vec<JobRequest>, SourceIngestionJobScheduleError> {
+        selected
+            .iter()
+            .map(|candidate| {
+                let request = SourceIngestionRequest::new(
+                    candidate.source_product_id().value(),
+                    candidate.source_slug(),
+                )
+                .map_err(SourceIngestionJobScheduleError::Request)?;
+                JobRequest::new(
+                    format!(
+                        "{}:{}:{}",
+                        RuntimeJobType::SourceGameIngestion.as_str(),
+                        day.as_str(),
+                        request.source_product_id().value()
+                    ),
+                    RuntimeJobType::SourceGameIngestion.as_str(),
+                    request.work_reference(),
+                    self.max_attempts,
+                    created_at,
+                )
+                .map_err(SourceIngestionJobScheduleError::JobRequest)
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceIngestionJobScheduleError {
+    Request(SourceIngestionRequestError),
+    JobRequest(JobInputError),
+}
+
+impl fmt::Display for SourceIngestionJobScheduleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request(error) => error.fmt(formatter),
+            Self::JobRequest(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for SourceIngestionJobScheduleError {}
 
 /// The hour width used to derive a durable schedule identity from a caller-supplied timestamp.
 pub const HOURLY_SCHEDULE_SECONDS: i64 = 60 * 60;
@@ -1071,6 +1347,7 @@ pub struct TypedJob {
     identity: String,
     job_type: RuntimeJobType,
     work_ref: String,
+    created_at: JobTimestamp,
 }
 
 impl TypedJob {
@@ -1079,6 +1356,7 @@ impl TypedJob {
             identity: record.identity().to_owned(),
             job_type: RuntimeJobType::parse(record.job_type())?,
             work_ref: record.work_ref().to_owned(),
+            created_at: record.created_at(),
         })
     }
 
@@ -1092,6 +1370,10 @@ impl TypedJob {
 
     pub fn work_ref(&self) -> &str {
         &self.work_ref
+    }
+
+    pub const fn created_at(&self) -> JobTimestamp {
+        self.created_at
     }
 }
 

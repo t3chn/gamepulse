@@ -250,14 +250,32 @@ explicit optional or empty values. Cover data remains the original descriptor
 fields and never becomes a fabricated CDN URL. Deterministic local product-detail
 and Userscore fixtures map into this model without a client or source request.
 
-M008 does not wire game-detail fetching, Userscore fetching, or snapshot upserts
-into the M007 runtime, queue, or hourly handler. Runtime game/review ingestion,
-summaries, web behavior, media, LLM behavior, and deployment remain
-unimplemented. Passing CI proves the bounded workspace claims and deterministic
-canary, policy, state-adapter, queue, M006 runtime, M007 discovery-handler, and
-M008 offline snapshot tests, not complete product behavior or complete
-architecture conformance. M006's scheduler identity, dispatcher-capacity, and
-stale-completion branches have focused mutation evidence.
+M009 wires the bounded offline vertical only: an hourly discovery commit derives
+one `source.game-ingestion` job per selected candidate in the same SQLite
+transaction as the daily state and candidate records. The job identity is scoped
+to the day and numeric product ID, so replay deduplicates without suppressing a
+later-day reprocess; its work reference carries the canonical decimal product ID
+and source slug. The application owns the source-ingestion use case, its typed
+source and snapshot ports, and the snapshot-persistence boundary. The source
+worker remains a thin job handler plus Metacritic adapter: it validates and maps
+source-native detail and every detail-listed platform Userscore through M008's
+snapshot mapper before the application use case persists the result. Neither
+path holds SQLite across an awaited source call. At the atomic commit boundary,
+a replayed job identity is accepted only when its job type, work reference, and
+maximum attempts exactly match the derived request; a stale slug conflict rolls
+back the state, candidates, and jobs together. The binary composes both typed
+source handlers and separate SQLite adapters; the dispatcher alone continues
+to settle all claims. Deterministic fixtures cover the full scheduler-to-reopen
+path, the duplicate-conflict rollback, and malformed, source, mapping, and
+store failure settlement without partial snapshots. Reviews, summaries,
+runs/run items, web behavior, media, LLM behavior, live source requests, and
+deployment remain unimplemented. Passing CI proves the bounded workspace
+claims and deterministic canary, policy, state-adapter, queue, M006 runtime,
+M007 discovery handler, M008 snapshot foundation, and M009 offline vertical; it
+does not prove complete product behavior or complete architecture conformance.
+M006's scheduler identity, dispatcher-capacity, and stale-completion branches
+have focused mutation evidence; M009's three allowed manual mutation attempts
+were exhausted before the correction pass, which adds no further mutation run.
 
 M003 requires targeted mutation testing because it introduces daily
 deduplication, crawl progression, and selection policy.
