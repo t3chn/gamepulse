@@ -240,15 +240,24 @@ retry, terminal, claim, and lease ownership. Focused fixture transport tests
 cover request mapping and a runtime integration covers durable settlement and
 SQLite reopen. They do not call the public source.
 
-M007 does not fetch game details or persist games, platforms, scores,
-developers, descriptions, trailers, reviews, review summaries, similar games,
-or web data. Game/review ingestion, summaries, web behavior, media, LLM
-behavior, and deployment remain unimplemented. Passing CI proves the bounded
-workspace claims and deterministic canary, policy, state-adapter, queue, M006
-runtime, and M007 discovery-handler tests, not complete product behavior or
-complete architecture conformance. M006's scheduler identity,
-dispatcher-capacity, and stale-completion branches have focused mutation
-evidence.
+M008 adds an offline game-snapshot foundation only. The domain owns the
+validated source-agnostic snapshot values; the application owns the one
+atomic-upsert port; and SQLite is the only durable adapter. A game is keyed by
+the numeric Metacritic product ID, while its source slug remains mutable routing
+data. One upsert replaces platform-score and developer collections atomically,
+preserving missing cover descriptors, video links, scores, and developers as
+explicit optional or empty values. Cover data remains the original descriptor
+fields and never becomes a fabricated CDN URL. Deterministic local product-detail
+and Userscore fixtures map into this model without a client or source request.
+
+M008 does not wire game-detail fetching, Userscore fetching, or snapshot upserts
+into the M007 runtime, queue, or hourly handler. Runtime game/review ingestion,
+summaries, web behavior, media, LLM behavior, and deployment remain
+unimplemented. Passing CI proves the bounded workspace claims and deterministic
+canary, policy, state-adapter, queue, M006 runtime, M007 discovery-handler, and
+M008 offline snapshot tests, not complete product behavior or complete
+architecture conformance. M006's scheduler identity, dispatcher-capacity, and
+stale-completion branches have focused mutation evidence.
 
 M003 requires targeted mutation testing because it introduces daily
 deduplication, crawl progression, and selection policy.

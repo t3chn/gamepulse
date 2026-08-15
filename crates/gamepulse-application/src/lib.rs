@@ -10,9 +10,29 @@ use std::sync::Arc;
 
 pub use gamepulse_domain::{
     APP_NAME, BrowseCursor, BrowseProgress, CrawlDayKey, CrawlDayKeyError, CrawlDiscoveryRequest,
-    DailyCrawlAction, DailyCrawlState, DailyCrawlTransition, SourceProductId, SourceProductIdError,
+    DailyCrawlAction, DailyCrawlState, DailyCrawlTransition, GameCoverDescriptor, GameDeveloper,
+    GamePlatformScore, GameSnapshot, GameSnapshotValidationError, GameVideoLink, Metascore,
+    MetascoreError, SourceProductId, SourceProductIdError, Userscore, UserscoreError,
 };
 use gamepulse_domain::{prepare_daily_crawl, select_daily_crawl};
+
+/// Application-owned durable boundary for replacing one complete game snapshot.
+///
+/// Implementations must key the game by `source_product_id`, update its mutable source slug, and
+/// make the game row plus all platform-score and developer rows visible together or not at all.
+pub trait GameSnapshotStore {
+    type Error;
+
+    fn upsert_snapshot(&mut self, snapshot: &GameSnapshot) -> Result<(), Self::Error>;
+}
+
+/// Persist one previously validated inner snapshot through the application-owned boundary.
+pub fn upsert_game_snapshot<S>(store: &mut S, snapshot: &GameSnapshot) -> Result<(), S::Error>
+where
+    S: GameSnapshotStore,
+{
+    store.upsert_snapshot(snapshot)
+}
 
 /// A compact, source-adapter-mapped candidate. The slug is opaque to this policy;
 /// daily uniqueness always uses `source_product_id`.

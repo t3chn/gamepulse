@@ -2,6 +2,7 @@
 
 //! SQLite implementations of GamePulse application ports.
 
+mod game_snapshot;
 mod job_queue;
 
 use std::collections::BTreeSet;
@@ -16,12 +17,15 @@ use rusqlite::{
     Connection, Error, OptionalExtension, Params, Transaction, TransactionBehavior, ffi, params,
 };
 
+pub use game_snapshot::{GameSnapshotStoreError, SqliteGameSnapshotStore};
 pub use job_queue::{JobStoreError, SqliteJobStore};
 
 const DAILY_CRAWL_SCHEMA_VERSION: i64 = 1;
-const SCHEMA_VERSION: i64 = 2;
+const JOB_QUEUE_SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const DAILY_CRAWL_MIGRATION_0001: &str = include_str!("../migrations/0001_daily_crawl_state.sql");
 const JOB_QUEUE_MIGRATION_0002: &str = include_str!("../migrations/0002_job_queue.sql");
+const GAME_SNAPSHOT_MIGRATION_0003: &str = include_str!("../migrations/0003_game_snapshots.sql");
 
 type ForeignKeyDefinition<'a> = (
     i64,
@@ -38,6 +42,7 @@ type ForeignKeyDefinition<'a> = (
 enum ExpectedConstraint {
     Check,
     ForeignKey,
+    PrimaryKey,
     Unique,
 }
 
@@ -46,6 +51,7 @@ impl ExpectedConstraint {
         match self {
             Self::Check => ffi::SQLITE_CONSTRAINT_CHECK,
             Self::ForeignKey => ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+            Self::PrimaryKey => ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
             Self::Unique => ffi::SQLITE_CONSTRAINT_UNIQUE,
         }
     }
@@ -54,6 +60,7 @@ impl ExpectedConstraint {
         match self {
             Self::Check => "CHECK",
             Self::ForeignKey => "FOREIGN KEY",
+            Self::PrimaryKey => "PRIMARY KEY",
             Self::Unique => "UNIQUE",
         }
     }
@@ -218,6 +225,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(JOB_QUEUE_MIGRATION_0002)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(GAME_SNAPSHOT_MIGRATION_0003)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -231,6 +241,25 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .execute_batch(JOB_QUEUE_MIGRATION_0002)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(GAME_SNAPSHOT_MIGRATION_0003)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .commit()
+                .map_err(DailyCrawlStateStoreError::database)
+        }
+        JOB_QUEUE_SCHEMA_VERSION => {
+            validate_daily_crawl_schema(connection)?;
+            validate_job_queue_schema(connection)?;
+            let transaction = connection
+                .transaction()
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(GAME_SNAPSHOT_MIGRATION_0003)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -249,7 +278,8 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
 
 fn validate_owned_schema(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError> {
     validate_daily_crawl_schema(connection)?;
-    validate_job_queue_schema(connection)
+    validate_job_queue_schema(connection)?;
+    validate_game_snapshot_schema(connection)
 }
 
 fn validate_daily_crawl_schema(
@@ -382,6 +412,62 @@ fn validate_job_queue_schema(connection: &mut Connection) -> Result<(), DailyCra
         )],
     )?;
     validate_job_queue_constraint_behavior(connection)
+}
+
+fn validate_game_snapshot_schema(
+    connection: &mut Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    validate_table_columns(
+        connection,
+        "games",
+        &[
+            ("source_product_id", "INTEGER", 1, 1),
+            ("source_slug", "TEXT", 1, 0),
+            ("title", "TEXT", 1, 0),
+            ("description", "TEXT", 1, 0),
+            ("cover_bucket_path", "TEXT", 0, 0),
+            ("cover_bucket_type", "TEXT", 0, 0),
+            ("cover_filename", "TEXT", 0, 0),
+            ("cover_kind", "TEXT", 0, 0),
+            ("video_url", "TEXT", 0, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "game_platform_scores",
+        &[
+            ("game_source_product_id", "INTEGER", 1, 1),
+            ("source_platform_id", "INTEGER", 1, 2),
+            ("source_slug", "TEXT", 1, 0),
+            ("metascore", "INTEGER", 0, 0),
+            ("userscore", "REAL", 0, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "game_developers",
+        &[
+            ("game_source_product_id", "INTEGER", 1, 1),
+            ("developer_name", "TEXT", 1, 2),
+        ],
+    )?;
+
+    validate_table_layout(connection, "games", false)?;
+    validate_table_layout(connection, "game_platform_scores", true)?;
+    validate_table_layout(connection, "game_developers", true)?;
+    let game_foreign_key = [(
+        0,
+        0,
+        "games",
+        "game_source_product_id",
+        "source_product_id",
+        "NO ACTION",
+        "CASCADE",
+        "NONE",
+    )];
+    validate_foreign_key_groups(connection, "game_platform_scores", &game_foreign_key)?;
+    validate_foreign_key_groups(connection, "game_developers", &game_foreign_key)?;
+    validate_game_snapshot_constraint_behavior(connection)
 }
 
 fn validate_table_columns(
@@ -763,6 +849,159 @@ fn validate_job_queue_constraints_in_transaction(
          ) VALUES (?1, 1, 2, 'worker', 1, NULL, 'active', NULL)",
         params![&valid_job_identity],
     )
+}
+
+fn validate_game_snapshot_constraint_behavior(
+    connection: &mut Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(DailyCrawlStateStoreError::database)?;
+    let validation = validate_game_snapshot_constraints_in_transaction(&transaction);
+    let rollback = transaction.rollback();
+
+    match (validation, rollback) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (_, Err(error)) => Err(DailyCrawlStateStoreError::database(error)),
+    }
+}
+
+fn validate_game_snapshot_constraints_in_transaction(
+    connection: &Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    let mut reserved_probe_product_ids = BTreeSet::new();
+    let valid_product_id =
+        next_absent_probe_game_source_id(connection, &mut reserved_probe_product_ids)?;
+    let missing_product_id =
+        next_absent_probe_game_source_id(connection, &mut reserved_probe_product_ids)?;
+
+    expect_constraint_rejection(
+        connection,
+        "zero game source identity",
+        ExpectedConstraint::Check,
+        "INSERT INTO games (source_product_id, source_slug, title, description)
+         VALUES (0, 'zero', 'Zero', 'Synthetic')",
+        [],
+    )?;
+    expect_constraint_rejection(
+        connection,
+        "blank game title",
+        ExpectedConstraint::Check,
+        "INSERT INTO games (source_product_id, source_slug, title, description)
+         VALUES (?1, 'blank-title', '   ', 'Synthetic')",
+        params![valid_product_id],
+    )?;
+    expect_constraint_rejection(
+        connection,
+        "partial cover descriptor",
+        ExpectedConstraint::Check,
+        "INSERT INTO games (
+            source_product_id, source_slug, title, description, cover_bucket_path
+         ) VALUES (?1, 'partial-cover', 'Partial Cover', 'Synthetic', 'bucket')",
+        params![valid_product_id],
+    )?;
+    connection
+        .execute(
+            "INSERT INTO games (source_product_id, source_slug, title, description)
+             VALUES (?1, 'valid-game', 'Valid Game', 'Synthetic')",
+            params![valid_product_id],
+        )
+        .map_err(DailyCrawlStateStoreError::database)?;
+    expect_constraint_rejection(
+        connection,
+        "platform source identity",
+        ExpectedConstraint::Check,
+        "INSERT INTO game_platform_scores (
+            game_source_product_id, source_platform_id, source_slug, metascore, userscore
+         ) VALUES (?1, 0, 'pc', 80, 8.0)",
+        params![valid_product_id],
+    )?;
+    expect_constraint_rejection(
+        connection,
+        "Metascore above upper bound",
+        ExpectedConstraint::Check,
+        "INSERT INTO game_platform_scores (
+            game_source_product_id, source_platform_id, source_slug, metascore, userscore
+         ) VALUES (?1, 1, 'pc', 101, 8.0)",
+        params![valid_product_id],
+    )?;
+    expect_constraint_rejection(
+        connection,
+        "Userscore above upper bound",
+        ExpectedConstraint::Check,
+        "INSERT INTO game_platform_scores (
+            game_source_product_id, source_platform_id, source_slug, metascore, userscore
+         ) VALUES (?1, 1, 'pc', 80, 10.1)",
+        params![valid_product_id],
+    )?;
+    expect_constraint_rejection(
+        connection,
+        "platform game foreign key",
+        ExpectedConstraint::ForeignKey,
+        "INSERT INTO game_platform_scores (
+            game_source_product_id, source_platform_id, source_slug, metascore, userscore
+         ) VALUES (?1, 1, 'pc', 80, 8.0)",
+        params![missing_product_id],
+    )?;
+    connection
+        .execute(
+            "INSERT INTO game_platform_scores (
+                game_source_product_id, source_platform_id, source_slug, metascore, userscore
+             ) VALUES (?1, 1, 'pc', 80, 8.0)",
+            params![valid_product_id],
+        )
+        .map_err(DailyCrawlStateStoreError::database)?;
+    expect_constraint_rejection(
+        connection,
+        "duplicate platform identity",
+        ExpectedConstraint::PrimaryKey,
+        "INSERT INTO game_platform_scores (
+            game_source_product_id, source_platform_id, source_slug, metascore, userscore
+         ) VALUES (?1, 1, 'pc-renamed', 80, 8.0)",
+        params![valid_product_id],
+    )?;
+    expect_constraint_rejection(
+        connection,
+        "developer game foreign key",
+        ExpectedConstraint::ForeignKey,
+        "INSERT INTO game_developers (game_source_product_id, developer_name)
+         VALUES (?1, 'Missing Parent')",
+        params![missing_product_id],
+    )
+}
+
+fn next_absent_probe_game_source_id(
+    connection: &Connection,
+    reserved_probe_product_ids: &mut BTreeSet<i64>,
+) -> Result<i64, DailyCrawlStateStoreError> {
+    let mut suffix = 0_i64;
+    loop {
+        let candidate = 9_000_000_000_000_000_000_i64
+            .checked_sub(suffix)
+            .ok_or_else(|| {
+                DailyCrawlStateStoreError::malformed(
+                    "no absent game source identity is available for validation",
+                )
+            })?;
+        suffix = suffix.checked_add(1).ok_or_else(|| {
+            DailyCrawlStateStoreError::malformed(
+                "no absent game source identity is available for validation",
+            )
+        })?;
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM games WHERE source_product_id = ?1",
+                params![candidate],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(DailyCrawlStateStoreError::database)?
+            .is_some();
+        if !exists && reserved_probe_product_ids.insert(candidate) {
+            return Ok(candidate);
+        }
+    }
 }
 
 fn next_absent_probe_job_identity(
@@ -1166,7 +1405,7 @@ mod tests {
             .execute_batch(queue_schema)
             .expect("queue test schema must create");
         connection
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", JOB_QUEUE_SCHEMA_VERSION)
             .expect("test schema version must set");
     }
 

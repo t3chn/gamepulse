@@ -2,6 +2,7 @@
 
 //! Direct-HTTP Metacritic source contract canary.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -18,7 +19,11 @@ use gamepulse_application::{
     DiscoveryCandidate, DiscoveryPage, JobHandler, JobHandlerFailure, JobHandlerFuture,
     JobHandlerResult, RuntimeJobType, TypedJob, execute_async_daily_crawl,
 };
-use gamepulse_domain::BrowseCursor;
+use gamepulse_domain::{
+    BrowseCursor, GameCoverDescriptor, GameDeveloper, GamePlatformScore, GameSnapshot,
+    GameSnapshotValidationError, GameVideoLink,
+};
+pub use gamepulse_domain::{Metascore, Userscore};
 
 const BACKEND_BASE_URL: &str = "https://backend.metacritic.com/";
 const NEW_RELEASES_LIST_LIMIT: u32 = 20;
@@ -194,26 +199,6 @@ pub struct GameId(pub u64);
 pub struct GameIdentity {
     pub id: GameId,
     pub slug: String,
-}
-
-/// A bounded Metascore on its source-native 0-100 scale.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Metascore(u8);
-
-impl Metascore {
-    pub fn value(self) -> u8 {
-        self.0
-    }
-}
-
-/// A bounded Userscore on its source-native 0-10 scale.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Userscore(f64);
-
-impl Userscore {
-    pub fn value(self) -> f64 {
-        self.0
-    }
 }
 
 /// The explicit continuation supplied by a finder or review response.
@@ -415,6 +400,118 @@ impl GameDetail {
             .iter()
             .find(|image| image.kind.eq_ignore_ascii_case("cardImage"))
     }
+}
+
+/// A Userscore result bound to the game and platform identities validated at the source boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlatformUserScore {
+    source_game: GameIdentity,
+    source_platform_id: u64,
+    source_platform_slug: String,
+    score: Option<Userscore>,
+}
+
+impl PlatformUserScore {
+    fn source_game(&self) -> &GameIdentity {
+        &self.source_game
+    }
+
+    fn source_platform_id(&self) -> u64 {
+        self.source_platform_id
+    }
+
+    fn source_platform_slug(&self) -> &str {
+        &self.source_platform_slug
+    }
+
+    fn score(&self) -> Option<Userscore> {
+        self.score
+    }
+}
+
+/// Map one parsed product payload and the available per-platform Userscores into the inner model.
+///
+/// This is deliberately request-free. Missing score responses remain `None`; supplied scores must
+/// exactly match the source game and platform identities in the product detail before they can be
+/// joined to the snapshot.
+pub fn map_game_detail_to_snapshot(
+    detail: &GameDetail,
+    user_scores: impl IntoIterator<Item = PlatformUserScore>,
+) -> Result<GameSnapshot, GameSnapshotMappingError> {
+    let mut user_scores_by_platform = BTreeMap::new();
+    for user_score in user_scores {
+        if user_score.source_game().id != detail.id || user_score.source_game().slug != detail.slug
+        {
+            return Err(GameSnapshotMappingError::MismatchedPlatformUserScoreGame);
+        }
+        if !detail.platforms.iter().any(|platform| {
+            platform.id == user_score.source_platform_id()
+                && platform.slug == user_score.source_platform_slug()
+        }) {
+            return Err(GameSnapshotMappingError::MismatchedPlatformUserScorePlatform);
+        }
+        if user_scores_by_platform
+            .insert(user_score.source_platform_id(), user_score.score())
+            .is_some()
+        {
+            return Err(GameSnapshotMappingError::DuplicatePlatformUserScore);
+        }
+    }
+
+    let cover = detail
+        .cover_image()
+        .map(|image| {
+            GameCoverDescriptor::new(
+                image.bucket_path.clone(),
+                image.bucket_type.clone(),
+                image.filename.clone(),
+                image.kind.clone(),
+            )
+        })
+        .transpose()
+        .map_err(GameSnapshotMappingError::InvalidSnapshot)?;
+    let video = detail
+        .video
+        .as_ref()
+        .map(|video| GameVideoLink::new(video.url.clone()))
+        .transpose()
+        .map_err(GameSnapshotMappingError::InvalidSnapshot)?;
+    let platform_scores = detail
+        .platforms
+        .iter()
+        .map(|platform| {
+            GamePlatformScore::new(
+                platform.id,
+                platform.slug.clone(),
+                platform.metascore,
+                user_scores_by_platform.remove(&platform.id).flatten(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(GameSnapshotMappingError::InvalidSnapshot)?;
+    if !user_scores_by_platform.is_empty() {
+        return Err(GameSnapshotMappingError::MismatchedPlatformUserScorePlatform);
+    }
+    let developers = detail
+        .developers
+        .iter()
+        .cloned()
+        .map(GameDeveloper::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(GameSnapshotMappingError::InvalidSnapshot)?;
+
+    GameSnapshot::new(
+        gamepulse_domain::SourceProductId::new(detail.id.0)
+            .map_err(|_| GameSnapshotMappingError::InvalidProductId)?,
+        detail.slug.clone(),
+        detail.title.clone(),
+        detail.description.clone(),
+        cover,
+        video,
+        platform_scores,
+        developers,
+    )
+    .map_err(GameSnapshotMappingError::InvalidSnapshot)
 }
 
 /// The per-platform Userscore response has an independent review count.
@@ -780,6 +877,33 @@ pub fn parse_user_score_summary(
     })
 }
 
+/// Parse and bind a Userscore response before it can enter the snapshot mapper.
+///
+/// The response self link must name this exact requested game slug and platform slug. The numeric
+/// identifiers are retained from the detail request, so callers cannot attach a parsed summary to
+/// arbitrary snapshot identities after parsing.
+pub fn parse_platform_user_score_for_snapshot(
+    expected_game: &GameIdentity,
+    expected_platform: &PlatformDetail,
+    body: &str,
+) -> Result<PlatformUserScore, SnapshotUserScoreBindingError> {
+    if expected_game.id.0 == 0 {
+        return Err(SnapshotUserScoreBindingError::InvalidGameIdentity);
+    }
+    if expected_platform.id == 0 {
+        return Err(SnapshotUserScoreBindingError::InvalidPlatformIdentity);
+    }
+
+    let summary = parse_user_score_summary(&expected_game.slug, &expected_platform.slug, body)
+        .map_err(SnapshotUserScoreBindingError::Source)?;
+    Ok(PlatformUserScore {
+        source_game: expected_game.clone(),
+        source_platform_id: expected_platform.id,
+        source_platform_slug: expected_platform.slug.clone(),
+        score: summary.score,
+    })
+}
+
 /// Parse a review response while intentionally leaving quote text out of M002 models.
 pub fn parse_review_page(
     kind: ReviewKind,
@@ -845,6 +969,69 @@ impl fmt::Display for DailyCrawlMappingError {
 }
 
 impl std::error::Error for DailyCrawlMappingError {}
+
+/// A deterministic mapping failure at the source-to-inner-snapshot boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GameSnapshotMappingError {
+    InvalidProductId,
+    DuplicatePlatformUserScore,
+    MismatchedPlatformUserScoreGame,
+    MismatchedPlatformUserScorePlatform,
+    InvalidSnapshot(GameSnapshotValidationError),
+}
+
+impl fmt::Display for GameSnapshotMappingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidProductId => {
+                formatter.write_str("Metacritic detail has an invalid numeric product identity")
+            }
+            Self::DuplicatePlatformUserScore => {
+                formatter.write_str("duplicate Userscore mapping for a Metacritic platform")
+            }
+            Self::MismatchedPlatformUserScoreGame => {
+                formatter.write_str("Userscore mapping references a different Metacritic game")
+            }
+            Self::MismatchedPlatformUserScorePlatform => {
+                formatter.write_str("Userscore mapping references a different Metacritic platform")
+            }
+            Self::InvalidSnapshot(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for GameSnapshotMappingError {}
+
+/// A failure while binding a validated Userscore response to a snapshot input.
+#[derive(Debug)]
+pub enum SnapshotUserScoreBindingError {
+    InvalidGameIdentity,
+    InvalidPlatformIdentity,
+    Source(SourceError),
+}
+
+impl fmt::Display for SnapshotUserScoreBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidGameIdentity => {
+                formatter.write_str("snapshot Userscore game identity must have a non-zero ID")
+            }
+            Self::InvalidPlatformIdentity => {
+                formatter.write_str("snapshot Userscore platform identity must have a non-zero ID")
+            }
+            Self::Source(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotUserScoreBindingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source(error) => Some(error),
+            Self::InvalidGameIdentity | Self::InvalidPlatformIdentity => None,
+        }
+    }
+}
 
 impl fmt::Display for SourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1032,14 +1219,21 @@ fn parse_metascore(
     else {
         return Ok(None);
     };
-    Ok(Some(Metascore(value as u8)))
+    Metascore::new(value as u8)
+        .map(Some)
+        .map_err(|_| SourceError::InvalidScore { field })
 }
 
 fn parse_userscore(
     value: Option<Value>,
     field: &'static str,
 ) -> Result<Option<Userscore>, SourceError> {
-    parse_optional_score(value, 10.0, false, field).map(|score| score.map(Userscore))
+    parse_optional_score(value, 10.0, false, field).and_then(|score| {
+        score
+            .map(Userscore::new)
+            .transpose()
+            .map_err(|_| SourceError::InvalidScore { field })
+    })
 }
 
 fn parse_optional_score(

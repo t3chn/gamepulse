@@ -46,6 +46,269 @@ impl SourceProductId {
     }
 }
 
+/// A bounded critic score on the common 0-100 scale.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Metascore(u8);
+
+impl Metascore {
+    pub fn new(value: u8) -> Result<Self, MetascoreError> {
+        if value > 100 {
+            return Err(MetascoreError::OutOfRange);
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+}
+
+/// A bounded user score on the common 0-10 scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Userscore(f64);
+
+impl Userscore {
+    pub fn new(value: f64) -> Result<Self, UserscoreError> {
+        if !value.is_finite() || !(0.0..=10.0).contains(&value) {
+            return Err(UserscoreError::OutOfRange);
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn value(self) -> f64 {
+        self.0
+    }
+}
+
+/// The original source descriptor for a cover image. Rendering policy is intentionally external.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GameCoverDescriptor {
+    bucket_path: String,
+    bucket_type: String,
+    filename: String,
+    kind: String,
+}
+
+impl GameCoverDescriptor {
+    pub fn new(
+        bucket_path: impl Into<String>,
+        bucket_type: impl Into<String>,
+        filename: impl Into<String>,
+        kind: impl Into<String>,
+    ) -> Result<Self, GameSnapshotValidationError> {
+        let bucket_path = bucket_path.into();
+        let bucket_type = bucket_type.into();
+        let filename = filename.into();
+        let kind = kind.into();
+        validate_snapshot_text("cover bucket path", &bucket_path)?;
+        validate_snapshot_text("cover bucket type", &bucket_type)?;
+        validate_snapshot_text("cover filename", &filename)?;
+        validate_snapshot_text("cover kind", &kind)?;
+
+        Ok(Self {
+            bucket_path,
+            bucket_type,
+            filename,
+            kind,
+        })
+    }
+
+    pub fn bucket_path(&self) -> &str {
+        &self.bucket_path
+    }
+
+    pub fn bucket_type(&self) -> &str {
+        &self.bucket_type
+    }
+
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+}
+
+/// A video link preserved as a source-supplied value without a provider-specific policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GameVideoLink(String);
+
+impl GameVideoLink {
+    pub fn new(value: impl Into<String>) -> Result<Self, GameSnapshotValidationError> {
+        let value = value.into();
+        validate_snapshot_text("video link", &value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One available platform and its independently optional scores.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GamePlatformScore {
+    source_platform_id: u64,
+    source_slug: String,
+    metascore: Option<Metascore>,
+    userscore: Option<Userscore>,
+}
+
+impl GamePlatformScore {
+    pub fn new(
+        source_platform_id: u64,
+        source_slug: impl Into<String>,
+        metascore: Option<Metascore>,
+        userscore: Option<Userscore>,
+    ) -> Result<Self, GameSnapshotValidationError> {
+        if source_platform_id == 0 {
+            return Err(GameSnapshotValidationError::ZeroPlatformSourceId);
+        }
+        let source_slug = source_slug.into();
+        validate_snapshot_text("platform source slug", &source_slug)?;
+
+        Ok(Self {
+            source_platform_id,
+            source_slug,
+            metascore,
+            userscore,
+        })
+    }
+
+    pub const fn source_platform_id(&self) -> u64 {
+        self.source_platform_id
+    }
+
+    pub fn source_slug(&self) -> &str {
+        &self.source_slug
+    }
+
+    pub const fn metascore(&self) -> Option<Metascore> {
+        self.metascore
+    }
+
+    pub const fn userscore(&self) -> Option<Userscore> {
+        self.userscore
+    }
+}
+
+/// One source-supplied developer name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GameDeveloper(String);
+
+impl GameDeveloper {
+    pub fn new(value: impl Into<String>) -> Result<Self, GameSnapshotValidationError> {
+        let value = value.into();
+        validate_snapshot_text("developer name", &value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A source-agnostic, validated game representation ready for one durable replacement write.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GameSnapshot {
+    source_product_id: SourceProductId,
+    source_slug: String,
+    title: String,
+    description: String,
+    cover: Option<GameCoverDescriptor>,
+    video: Option<GameVideoLink>,
+    platform_scores: Vec<GamePlatformScore>,
+    developers: Vec<GameDeveloper>,
+}
+
+impl GameSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        source_product_id: SourceProductId,
+        source_slug: impl Into<String>,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        cover: Option<GameCoverDescriptor>,
+        video: Option<GameVideoLink>,
+        platform_scores: Vec<GamePlatformScore>,
+        developers: Vec<GameDeveloper>,
+    ) -> Result<Self, GameSnapshotValidationError> {
+        let source_slug = source_slug.into();
+        let title = title.into();
+        let description = description.into();
+        validate_snapshot_text("source slug", &source_slug)?;
+        validate_snapshot_text("title", &title)?;
+        validate_snapshot_text("description", &description)?;
+
+        let mut platform_ids = BTreeSet::new();
+        for platform in &platform_scores {
+            if !platform_ids.insert(platform.source_platform_id()) {
+                return Err(GameSnapshotValidationError::DuplicatePlatformSourceId);
+            }
+        }
+        let mut developer_names = BTreeSet::new();
+        for developer in &developers {
+            if !developer_names.insert(developer.as_str()) {
+                return Err(GameSnapshotValidationError::DuplicateDeveloperName);
+            }
+        }
+
+        Ok(Self {
+            source_product_id,
+            source_slug,
+            title,
+            description,
+            cover,
+            video,
+            platform_scores,
+            developers,
+        })
+    }
+
+    pub const fn source_product_id(&self) -> SourceProductId {
+        self.source_product_id
+    }
+
+    pub fn source_slug(&self) -> &str {
+        &self.source_slug
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn cover(&self) -> Option<&GameCoverDescriptor> {
+        self.cover.as_ref()
+    }
+
+    pub fn video(&self) -> Option<&GameVideoLink> {
+        self.video.as_ref()
+    }
+
+    pub fn platform_scores(&self) -> &[GamePlatformScore] {
+        &self.platform_scores
+    }
+
+    pub fn developers(&self) -> &[GameDeveloper] {
+        &self.developers
+    }
+}
+
+fn validate_snapshot_text(
+    field: &'static str,
+    value: &str,
+) -> Result<(), GameSnapshotValidationError> {
+    if value.trim().is_empty() {
+        return Err(GameSnapshotValidationError::BlankField(field));
+    }
+    Ok(())
+}
+
 /// A source-adapter cursor for a later newest-first browse request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct BrowseCursor(u64);
@@ -294,6 +557,57 @@ impl fmt::Display for SourceProductIdError {
 
 impl std::error::Error for SourceProductIdError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetascoreError {
+    OutOfRange,
+}
+
+impl fmt::Display for MetascoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Metascore must be between 0 and 100")
+    }
+}
+
+impl std::error::Error for MetascoreError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserscoreError {
+    OutOfRange,
+}
+
+impl fmt::Display for UserscoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Userscore must be finite and between 0 and 10")
+    }
+}
+
+impl std::error::Error for UserscoreError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GameSnapshotValidationError {
+    BlankField(&'static str),
+    ZeroPlatformSourceId,
+    DuplicatePlatformSourceId,
+    DuplicateDeveloperName,
+}
+
+impl fmt::Display for GameSnapshotValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BlankField(field) => write!(formatter, "{field} must not be blank"),
+            Self::ZeroPlatformSourceId => {
+                formatter.write_str("platform source identity must be non-zero")
+            }
+            Self::DuplicatePlatformSourceId => {
+                formatter.write_str("platform source identities must be unique")
+            }
+            Self::DuplicateDeveloperName => formatter.write_str("developer names must be unique"),
+        }
+    }
+}
+
+impl std::error::Error for GameSnapshotValidationError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,5 +811,68 @@ mod tests {
     fn rejects_blank_days_and_zero_source_ids() {
         assert_eq!(CrawlDayKey::new(" "), Err(CrawlDayKeyError::Blank));
         assert_eq!(SourceProductId::new(0), Err(SourceProductIdError::Zero));
+    }
+
+    #[test]
+    fn snapshot_scores_enforce_their_domain_bounds() {
+        assert_eq!(
+            Metascore::new(100)
+                .expect("upper bound must be valid")
+                .value(),
+            100
+        );
+        assert_eq!(Metascore::new(101), Err(MetascoreError::OutOfRange));
+        assert_eq!(
+            Userscore::new(10.0)
+                .expect("upper bound must be valid")
+                .value(),
+            10.0
+        );
+        assert_eq!(Userscore::new(-0.1), Err(UserscoreError::OutOfRange));
+        assert_eq!(Userscore::new(10.1), Err(UserscoreError::OutOfRange));
+        assert_eq!(Userscore::new(f64::NAN), Err(UserscoreError::OutOfRange));
+    }
+
+    #[test]
+    fn snapshot_keeps_optional_source_data_explicit_and_rejects_duplicate_children() {
+        let platform = GamePlatformScore::new(7, "pc", None, None)
+            .expect("available platform with unavailable scores must be valid");
+        let snapshot = GameSnapshot::new(
+            product(101),
+            "example-game",
+            "Example Game",
+            "Example description",
+            None,
+            None,
+            vec![platform],
+            Vec::new(),
+        )
+        .expect("explicitly absent cover, video, scores, and developers must be valid");
+
+        assert!(snapshot.cover().is_none());
+        assert!(snapshot.video().is_none());
+        assert_eq!(snapshot.platform_scores()[0].metascore(), None);
+        assert_eq!(snapshot.platform_scores()[0].userscore(), None);
+        assert!(snapshot.developers().is_empty());
+
+        let duplicate_platform = GamePlatformScore::new(7, "pc-renamed", None, None)
+            .expect("individually valid platform");
+        assert_eq!(
+            GameSnapshot::new(
+                product(101),
+                "example-game",
+                "Example Game",
+                "Example description",
+                None,
+                None,
+                vec![snapshot.platform_scores()[0].clone(), duplicate_platform],
+                Vec::new(),
+            ),
+            Err(GameSnapshotValidationError::DuplicatePlatformSourceId)
+        );
+        assert_eq!(
+            GameDeveloper::new(" "),
+            Err(GameSnapshotValidationError::BlankField("developer name"))
+        );
     }
 }
