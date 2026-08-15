@@ -1,0 +1,10 @@
+{
+  "data": {
+    "items": [
+      { "id": "synthetic-user-1", "score": 9, "quote": "Users praise the synthetic co-op mode." },
+      { "id": "synthetic-user-2", "score": 3, "quote": "Users report poor synthetic performance." }
+    ],
+    "totalResults": 2
+  },
+  "links": { "next": null }
+}

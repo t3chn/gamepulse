@@ -112,6 +112,10 @@ quote fields; a critic record cannot be assumed to have a stable review ID.
 M002 records only structural availability and never writes review text to
 fixtures, logs, or tracked evidence.
 
+M011's offline fixture vertical requests only `offset=0` with `limit=20` for
+each kind and never follows a review continuation. It maps bounded synthetic
+excerpt fields as untrusted input; critic and user data must not be combined.
+
 ## Remaining risks
 
 - The backend is a public site implementation, not a versioned public API.

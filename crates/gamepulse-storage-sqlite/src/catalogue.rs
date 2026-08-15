@@ -3,8 +3,8 @@ use std::path::Path;
 
 use gamepulse_application::{
     CatalogueCoverDescriptor, CatalogueGameCard, CatalogueGameDetail, CataloguePage,
-    CataloguePlatformFilter, CataloguePlatformScore, CatalogueQuery, GameCatalogueReadPort,
-    SimilarCatalogueGame, SourceProductId,
+    CataloguePlatformFilter, CataloguePlatformScore, CatalogueQuery, CatalogueReviewSummary,
+    GameCatalogueReadPort, ReviewKind, SimilarCatalogueGame, SourceProductId,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -138,6 +138,9 @@ impl SqliteGameCatalogueReadStore {
         let platforms = self.platform_scores(stored_game.source_product_id)?;
         let developers = self.developers(stored_game.source_product_id)?;
         let similar_games = self.similar_games(stored_game.source_product_id)?;
+        let critic_summary =
+            self.review_summary(stored_game.source_product_id, ReviewKind::Critic)?;
+        let user_summary = self.review_summary(stored_game.source_product_id, ReviewKind::User)?;
 
         Ok(Some(CatalogueGameDetail::new(
             stored_game.source_product_id,
@@ -149,6 +152,8 @@ impl SqliteGameCatalogueReadStore {
             platforms,
             developers,
             similar_games,
+            critic_summary,
+            user_summary,
         )))
     }
 
@@ -313,6 +318,64 @@ impl SqliteGameCatalogueReadStore {
         rows.map(|row| row.map_err(GameCatalogueReadStoreError::database))
             .collect()
     }
+
+    fn review_summary(
+        &mut self,
+        source_product_id: SourceProductId,
+        kind: ReviewKind,
+    ) -> Result<Option<CatalogueReviewSummary>, GameCatalogueReadStoreError> {
+        let identifier = sqlite_identifier(source_product_id)?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(GameCatalogueReadStoreError::database)?;
+        let state = transaction
+            .query_row(
+                "SELECT state
+                 FROM review_summaries
+                 WHERE game_source_product_id = ?1 AND review_kind = ?2",
+                params![identifier, kind.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(GameCatalogueReadStoreError::database)?;
+        let summary = match state.as_deref() {
+            None => None,
+            Some("pending") => Some(CatalogueReviewSummary::Pending),
+            Some("unavailable") => Some(CatalogueReviewSummary::Unavailable),
+            Some("available") => {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT sentiment, item
+                         FROM review_summary_items
+                         WHERE game_source_product_id = ?1 AND review_kind = ?2
+                         ORDER BY sentiment ASC, item_position ASC",
+                    )
+                    .map_err(GameCatalogueReadStoreError::database)?;
+                let rows = statement
+                    .query_map(params![identifier, kind.as_str()], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(GameCatalogueReadStoreError::database)?;
+                let mut likes = Vec::new();
+                let mut dislikes = Vec::new();
+                for row in rows {
+                    let (sentiment, item) = row.map_err(GameCatalogueReadStoreError::database)?;
+                    match sentiment.as_str() {
+                        "like" => likes.push(item),
+                        "dislike" => dislikes.push(item),
+                        _ => return Err(GameCatalogueReadStoreError::malformed_summary()),
+                    }
+                }
+                Some(CatalogueReviewSummary::Available { likes, dislikes })
+            }
+            Some(_) => return Err(GameCatalogueReadStoreError::malformed_summary()),
+        };
+        transaction
+            .commit()
+            .map_err(GameCatalogueReadStoreError::database)?;
+        Ok(summary)
+    }
 }
 
 impl GameCatalogueReadPort for SqliteGameCatalogueReadStore {
@@ -405,6 +468,12 @@ impl GameCatalogueReadStoreError {
     fn identifier() -> Self {
         Self {
             message: "game source product identity exceeds SQLite INTEGER range".to_owned(),
+        }
+    }
+
+    fn malformed_summary() -> Self {
+        Self {
+            message: "SQLite catalogue review summary is malformed".to_owned(),
         }
     }
 }

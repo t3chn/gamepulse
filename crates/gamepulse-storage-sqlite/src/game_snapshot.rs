@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::Path;
 
 use gamepulse_application::{GameSnapshot, GameSnapshotStore};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 /// A durable SQLite implementation of the application-owned game snapshot upsert port.
 pub struct SqliteGameSnapshotStore {
@@ -29,93 +29,11 @@ impl SqliteGameSnapshotStore {
         &mut self,
         snapshot: &GameSnapshot,
     ) -> Result<(), GameSnapshotStoreError> {
-        let source_product_id = sqlite_identifier(
-            snapshot.source_product_id().value(),
-            "game source product identity",
-        )?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(GameSnapshotStoreError::database)?;
-        let cover = snapshot.cover();
-        transaction
-            .execute(
-                "INSERT INTO games (
-                    source_product_id,
-                    source_slug,
-                    title,
-                    description,
-                    cover_bucket_path,
-                    cover_bucket_type,
-                    cover_filename,
-                    cover_kind,
-                    video_url
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(source_product_id) DO UPDATE SET
-                    source_slug = excluded.source_slug,
-                    title = excluded.title,
-                    description = excluded.description,
-                    cover_bucket_path = excluded.cover_bucket_path,
-                    cover_bucket_type = excluded.cover_bucket_type,
-                    cover_filename = excluded.cover_filename,
-                    cover_kind = excluded.cover_kind,
-                    video_url = excluded.video_url",
-                params![
-                    source_product_id,
-                    snapshot.source_slug(),
-                    snapshot.title(),
-                    snapshot.description(),
-                    cover.map(|value| value.bucket_path()),
-                    cover.map(|value| value.bucket_type()),
-                    cover.map(|value| value.filename()),
-                    cover.map(|value| value.kind()),
-                    snapshot.video().map(|value| value.as_str()),
-                ],
-            )
-            .map_err(GameSnapshotStoreError::database)?;
-        transaction
-            .execute(
-                "DELETE FROM game_platform_scores WHERE game_source_product_id = ?1",
-                params![source_product_id],
-            )
-            .map_err(GameSnapshotStoreError::database)?;
-        transaction
-            .execute(
-                "DELETE FROM game_developers WHERE game_source_product_id = ?1",
-                params![source_product_id],
-            )
-            .map_err(GameSnapshotStoreError::database)?;
-        for platform in snapshot.platform_scores() {
-            let source_platform_id =
-                sqlite_identifier(platform.source_platform_id(), "platform source identity")?;
-            transaction
-                .execute(
-                    "INSERT INTO game_platform_scores (
-                        game_source_product_id,
-                        source_platform_id,
-                        source_slug,
-                        metascore,
-                        userscore
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        source_product_id,
-                        source_platform_id,
-                        platform.source_slug(),
-                        platform.metascore().map(|value| i64::from(value.value())),
-                        platform.userscore().map(|value| value.value()),
-                    ],
-                )
-                .map_err(GameSnapshotStoreError::database)?;
-        }
-        for developer in snapshot.developers() {
-            transaction
-                .execute(
-                    "INSERT INTO game_developers (game_source_product_id, developer_name)
-                     VALUES (?1, ?2)",
-                    params![source_product_id, developer.as_str()],
-                )
-                .map_err(GameSnapshotStoreError::database)?;
-        }
+        upsert_snapshot_in_transaction(&transaction, snapshot)?;
         transaction
             .commit()
             .map_err(GameSnapshotStoreError::database)
@@ -133,6 +51,96 @@ impl SqliteGameSnapshotStore {
             )
             .expect("test trigger must install");
     }
+}
+
+pub(crate) fn upsert_snapshot_in_transaction(
+    transaction: &Transaction<'_>,
+    snapshot: &GameSnapshot,
+) -> Result<(), GameSnapshotStoreError> {
+    let source_product_id = sqlite_identifier(
+        snapshot.source_product_id().value(),
+        "game source product identity",
+    )?;
+    let cover = snapshot.cover();
+    transaction
+        .execute(
+            "INSERT INTO games (
+                source_product_id,
+                source_slug,
+                title,
+                description,
+                cover_bucket_path,
+                cover_bucket_type,
+                cover_filename,
+                cover_kind,
+                video_url
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(source_product_id) DO UPDATE SET
+                source_slug = excluded.source_slug,
+                title = excluded.title,
+                description = excluded.description,
+                cover_bucket_path = excluded.cover_bucket_path,
+                cover_bucket_type = excluded.cover_bucket_type,
+                cover_filename = excluded.cover_filename,
+                cover_kind = excluded.cover_kind,
+                video_url = excluded.video_url",
+            params![
+                source_product_id,
+                snapshot.source_slug(),
+                snapshot.title(),
+                snapshot.description(),
+                cover.map(|value| value.bucket_path()),
+                cover.map(|value| value.bucket_type()),
+                cover.map(|value| value.filename()),
+                cover.map(|value| value.kind()),
+                snapshot.video().map(|value| value.as_str()),
+            ],
+        )
+        .map_err(GameSnapshotStoreError::database)?;
+    transaction
+        .execute(
+            "DELETE FROM game_platform_scores WHERE game_source_product_id = ?1",
+            params![source_product_id],
+        )
+        .map_err(GameSnapshotStoreError::database)?;
+    transaction
+        .execute(
+            "DELETE FROM game_developers WHERE game_source_product_id = ?1",
+            params![source_product_id],
+        )
+        .map_err(GameSnapshotStoreError::database)?;
+    for platform in snapshot.platform_scores() {
+        let source_platform_id =
+            sqlite_identifier(platform.source_platform_id(), "platform source identity")?;
+        transaction
+            .execute(
+                "INSERT INTO game_platform_scores (
+                    game_source_product_id,
+                    source_platform_id,
+                    source_slug,
+                    metascore,
+                    userscore
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    source_product_id,
+                    source_platform_id,
+                    platform.source_slug(),
+                    platform.metascore().map(|value| i64::from(value.value())),
+                    platform.userscore().map(|value| value.value()),
+                ],
+            )
+            .map_err(GameSnapshotStoreError::database)?;
+    }
+    for developer in snapshot.developers() {
+        transaction
+            .execute(
+                "INSERT INTO game_developers (game_source_product_id, developer_name)
+                 VALUES (?1, ?2)",
+                params![source_product_id, developer.as_str()],
+            )
+            .map_err(GameSnapshotStoreError::database)?;
+    }
+    Ok(())
 }
 
 impl GameSnapshotStore for SqliteGameSnapshotStore {

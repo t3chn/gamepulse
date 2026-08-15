@@ -5,6 +5,7 @@
 mod catalogue;
 mod game_snapshot;
 mod job_queue;
+mod review_summary;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -21,13 +22,16 @@ use rusqlite::{
 pub use catalogue::{GameCatalogueReadStoreError, SqliteGameCatalogueReadStore};
 pub use game_snapshot::{GameSnapshotStoreError, SqliteGameSnapshotStore};
 pub use job_queue::{JobStoreError, SqliteJobStore};
+pub use review_summary::{ReviewSummaryStoreError, SqliteReviewSummaryStore};
 
 const DAILY_CRAWL_SCHEMA_VERSION: i64 = 1;
 const JOB_QUEUE_SCHEMA_VERSION: i64 = 2;
-const SCHEMA_VERSION: i64 = 3;
+const GAME_SNAPSHOT_SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const DAILY_CRAWL_MIGRATION_0001: &str = include_str!("../migrations/0001_daily_crawl_state.sql");
 const JOB_QUEUE_MIGRATION_0002: &str = include_str!("../migrations/0002_job_queue.sql");
 const GAME_SNAPSHOT_MIGRATION_0003: &str = include_str!("../migrations/0003_game_snapshots.sql");
+const REVIEW_SUMMARY_MIGRATION_0004: &str = include_str!("../migrations/0004_review_summaries.sql");
 
 type ForeignKeyDefinition<'a> = (
     i64,
@@ -285,6 +289,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(GAME_SNAPSHOT_MIGRATION_0003)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(REVIEW_SUMMARY_MIGRATION_0004)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -303,6 +310,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(GAME_SNAPSHOT_MIGRATION_0003)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(REVIEW_SUMMARY_MIGRATION_0004)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -317,6 +327,26 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .execute_batch(GAME_SNAPSHOT_MIGRATION_0003)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(REVIEW_SUMMARY_MIGRATION_0004)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .commit()
+                .map_err(DailyCrawlStateStoreError::database)
+        }
+        GAME_SNAPSHOT_SCHEMA_VERSION => {
+            validate_daily_crawl_schema(connection)?;
+            validate_job_queue_schema(connection)?;
+            validate_game_snapshot_schema(connection)?;
+            let transaction = connection
+                .transaction()
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(REVIEW_SUMMARY_MIGRATION_0004)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -336,7 +366,8 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
 fn validate_owned_schema(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError> {
     validate_daily_crawl_schema(connection)?;
     validate_job_queue_schema(connection)?;
-    validate_game_snapshot_schema(connection)
+    validate_game_snapshot_schema(connection)?;
+    validate_review_summary_schema(connection)
 }
 
 fn validate_daily_crawl_schema(
@@ -525,6 +556,136 @@ fn validate_game_snapshot_schema(
     validate_foreign_key_groups(connection, "game_platform_scores", &game_foreign_key)?;
     validate_foreign_key_groups(connection, "game_developers", &game_foreign_key)?;
     validate_game_snapshot_constraint_behavior(connection)
+}
+
+fn validate_review_summary_schema(
+    connection: &mut Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    validate_table_columns(
+        connection,
+        "review_inputs",
+        &[
+            ("game_source_product_id", "INTEGER", 1, 1),
+            ("review_kind", "TEXT", 1, 2),
+            ("content_hash", "TEXT", 1, 0),
+            ("refresh_fingerprint", "TEXT", 1, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "review_input_excerpts",
+        &[
+            ("game_source_product_id", "INTEGER", 1, 1),
+            ("review_kind", "TEXT", 1, 2),
+            ("excerpt_position", "INTEGER", 1, 3),
+            ("excerpt", "TEXT", 1, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "review_summaries",
+        &[
+            ("game_source_product_id", "INTEGER", 1, 1),
+            ("review_kind", "TEXT", 1, 2),
+            ("refresh_fingerprint", "TEXT", 1, 0),
+            ("state", "TEXT", 1, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "review_summary_items",
+        &[
+            ("game_source_product_id", "INTEGER", 1, 1),
+            ("review_kind", "TEXT", 1, 2),
+            ("sentiment", "TEXT", 1, 3),
+            ("item_position", "INTEGER", 1, 4),
+            ("item", "TEXT", 1, 0),
+        ],
+    )?;
+    validate_table_layout(connection, "review_inputs", true)?;
+    validate_table_layout(connection, "review_input_excerpts", true)?;
+    validate_table_layout(connection, "review_summaries", true)?;
+    validate_table_layout(connection, "review_summary_items", true)?;
+    validate_foreign_key_groups(
+        connection,
+        "review_inputs",
+        &[(
+            0,
+            0,
+            "games",
+            "game_source_product_id",
+            "source_product_id",
+            "NO ACTION",
+            "CASCADE",
+            "NONE",
+        )],
+    )?;
+    validate_foreign_key_groups(
+        connection,
+        "review_input_excerpts",
+        &[
+            (
+                0,
+                0,
+                "review_inputs",
+                "game_source_product_id",
+                "game_source_product_id",
+                "NO ACTION",
+                "CASCADE",
+                "NONE",
+            ),
+            (
+                0,
+                1,
+                "review_inputs",
+                "review_kind",
+                "review_kind",
+                "NO ACTION",
+                "CASCADE",
+                "NONE",
+            ),
+        ],
+    )?;
+    validate_foreign_key_groups(
+        connection,
+        "review_summaries",
+        &[(
+            0,
+            0,
+            "games",
+            "game_source_product_id",
+            "source_product_id",
+            "NO ACTION",
+            "CASCADE",
+            "NONE",
+        )],
+    )?;
+    validate_foreign_key_groups(
+        connection,
+        "review_summary_items",
+        &[
+            (
+                0,
+                0,
+                "review_summaries",
+                "game_source_product_id",
+                "game_source_product_id",
+                "NO ACTION",
+                "CASCADE",
+                "NONE",
+            ),
+            (
+                0,
+                1,
+                "review_summaries",
+                "review_kind",
+                "review_kind",
+                "NO ACTION",
+                "CASCADE",
+                "NONE",
+            ),
+        ],
+    )
 }
 
 fn validate_table_columns(

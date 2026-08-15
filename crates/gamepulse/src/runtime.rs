@@ -8,8 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use gamepulse_application::{
     ClaimedJob, HourlyJobSchedule, JobClaimRequest, JobCompletion, JobEnqueueResult, JobFailure,
     JobFailureResult, JobHandlerFailure, JobHandlerRegistry, JobHandlerResult, JobInputError,
-    JobStore, JobTimestamp, TypedJob,
+    JobStore, JobTimestamp, RuntimeJobTypeFilter, TypedJob,
 };
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
@@ -59,7 +60,8 @@ pub struct RuntimeConfig {
     worker_id: String,
     lease_seconds: i64,
     concurrency_limit: usize,
-    hourly_schedule: HourlyJobSchedule,
+    hourly_schedule: Option<HourlyJobSchedule>,
+    claim_filter: Option<RuntimeJobTypeFilter>,
 }
 
 impl RuntimeConfig {
@@ -83,8 +85,40 @@ impl RuntimeConfig {
             worker_id,
             lease_seconds,
             concurrency_limit,
-            hourly_schedule,
+            hourly_schedule: Some(hourly_schedule),
+            claim_filter: None,
         })
+    }
+
+    /// Build a worker-only runtime with no independent scheduler family.
+    pub fn worker_only(
+        worker_id: impl Into<String>,
+        lease_seconds: i64,
+        concurrency_limit: usize,
+    ) -> Result<Self, RuntimeConfigError> {
+        let worker_id = worker_id.into();
+        JobClaimRequest::new(
+            worker_id.clone(),
+            JobTimestamp::new(0).expect("zero timestamp must be valid"),
+            lease_seconds,
+        )
+        .map_err(RuntimeConfigError::InvalidJobInput)?;
+        if concurrency_limit == 0 {
+            return Err(RuntimeConfigError::ZeroConcurrencyLimit);
+        }
+        Ok(Self {
+            worker_id,
+            lease_seconds,
+            concurrency_limit,
+            hourly_schedule: None,
+            claim_filter: None,
+        })
+    }
+
+    /// Restrict this runtime instance to one worker lane's durable job types.
+    pub fn with_claim_filter(mut self, claim_filter: RuntimeJobTypeFilter) -> Self {
+        self.claim_filter = Some(claim_filter);
+        self
     }
 }
 
@@ -144,6 +178,7 @@ where
     clock: Arc<C>,
     config: RuntimeConfig,
     handlers: Arc<JobHandlerRegistry>,
+    wakeup: Option<Arc<Notify>>,
     accepting_work: bool,
     tasks: JoinSet<RuntimeTaskOutcome>,
 }
@@ -165,9 +200,17 @@ where
             clock,
             config,
             handlers,
+            wakeup: None,
             accepting_work: true,
             tasks: JoinSet::new(),
         }
+    }
+
+    /// A process-local wake signal may reduce latency after another lane settles durable work.
+    /// It is never a source of queue truth: every wake reclaims from SQLite through the filter.
+    pub fn with_wakeup(mut self, wakeup: Arc<Notify>) -> Self {
+        self.wakeup = Some(wakeup);
+        self
     }
 
     /// Enqueue the current hour's job through durable identity/deduplication.
@@ -175,9 +218,10 @@ where
         if !self.accepting_work {
             return Ok(SchedulerOutcome::Stopped);
         }
-        let request = self
-            .config
-            .hourly_schedule
+        let Some(hourly_schedule) = self.config.hourly_schedule else {
+            return Ok(SchedulerOutcome::Stopped);
+        };
+        let request = hourly_schedule
             .request_for(self.clock.now().map_err(|_| RuntimeError::Clock)?)
             .map_err(|_| RuntimeError::InvalidJobInput)?;
         let result = self
@@ -205,10 +249,15 @@ where
                 self.config.lease_seconds,
             )
             .map_err(|_| RuntimeError::InvalidJobInput)?;
-            let claimed = self
-                .store()?
-                .claim_next(claim_request)
-                .map_err(|_| RuntimeError::StoreUnavailable)?;
+            let claimed = if let Some(claim_filter) = &self.config.claim_filter {
+                self.store()?
+                    .claim_next_matching(claim_request, claim_filter.job_types())
+                    .map_err(|_| RuntimeError::StoreUnavailable)?
+            } else {
+                self.store()?
+                    .claim_next(claim_request)
+                    .map_err(|_| RuntimeError::StoreUnavailable)?
+            };
             let Some(claimed) = claimed else {
                 break;
             };
@@ -217,6 +266,7 @@ where
                 Arc::clone(&self.store),
                 Arc::clone(&self.clock),
                 Arc::clone(&self.handlers),
+                self.wakeup.clone(),
                 claimed,
             ));
         }
@@ -254,6 +304,7 @@ where
     }
 
     /// Run the production hourly loop until the caller signals graceful shutdown.
+    #[allow(dead_code)]
     pub async fn run_until_shutdown<F>(&mut self, shutdown_signal: F) -> Result<(), RuntimeError>
     where
         F: Future<Output = ()>,
@@ -286,6 +337,49 @@ where
         }
     }
 
+    /// Run an optionally scheduled lane and react to a local notification from a sibling lane.
+    /// The notification only prompts another filtered SQLite claim; lost notifications are safe.
+    pub async fn run_until_shutdown_with_wakeup<F>(
+        &mut self,
+        wakeup: Arc<Notify>,
+        shutdown_signal: F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: Future<Output = ()>,
+    {
+        let mut interval = tokio::time::interval(Duration::from_secs(
+            gamepulse_application::HOURLY_SCHEDULE_SECONDS as u64,
+        ));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        tokio::pin!(shutdown_signal);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown_signal => {
+                    self.shutdown().await?;
+                    return Ok(());
+                }
+                completed = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                    if let Some(completed) = completed {
+                        completed.map_err(|_| RuntimeError::TaskJoinFailed)?;
+                    }
+                    if self.accepting_work {
+                        self.dispatch_available()?;
+                    }
+                }
+                _ = wakeup.notified() => {
+                    if self.accepting_work {
+                        self.dispatch_available()?;
+                    }
+                }
+                _ = interval.tick() => {
+                    self.tick()?;
+                }
+            }
+        }
+    }
+
     fn reap_finished(&mut self) -> Result<DispatchReport, RuntimeError> {
         let mut report = DispatchReport::default();
         while let Some(joined) = self.tasks.try_join_next() {
@@ -305,6 +399,7 @@ async fn execute_claim<S, C>(
     store: Arc<Mutex<S>>,
     clock: Arc<C>,
     handlers: Arc<JobHandlerRegistry>,
+    wakeup: Option<Arc<Notify>>,
     claimed: ClaimedJob,
 ) -> RuntimeTaskOutcome
 where
@@ -312,27 +407,36 @@ where
     S::Error: Send + 'static,
     C: RuntimeClock,
 {
-    let Some(job) = TypedJob::from_record(claimed.job()) else {
-        return settle_failure(
+    let outcome = if let Some(job) = TypedJob::from_record(claimed.job()) {
+        let Some(handler) = handlers.handler(job.job_type()) else {
+            let outcome = settle_failure(
+                store,
+                clock,
+                claimed,
+                JobHandlerFailure::new(MISSING_TYPED_HANDLER),
+            );
+            if let Some(wakeup) = wakeup {
+                wakeup.notify_waiters();
+            }
+            return outcome;
+        };
+
+        match handler.handle(job).await {
+            JobHandlerResult::Succeeded => settle_success(store, clock, claimed),
+            JobHandlerResult::Failed(error) => settle_failure(store, clock, claimed, error),
+        }
+    } else {
+        settle_failure(
             store,
             clock,
             claimed,
             JobHandlerFailure::new(UNSUPPORTED_JOB_TYPE),
-        );
+        )
     };
-    let Some(handler) = handlers.handler(job.job_type()) else {
-        return settle_failure(
-            store,
-            clock,
-            claimed,
-            JobHandlerFailure::new(MISSING_TYPED_HANDLER),
-        );
-    };
-
-    match handler.handle(job).await {
-        JobHandlerResult::Succeeded => settle_success(store, clock, claimed),
-        JobHandlerResult::Failed(error) => settle_failure(store, clock, claimed, error),
+    if let Some(wakeup) = wakeup {
+        wakeup.notify_waiters();
     }
+    outcome
 }
 
 fn settle_success<S, C>(

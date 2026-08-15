@@ -15,18 +15,19 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use gamepulse_application::{
-    AsyncDailyCrawlSourcePort, AsyncSourceIngestionPort, CrawlDayKey, CrawlDiscoveryRequest,
-    DailyCrawlStatePort, DiscoveryCandidate, DiscoveryPage, GameSnapshotStore, JobHandler,
-    JobHandlerFailure, JobHandlerFuture, JobHandlerResult, RuntimeJobType,
+    AsyncDailyCrawlSourcePort, AsyncReviewSourceIngestionPort, AsyncSourceIngestionPort,
+    CrawlDayKey, CrawlDiscoveryRequest, DailyCrawlStatePort, DiscoveryCandidate, DiscoveryPage,
+    GameReviewRefreshStore, GameSnapshotStore, JobHandler, JobHandlerFailure, JobHandlerFuture,
+    JobHandlerResult, ReviewInput, ReviewSourceIngestion, ReviewSummaryJobSchedule, RuntimeJobType,
     SourceIngestionJobSchedule, SourceIngestionRequest, TypedJob,
-    execute_async_daily_crawl_with_source_ingestion_jobs, execute_async_source_ingestion,
-    upsert_game_snapshot,
+    execute_async_daily_crawl_with_source_ingestion_jobs, execute_async_review_source_ingestion,
+    execute_async_source_ingestion, persist_game_review_refresh, upsert_game_snapshot,
 };
 use gamepulse_domain::{
     BrowseCursor, GameCoverDescriptor, GameDeveloper, GamePlatformScore, GameSnapshot,
-    GameSnapshotValidationError, GameVideoLink,
+    GameSnapshotValidationError, GameVideoLink, REVIEW_EXCERPT_MAX_BYTES, ReviewExcerpt,
 };
-pub use gamepulse_domain::{Metascore, Userscore};
+pub use gamepulse_domain::{Metascore, ReviewKind, Userscore};
 
 const BACKEND_BASE_URL: &str = "https://backend.metacritic.com/";
 const NEW_RELEASES_LIST_LIMIT: u32 = 20;
@@ -39,6 +40,7 @@ const HOURS_PER_UTC_DAY: u64 = 24;
 const MAX_SCHEDULED_HOUR_SLOT: u64 = (i64::MAX as u64) / HOURLY_SCHEDULE_SECONDS;
 const HOURLY_DISCOVERY_FAILURE: &str = "source hourly discovery failed";
 const SOURCE_INGESTION_FAILURE: &str = "source game ingestion failed";
+const REVIEW_PAGE_LIMIT: u32 = 20;
 
 /// Translate the exact durable hourly schedule reference into its UTC calendar day.
 ///
@@ -194,13 +196,6 @@ where
 pub enum ListMode {
     NewReleases,
     NewestBrowse,
-}
-
-/// Review paths remain distinct even though their pagination shape is shared.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReviewKind {
-    Critic,
-    User,
 }
 
 /// A public Metacritic numeric product identity.
@@ -456,6 +451,9 @@ pub trait GameIngestionTransport: Send + Sync {
         + 'a
     where
         Self: 'a;
+    type FetchReviewPageFuture<'a>: Future<Output = Result<ReviewPage, Self::Error>> + Send + 'a
+    where
+        Self: 'a;
 
     fn fetch_game_detail(&self, expected: GameIdentity) -> Self::FetchDetailFuture<'_>;
 
@@ -464,6 +462,14 @@ pub trait GameIngestionTransport: Send + Sync {
         expected_game: GameIdentity,
         expected_platform: PlatformDetail,
     ) -> Self::FetchPlatformUserScoreFuture<'_>;
+
+    fn fetch_review_page(
+        &self,
+        expected_game: GameIdentity,
+        kind: ReviewKind,
+        offset: u32,
+        limit: u32,
+    ) -> Self::FetchReviewPageFuture<'_>;
 }
 
 /// Map one parsed product payload and the available per-platform Userscores into the inner model.
@@ -695,6 +701,183 @@ where
     }
 }
 
+/// Metacritic source adapter for M011's snapshot plus two bounded, kind-separated review inputs.
+pub struct MetacriticGameReviewSource<T> {
+    transport: Arc<T>,
+}
+
+impl<T> MetacriticGameReviewSource<T> {
+    pub fn new(transport: T) -> Self {
+        Self {
+            transport: Arc::new(transport),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum MetacriticGameReviewError<E> {
+    Transport(E),
+    MismatchedGameIdentity,
+    MismatchedReviewKind,
+    Snapshot(GameSnapshotMappingError),
+    ReviewInput(ReviewInputMappingError),
+    Ingestion(gamepulse_application::GameReviewRefreshError),
+}
+
+impl<E> fmt::Display for MetacriticGameReviewError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(_) => {
+                formatter.write_str("Metacritic review ingestion transport failed")
+            }
+            Self::MismatchedGameIdentity => formatter.write_str(
+                "Metacritic review ingestion detail did not match the requested identity",
+            ),
+            Self::MismatchedReviewKind => {
+                formatter.write_str("Metacritic review response did not match the requested kind")
+            }
+            Self::Snapshot(_) => formatter.write_str("Metacritic snapshot mapping failed"),
+            Self::ReviewInput(_) => formatter.write_str("Metacritic review input mapping failed"),
+            Self::Ingestion(_) => {
+                formatter.write_str("Metacritic review ingestion validation failed")
+            }
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for MetacriticGameReviewError<E> {}
+
+impl<T> AsyncReviewSourceIngestionPort for MetacriticGameReviewSource<T>
+where
+    T: GameIngestionTransport + Send + Sync + 'static,
+    T::Error: Send + 'static,
+{
+    type Error = MetacriticGameReviewError<T::Error>;
+    type IngestFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<ReviewSourceIngestion, Self::Error>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn ingest_reviews(&self, request: SourceIngestionRequest) -> Self::IngestFuture<'_> {
+        let transport = Arc::clone(&self.transport);
+        Box::pin(async move {
+            let expected_game = GameIdentity {
+                id: GameId(request.source_product_id().value()),
+                slug: request.source_slug().to_owned(),
+            };
+            let detail = transport
+                .fetch_game_detail(expected_game.clone())
+                .await
+                .map_err(MetacriticGameReviewError::Transport)?;
+            if detail.id != expected_game.id || detail.slug != expected_game.slug {
+                return Err(MetacriticGameReviewError::MismatchedGameIdentity);
+            }
+            let mut user_scores = Vec::with_capacity(detail.platforms.len());
+            for platform in detail.platforms.iter().cloned() {
+                user_scores.push(
+                    transport
+                        .fetch_platform_user_score(expected_game.clone(), platform)
+                        .await
+                        .map_err(MetacriticGameReviewError::Transport)?,
+                );
+            }
+            let snapshot = map_game_detail_to_snapshot(&detail, user_scores)
+                .map_err(MetacriticGameReviewError::Snapshot)?;
+            let mut inputs = BTreeMap::new();
+            for kind in ReviewKind::ALL {
+                let page = transport
+                    .fetch_review_page(expected_game.clone(), kind, 0, REVIEW_PAGE_LIMIT)
+                    .await
+                    .map_err(MetacriticGameReviewError::Transport)?;
+                if page.kind != kind {
+                    return Err(MetacriticGameReviewError::MismatchedReviewKind);
+                }
+                let input = map_review_page_to_input(request.source_product_id(), &page)
+                    .map_err(MetacriticGameReviewError::ReviewInput)?;
+                inputs.insert(kind, input);
+            }
+            let critic = inputs
+                .remove(&ReviewKind::Critic)
+                .expect("all review kinds are requested");
+            let user = inputs
+                .remove(&ReviewKind::User)
+                .expect("all review kinds are requested");
+            ReviewSourceIngestion::new(snapshot, critic, user)
+                .map_err(MetacriticGameReviewError::Ingestion)
+        })
+    }
+}
+
+/// Source-lane handler for the M011 atomic refresh. It obtains its SQLite mutex only after all
+/// source futures resolve, so no database lock spans a source request.
+pub struct ReviewSourceIngestionHandler<S, P> {
+    review_store: Arc<Mutex<S>>,
+    source_port: Arc<P>,
+    summary_schedule: ReviewSummaryJobSchedule,
+}
+
+impl<S, P> ReviewSourceIngestionHandler<S, P> {
+    pub fn new(
+        review_store: Arc<Mutex<S>>,
+        source_port: P,
+        summary_schedule: ReviewSummaryJobSchedule,
+    ) -> Self {
+        Self {
+            review_store,
+            source_port: Arc::new(source_port),
+            summary_schedule,
+        }
+    }
+}
+
+enum ReviewStoreAccessError<E> {
+    Poisoned,
+    Port(E),
+}
+
+impl<S, P> JobHandler for ReviewSourceIngestionHandler<S, P>
+where
+    S: GameReviewRefreshStore + Send + 'static,
+    S::Error: Send + 'static,
+    P: AsyncReviewSourceIngestionPort + Send + Sync + 'static,
+    P::Error: Send + 'static,
+{
+    fn job_type(&self) -> RuntimeJobType {
+        RuntimeJobType::SourceGameIngestion
+    }
+
+    fn handle(&self, job: TypedJob) -> JobHandlerFuture {
+        let review_store = Arc::clone(&self.review_store);
+        let source_port = Arc::clone(&self.source_port);
+        let summary_schedule = self.summary_schedule;
+        Box::pin(async move {
+            let Ok(request) = SourceIngestionRequest::from_work_reference(job.work_ref()) else {
+                return JobHandlerResult::Failed(JobHandlerFailure::new(SOURCE_INGESTION_FAILURE));
+            };
+            let outcome = execute_async_review_source_ingestion(
+                source_port.as_ref(),
+                move |refresh| {
+                    let mut review_store = review_store
+                        .lock()
+                        .map_err(|_| ReviewStoreAccessError::Poisoned)?;
+                    persist_game_review_refresh(&mut *review_store, refresh)
+                        .map_err(ReviewStoreAccessError::Port)
+                },
+                request,
+                summary_schedule,
+                job.created_at(),
+            )
+            .await;
+            match outcome {
+                Ok(()) => JobHandlerResult::Succeeded,
+                Err(_) => {
+                    JobHandlerResult::Failed(JobHandlerFailure::new(SOURCE_INGESTION_FAILURE))
+                }
+            }
+        })
+    }
+}
+
 /// The per-platform Userscore response has an independent review count.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UserScoreSummary {
@@ -702,12 +885,14 @@ pub struct UserScoreSummary {
     pub review_count: u64,
 }
 
-/// Review metadata intentionally excludes the source quote text in M002.
+/// Review metadata preserves an optional untrusted quote only for M011's bounded local input
+/// mapper. It is never logged and is clipped before it crosses the source boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReviewMarker {
     pub id: Option<String>,
     pub score: Option<f64>,
     pub quote_available: bool,
+    pub excerpt: Option<String>,
 }
 
 /// Structural review input evidence, retained independently for each source kind.
@@ -717,6 +902,49 @@ pub struct ReviewPage {
     pub reviews: Vec<ReviewMarker>,
     pub total_results: u64,
     pub next: Option<Continuation>,
+}
+
+/// Map one bounded source-native review page into the inner kind-preserving input value.
+///
+/// Empty quotes remain absent. Non-empty quote fields are clipped on a UTF-8 boundary before
+/// entering the domain so arbitrary source payload size cannot reach durable storage or summary
+/// work. The caller owns the fixed M011 first-page limit; a larger page is rejected here.
+pub fn map_review_page_to_input(
+    source_product_id: gamepulse_domain::SourceProductId,
+    page: &ReviewPage,
+) -> Result<ReviewInput, ReviewInputMappingError> {
+    if page.reviews.len() > usize::try_from(REVIEW_PAGE_LIMIT).expect("review page bound fits") {
+        return Err(ReviewInputMappingError::TooManyReviews);
+    }
+    let excerpts = page
+        .reviews
+        .iter()
+        .filter_map(|review| review.excerpt.as_deref())
+        .filter_map(bounded_review_excerpt)
+        .map(ReviewExcerpt::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ReviewInputMappingError::InvalidExcerpt)?;
+    ReviewInput::new(source_product_id, page.kind, excerpts)
+        .map_err(ReviewInputMappingError::InvalidInput)
+}
+
+fn bounded_review_excerpt(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut end = value.len().min(REVIEW_EXCERPT_MAX_BYTES);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(value[..end].to_owned())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewInputMappingError {
+    TooManyReviews,
+    InvalidExcerpt(gamepulse_domain::ReviewExcerptError),
+    InvalidInput(gamepulse_application::ReviewInputError),
 }
 
 /// The narrow direct-HTTP client. It performs no retries and follows no redirects.
@@ -989,6 +1217,10 @@ impl GameIngestionTransport for MetacriticCanaryClient {
         = Pin<Box<dyn Future<Output = Result<PlatformUserScore, Self::Error>> + Send + 'a>>
     where
         Self: 'a;
+    type FetchReviewPageFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<ReviewPage, Self::Error>> + Send + 'a>>
+    where
+        Self: 'a;
 
     fn fetch_game_detail(&self, expected: GameIdentity) -> Self::FetchDetailFuture<'_> {
         Box::pin(async move { MetacriticCanaryClient::fetch_game_detail(self, &expected).await })
@@ -1002,6 +1234,25 @@ impl GameIngestionTransport for MetacriticCanaryClient {
         Box::pin(async move {
             self.fetch_platform_user_score_for_snapshot(&expected_game, &expected_platform)
                 .await
+        })
+    }
+
+    fn fetch_review_page(
+        &self,
+        expected_game: GameIdentity,
+        kind: ReviewKind,
+        offset: u32,
+        limit: u32,
+    ) -> Self::FetchReviewPageFuture<'_> {
+        Box::pin(async move {
+            MetacriticCanaryClient::fetch_review_page(
+                self,
+                kind,
+                &expected_game.slug,
+                offset,
+                limit,
+            )
+            .await
         })
     }
 }
@@ -1404,9 +1655,10 @@ fn parse_review_marker(kind: ReviewKind, raw: RawReview) -> Result<ReviewMarker,
         ReviewKind::User => 10.0,
     };
     let score = parse_optional_score(raw.score, max, false, "review.score")?;
-    let quote_available = match raw.quote {
-        None | Some(Value::Null) => false,
-        Some(Value::String(quote)) => !quote.trim().is_empty(),
+    let excerpt = match raw.quote {
+        None | Some(Value::Null) => None,
+        Some(Value::String(quote)) if quote.trim().is_empty() => None,
+        Some(Value::String(quote)) => Some(quote),
         Some(_) => {
             return Err(SourceError::MissingField {
                 field: "review.quote",
@@ -1417,7 +1669,8 @@ fn parse_review_marker(kind: ReviewKind, raw: RawReview) -> Result<ReviewMarker,
     Ok(ReviewMarker {
         id: parse_optional_identifier(raw.id, "review.id")?,
         score,
-        quote_available,
+        quote_available: excerpt.is_some(),
+        excerpt,
     })
 }
 

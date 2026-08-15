@@ -29,8 +29,12 @@ wires the bounded offline scheduler-to-snapshot vertical with fixture-only
 coverage. M010 adds the embedded, server-rendered catalogue at `/games` and
 `/games/{id}`: it reads only persisted SQLite snapshots, supports
 case-insensitive title search, platform filtering, rating sorting, and
-SQLite-only similar-game links. Review persistence and summaries, runs/run_items,
-SSE, media, LLM, and deployment remain unimplemented.
+SQLite-only similar-game links. M011 adds the fully offline review-to-summary vertical: each
+stored refresh keeps bounded critic and user review inputs separate, atomically schedules one
+fingerprint-fenced local summary job per kind, and renders persisted likes/dislikes or an explicit
+unavailable state on the detail page. The fallback is deterministic and local; it does not use a
+provider. Runs/run_items, SSE, media, external LLM/provider integration, and deployment remain
+unimplemented.
 
 ## Baseline architecture
 

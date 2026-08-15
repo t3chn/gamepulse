@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
+use gamepulse_domain::SourceProductId;
 use gamepulse_worker_source::{
     GameId, GameIdentity, ListMode, ReviewKind, SourceError, map_listing_page_for_daily_crawl,
-    parse_game_detail, parse_listing_page, parse_review_page, parse_user_score_summary,
+    map_review_page_to_input, parse_game_detail, parse_listing_page, parse_review_page,
+    parse_user_score_summary,
 };
 
 const LISTING: &str = include_str!("fixtures/listing-page.json");
@@ -10,6 +12,8 @@ const DETAIL: &str = include_str!("fixtures/product-detail.json");
 const CRITIC_REVIEWS: &str = include_str!("fixtures/review-page.json");
 const USER_REVIEWS: &str = include_str!("fixtures/user-review-page.json");
 const USER_SCORE: &str = include_str!("fixtures/user-score.json");
+const M011_CRITIC_REVIEWS: &str = include_str!("fixtures/m011-critic-review-page.json");
+const M011_USER_REVIEWS: &str = include_str!("fixtures/m011-user-review-page.json");
 
 fn example_game() -> GameIdentity {
     GameIdentity {
@@ -145,6 +149,32 @@ fn preserves_critic_and_user_review_kinds_without_review_text() {
     assert!(critic.reviews.iter().all(|review| !review.quote_available));
     assert_eq!(critic.next.expect("next").offset, 3);
     assert_eq!(user.next.expect("next").offset, 3);
+}
+
+#[test]
+fn maps_only_one_bounded_first_page_into_separate_synthetic_review_inputs() {
+    let critic = parse_review_page(
+        ReviewKind::Critic,
+        "example-game",
+        0,
+        20,
+        M011_CRITIC_REVIEWS,
+    )
+    .expect("synthetic critic fixture must parse");
+    let user = parse_review_page(ReviewKind::User, "example-game", 0, 20, M011_USER_REVIEWS)
+        .expect("synthetic user fixture must parse");
+    let source_product_id = SourceProductId::new(101).expect("test identity must be valid");
+
+    let critic_input =
+        map_review_page_to_input(source_product_id, &critic).expect("critic input must map");
+    let user_input =
+        map_review_page_to_input(source_product_id, &user).expect("user input must map");
+
+    assert_eq!(critic_input.kind(), ReviewKind::Critic);
+    assert_eq!(user_input.kind(), ReviewKind::User);
+    assert_eq!(critic_input.excerpts().len(), 2);
+    assert_eq!(user_input.excerpts().len(), 2);
+    assert_ne!(critic_input.content_hash(), user_input.content_hash());
 }
 
 #[test]

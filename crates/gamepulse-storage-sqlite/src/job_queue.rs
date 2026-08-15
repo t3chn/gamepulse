@@ -4,9 +4,11 @@ use std::path::Path;
 use gamepulse_application::{
     ClaimedJob, JOB_TEXT_MAX_BYTES, JobAttempt, JobAttemptOutcome, JobClaim, JobClaimRequest,
     JobCompletion, JobEnqueueResult, JobFailure, JobFailureResult, JobInputError, JobRecord,
-    JobRequest, JobStatus, JobStore, JobTimestamp,
+    JobRequest, JobStatus, JobStore, JobTimestamp, RuntimeJobType,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+};
 
 const EXPIRED_LEASE_ERROR: &str = "lease expired";
 
@@ -96,24 +98,55 @@ impl JobStore for SqliteJobStore {
         &mut self,
         request: JobClaimRequest,
     ) -> Result<Option<ClaimedJob>, JobStoreError> {
+        self.claim_next_matching(request, &[])
+    }
+
+    fn claim_next_matching(
+        &mut self,
+        request: JobClaimRequest,
+        accepted_types: &[RuntimeJobType],
+    ) -> Result<Option<ClaimedJob>, JobStoreError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(JobStoreError::database)?;
         recover_expired_claims(&transaction, request.claimed_at())?;
 
-        let job_identity = transaction
-            .query_row(
+        let job_identity = if accepted_types.is_empty() {
+            transaction
+                .query_row(
+                    "SELECT job_identity
+                     FROM jobs
+                     WHERE state = 'ready' AND attempt_count < max_attempts
+                     ORDER BY created_at, job_identity
+                     LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(JobStoreError::database)?
+        } else {
+            let placeholders = (1..=accepted_types.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let selection = format!(
                 "SELECT job_identity
                  FROM jobs
                  WHERE state = 'ready' AND attempt_count < max_attempts
+                   AND job_type IN ({placeholders})
                  ORDER BY created_at, job_identity
-                 LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(JobStoreError::database)?;
+                 LIMIT 1"
+            );
+            transaction
+                .query_row(
+                    &selection,
+                    params_from_iter(accepted_types.iter().map(|job_type| job_type.as_str())),
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(JobStoreError::database)?
+        };
         let Some(job_identity) = job_identity else {
             transaction.commit().map_err(JobStoreError::database)?;
             return Ok(None);

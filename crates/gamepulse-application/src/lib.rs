@@ -12,7 +12,9 @@ pub use gamepulse_domain::{
     APP_NAME, BrowseCursor, BrowseProgress, CrawlDayKey, CrawlDayKeyError, CrawlDiscoveryRequest,
     DailyCrawlAction, DailyCrawlState, DailyCrawlTransition, GameCoverDescriptor, GameDeveloper,
     GamePlatformScore, GameSnapshot, GameSnapshotValidationError, GameVideoLink, Metascore,
-    MetascoreError, SourceProductId, SourceProductIdError, Userscore, UserscoreError,
+    MetascoreError, REVIEW_EXCERPT_MAX_BYTES, REVIEW_INPUT_LIMIT, ReviewExcerpt,
+    ReviewExcerptError, ReviewKind, SourceProductId, SourceProductIdError, Userscore,
+    UserscoreError,
 };
 use gamepulse_domain::{prepare_daily_crawl, select_daily_crawl};
 
@@ -163,6 +165,17 @@ pub struct SimilarCatalogueGame {
     title: String,
 }
 
+/// A persisted review-summary state exposed on the stored-game detail page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogueReviewSummary {
+    Pending,
+    Unavailable,
+    Available {
+        likes: Vec<String>,
+        dislikes: Vec<String>,
+    },
+}
+
 impl SimilarCatalogueGame {
     pub fn new(source_product_id: SourceProductId, title: impl Into<String>) -> Self {
         Self {
@@ -192,6 +205,8 @@ pub struct CatalogueGameDetail {
     platform_scores: Vec<CataloguePlatformScore>,
     developers: Vec<String>,
     similar_games: Vec<SimilarCatalogueGame>,
+    critic_summary: Option<CatalogueReviewSummary>,
+    user_summary: Option<CatalogueReviewSummary>,
 }
 
 impl CatalogueGameDetail {
@@ -206,6 +221,8 @@ impl CatalogueGameDetail {
         platform_scores: Vec<CataloguePlatformScore>,
         developers: Vec<String>,
         similar_games: Vec<SimilarCatalogueGame>,
+        critic_summary: Option<CatalogueReviewSummary>,
+        user_summary: Option<CatalogueReviewSummary>,
     ) -> Self {
         Self {
             source_product_id,
@@ -217,6 +234,8 @@ impl CatalogueGameDetail {
             platform_scores,
             developers,
             similar_games,
+            critic_summary,
+            user_summary,
         }
     }
 
@@ -254,6 +273,14 @@ impl CatalogueGameDetail {
 
     pub fn similar_games(&self) -> &[SimilarCatalogueGame] {
         &self.similar_games
+    }
+
+    pub fn critic_summary(&self) -> Option<&CatalogueReviewSummary> {
+        self.critic_summary.as_ref()
+    }
+
+    pub fn user_summary(&self) -> Option<&CatalogueReviewSummary> {
+        self.user_summary.as_ref()
     }
 }
 
@@ -367,6 +394,562 @@ where
     S: GameSnapshotStore,
 {
     store.upsert_snapshot(snapshot)
+}
+
+/// One kind-separated, bounded source input together with the durable content hash used for
+/// summary freshness. The hash is over the exact retained excerpt bytes and source kind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewInput {
+    source_product_id: SourceProductId,
+    kind: ReviewKind,
+    excerpts: Vec<ReviewExcerpt>,
+    content_hash: ReviewContentHash,
+}
+
+impl ReviewInput {
+    pub fn new(
+        source_product_id: SourceProductId,
+        kind: ReviewKind,
+        excerpts: Vec<ReviewExcerpt>,
+    ) -> Result<Self, ReviewInputError> {
+        if excerpts.len() > REVIEW_INPUT_LIMIT {
+            return Err(ReviewInputError::TooManyExcerpts);
+        }
+        let content_hash = ReviewContentHash::for_input(kind, &excerpts);
+        Ok(Self {
+            source_product_id,
+            kind,
+            excerpts,
+            content_hash,
+        })
+    }
+
+    pub const fn source_product_id(&self) -> SourceProductId {
+        self.source_product_id
+    }
+
+    pub const fn kind(&self) -> ReviewKind {
+        self.kind
+    }
+
+    pub fn excerpts(&self) -> &[ReviewExcerpt] {
+        &self.excerpts
+    }
+
+    pub fn content_hash(&self) -> &ReviewContentHash {
+        &self.content_hash
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewInputError {
+    TooManyExcerpts,
+}
+
+impl fmt::Display for ReviewInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyExcerpts => {
+                formatter.write_str("review input exceeds the first-page bound")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReviewInputError {}
+
+/// A lowercase SHA-256 content digest stored independently for each review kind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewContentHash(String);
+
+impl ReviewContentHash {
+    fn for_input(kind: ReviewKind, excerpts: &[ReviewExcerpt]) -> Self {
+        let mut bytes = Vec::new();
+        append_hash_field(&mut bytes, kind.as_str().as_bytes());
+        for excerpt in excerpts {
+            append_hash_field(&mut bytes, excerpt.as_str().as_bytes());
+        }
+        Self(sha256_hex(&bytes))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The SHA-256 digest of the two kind-specific input hashes. It is the freshness fence for both
+/// durable summary jobs and summary output writes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewRefreshFingerprint(String);
+
+impl ReviewRefreshFingerprint {
+    fn for_inputs(critic: &ReviewInput, user: &ReviewInput) -> Self {
+        let mut bytes = Vec::new();
+        append_hash_field(&mut bytes, b"critic");
+        append_hash_field(&mut bytes, critic.content_hash().as_str().as_bytes());
+        append_hash_field(&mut bytes, b"user");
+        append_hash_field(&mut bytes, user.content_hash().as_str().as_bytes());
+        Self(sha256_hex(&bytes))
+    }
+
+    pub fn parse(value: impl Into<String>) -> Result<Self, ReviewRefreshFingerprintError> {
+        let value = value.into();
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ReviewRefreshFingerprintError::Malformed);
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewRefreshFingerprintError {
+    Malformed,
+}
+
+impl fmt::Display for ReviewRefreshFingerprintError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("review refresh fingerprint must be a SHA-256 hex digest")
+    }
+}
+
+impl std::error::Error for ReviewRefreshFingerprintError {}
+
+/// The complete atomic persistence unit produced by a source refresh.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GameReviewRefresh {
+    snapshot: GameSnapshot,
+    critic: ReviewInput,
+    user: ReviewInput,
+    fingerprint: ReviewRefreshFingerprint,
+    jobs: Vec<JobRequest>,
+}
+
+impl GameReviewRefresh {
+    pub fn new(
+        snapshot: GameSnapshot,
+        critic: ReviewInput,
+        user: ReviewInput,
+        schedule: ReviewSummaryJobSchedule,
+        created_at: JobTimestamp,
+    ) -> Result<Self, GameReviewRefreshError> {
+        if critic.kind() != ReviewKind::Critic || user.kind() != ReviewKind::User {
+            return Err(GameReviewRefreshError::ReviewKindsMustBeSeparate);
+        }
+        let source_product_id = snapshot.source_product_id();
+        if critic.source_product_id() != source_product_id
+            || user.source_product_id() != source_product_id
+        {
+            return Err(GameReviewRefreshError::ReviewInputGameMismatch);
+        }
+        let fingerprint = ReviewRefreshFingerprint::for_inputs(&critic, &user);
+        let jobs = schedule
+            .requests_for(source_product_id, &fingerprint, created_at)
+            .map_err(GameReviewRefreshError::JobSchedule)?;
+        Ok(Self {
+            snapshot,
+            critic,
+            user,
+            fingerprint,
+            jobs,
+        })
+    }
+
+    pub fn snapshot(&self) -> &GameSnapshot {
+        &self.snapshot
+    }
+
+    pub fn input(&self, kind: ReviewKind) -> &ReviewInput {
+        match kind {
+            ReviewKind::Critic => &self.critic,
+            ReviewKind::User => &self.user,
+        }
+    }
+
+    pub fn fingerprint(&self) -> &ReviewRefreshFingerprint {
+        &self.fingerprint
+    }
+
+    pub fn jobs(&self) -> &[JobRequest] {
+        &self.jobs
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GameReviewRefreshError {
+    ReviewKindsMustBeSeparate,
+    ReviewInputGameMismatch,
+    JobSchedule(ReviewSummaryJobScheduleError),
+}
+
+impl fmt::Display for GameReviewRefreshError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReviewKindsMustBeSeparate => {
+                formatter.write_str("critic and user review inputs must stay separate")
+            }
+            Self::ReviewInputGameMismatch => {
+                formatter.write_str("review input identity must match its game snapshot")
+            }
+            Self::JobSchedule(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for GameReviewRefreshError {}
+
+/// Application-owned durable boundary for the all-or-nothing M011 refresh commit.
+pub trait GameReviewRefreshStore {
+    type Error;
+
+    fn persist_review_refresh(&mut self, refresh: &GameReviewRefresh) -> Result<(), Self::Error>;
+}
+
+/// Persist a complete source snapshot, both review inputs, and both summary jobs atomically.
+pub fn persist_game_review_refresh<S>(
+    store: &mut S,
+    refresh: &GameReviewRefresh,
+) -> Result<(), S::Error>
+where
+    S: GameReviewRefreshStore,
+{
+    store.persist_review_refresh(refresh)
+}
+
+/// Canonical work request for one fingerprint-fenced review summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewSummaryRequest {
+    source_product_id: SourceProductId,
+    kind: ReviewKind,
+    fingerprint: ReviewRefreshFingerprint,
+}
+
+impl ReviewSummaryRequest {
+    pub fn new(
+        source_product_id: SourceProductId,
+        kind: ReviewKind,
+        fingerprint: ReviewRefreshFingerprint,
+    ) -> Self {
+        Self {
+            source_product_id,
+            kind,
+            fingerprint,
+        }
+    }
+
+    pub fn from_work_reference(value: &str) -> Result<Self, ReviewSummaryRequestError> {
+        let encoded = value
+            .strip_prefix(REVIEW_SUMMARY_WORK_REFERENCE_PREFIX)
+            .ok_or(ReviewSummaryRequestError::MalformedWorkReference)?;
+        let mut parts = encoded.split(':');
+        let product_id = parts
+            .next()
+            .ok_or(ReviewSummaryRequestError::MalformedWorkReference)?;
+        let kind = parts
+            .next()
+            .and_then(ReviewKind::parse)
+            .ok_or(ReviewSummaryRequestError::MalformedWorkReference)?;
+        let fingerprint = parts
+            .next()
+            .ok_or(ReviewSummaryRequestError::MalformedWorkReference)?;
+        if parts.next().is_some()
+            || product_id.is_empty()
+            || !product_id.bytes().all(|byte| byte.is_ascii_digit())
+            || (product_id.len() > 1 && product_id.starts_with('0'))
+        {
+            return Err(ReviewSummaryRequestError::MalformedWorkReference);
+        }
+        let source_product_id = product_id
+            .parse::<u64>()
+            .ok()
+            .and_then(|value| SourceProductId::new(value).ok())
+            .ok_or(ReviewSummaryRequestError::MalformedWorkReference)?;
+        let fingerprint = ReviewRefreshFingerprint::parse(fingerprint)
+            .map_err(|_| ReviewSummaryRequestError::MalformedWorkReference)?;
+        Ok(Self::new(source_product_id, kind, fingerprint))
+    }
+
+    pub const fn source_product_id(&self) -> SourceProductId {
+        self.source_product_id
+    }
+
+    pub const fn kind(&self) -> ReviewKind {
+        self.kind
+    }
+
+    pub fn fingerprint(&self) -> &ReviewRefreshFingerprint {
+        &self.fingerprint
+    }
+
+    pub fn work_reference(&self) -> String {
+        format!(
+            "{REVIEW_SUMMARY_WORK_REFERENCE_PREFIX}{}:{}:{}",
+            self.source_product_id.value(),
+            self.kind.as_str(),
+            self.fingerprint.as_str()
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewSummaryRequestError {
+    MalformedWorkReference,
+}
+
+impl fmt::Display for ReviewSummaryRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("malformed review summary work reference")
+    }
+}
+
+impl std::error::Error for ReviewSummaryRequestError {}
+
+/// One persisted summary result. Unavailable is deliberate output for an empty input, never a
+/// fabricated positive or negative statement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReviewSummaryOutput {
+    Unavailable,
+    Available {
+        likes: Vec<String>,
+        dislikes: Vec<String>,
+    },
+}
+
+impl ReviewSummaryOutput {
+    pub fn available(
+        likes: Vec<String>,
+        dislikes: Vec<String>,
+    ) -> Result<Self, ReviewSummaryOutputError> {
+        if likes.len() > 3 || dislikes.len() > 3 {
+            return Err(ReviewSummaryOutputError::TooManyItems);
+        }
+        for item in likes.iter().chain(dislikes.iter()) {
+            if item.trim().is_empty() || item.len() > REVIEW_EXCERPT_MAX_BYTES {
+                return Err(ReviewSummaryOutputError::InvalidItem);
+            }
+        }
+        Ok(Self::Available { likes, dislikes })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewSummaryOutputError {
+    TooManyItems,
+    InvalidItem,
+}
+
+impl fmt::Display for ReviewSummaryOutputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyItems => formatter.write_str("review summary has too many items"),
+            Self::InvalidItem => formatter.write_str("review summary item is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for ReviewSummaryOutputError {}
+
+/// A provider-agnostic summary request and its exact freshness fence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewSummary {
+    request: ReviewSummaryRequest,
+    output: ReviewSummaryOutput,
+}
+
+impl ReviewSummary {
+    pub fn new(request: ReviewSummaryRequest, output: ReviewSummaryOutput) -> Self {
+        Self { request, output }
+    }
+
+    pub fn request(&self) -> &ReviewSummaryRequest {
+        &self.request
+    }
+
+    pub fn output(&self) -> &ReviewSummaryOutput {
+        &self.output
+    }
+}
+
+/// The summarizer boundary is deliberately free of provider names, configuration, and SDK types.
+pub trait ReviewSummarizer: Send + Sync {
+    type Error;
+
+    fn summarize(&self, input: &ReviewInput) -> Result<ReviewSummaryOutput, Self::Error>;
+}
+
+/// Durable read/write boundary for the local summary worker. The adapter must only apply a write
+/// when the request fingerprint is still current for that game and kind.
+pub trait ReviewSummaryStore {
+    type Error;
+
+    fn load_review_input(
+        &mut self,
+        request: &ReviewSummaryRequest,
+    ) -> Result<Option<ReviewInput>, Self::Error>;
+
+    fn persist_review_summary(
+        &mut self,
+        summary: &ReviewSummary,
+    ) -> Result<FencedSummaryWrite, Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FencedSummaryWrite {
+    Applied,
+    Stale,
+}
+
+/// The canonical opaque work-reference prefix for one local review-summary job.
+pub const REVIEW_SUMMARY_WORK_REFERENCE_PREFIX: &str = "review-summary:";
+
+/// Application-owned policy for exactly one summary job per review kind and refresh fingerprint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReviewSummaryJobSchedule {
+    max_attempts: u32,
+}
+
+impl ReviewSummaryJobSchedule {
+    pub fn new(max_attempts: u32) -> Result<Self, JobInputError> {
+        if max_attempts == 0 {
+            return Err(JobInputError::ZeroMaxAttempts);
+        }
+        Ok(Self { max_attempts })
+    }
+
+    pub fn requests_for(
+        self,
+        source_product_id: SourceProductId,
+        fingerprint: &ReviewRefreshFingerprint,
+        created_at: JobTimestamp,
+    ) -> Result<Vec<JobRequest>, ReviewSummaryJobScheduleError> {
+        ReviewKind::ALL
+            .into_iter()
+            .map(|kind| {
+                let request =
+                    ReviewSummaryRequest::new(source_product_id, kind, fingerprint.clone());
+                JobRequest::new(
+                    format!(
+                        "{}:{}:{}:{}",
+                        RuntimeJobType::LlmReviewSummary.as_str(),
+                        source_product_id.value(),
+                        kind.as_str(),
+                        fingerprint.as_str()
+                    ),
+                    RuntimeJobType::LlmReviewSummary.as_str(),
+                    request.work_reference(),
+                    self.max_attempts,
+                    created_at,
+                )
+                .map_err(ReviewSummaryJobScheduleError::JobRequest)
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewSummaryJobScheduleError {
+    JobRequest(JobInputError),
+}
+
+impl fmt::Display for ReviewSummaryJobScheduleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::JobRequest(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ReviewSummaryJobScheduleError {}
+
+fn append_hash_field(target: &mut Vec<u8>, value: &[u8]) {
+    target.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    target.extend_from_slice(value);
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    const INITIAL: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut padded = input.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut state = INITIAL;
+    for chunk in padded.chunks_exact(64) {
+        let mut words = [0_u32; 64];
+        for (index, word) in words.iter_mut().take(16).enumerate() {
+            *word = u32::from_be_bytes(
+                chunk[index * 4..index * 4 + 4]
+                    .try_into()
+                    .expect("chunk width"),
+            );
+        }
+        for index in 16..64 {
+            let small0 = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let small1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(small0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(small1);
+        }
+        let mut working = state;
+        for index in 0..64 {
+            let choice = (working[4] & working[5]) ^ ((!working[4]) & working[6]);
+            let major =
+                (working[0] & working[1]) ^ (working[0] & working[2]) ^ (working[1] & working[2]);
+            let big1 = working[4].rotate_right(6)
+                ^ working[4].rotate_right(11)
+                ^ working[4].rotate_right(25);
+            let big0 = working[0].rotate_right(2)
+                ^ working[0].rotate_right(13)
+                ^ working[0].rotate_right(22);
+            let temporary1 = working[7]
+                .wrapping_add(big1)
+                .wrapping_add(choice)
+                .wrapping_add(K[index])
+                .wrapping_add(words[index]);
+            let temporary2 = big0.wrapping_add(major);
+            working = [
+                temporary1.wrapping_add(temporary2),
+                working[0],
+                working[1],
+                working[2],
+                working[3].wrapping_add(temporary1),
+                working[4],
+                working[5],
+                working[6],
+            ];
+        }
+        for (value, result) in state.iter_mut().zip(working) {
+            *value = value.wrapping_add(result);
+        }
+    }
+    state.iter().map(|word| format!("{word:08x}")).collect()
 }
 
 /// A validated, source-agnostic input for one durable game-ingestion job.
@@ -496,6 +1079,93 @@ where
 #[derive(Debug)]
 pub enum SourceIngestionError<SourceError, StoreError> {
     Source(SourceError),
+    Store(StoreError),
+}
+
+/// Fully mapped source output for M011: one snapshot plus independently typed critic and user
+/// inputs. Outer source adapters may not return anonymous or combined review collections.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReviewSourceIngestion {
+    snapshot: GameSnapshot,
+    critic: ReviewInput,
+    user: ReviewInput,
+}
+
+impl ReviewSourceIngestion {
+    pub fn new(
+        snapshot: GameSnapshot,
+        critic: ReviewInput,
+        user: ReviewInput,
+    ) -> Result<Self, GameReviewRefreshError> {
+        if critic.kind() != ReviewKind::Critic || user.kind() != ReviewKind::User {
+            return Err(GameReviewRefreshError::ReviewKindsMustBeSeparate);
+        }
+        if critic.source_product_id() != snapshot.source_product_id()
+            || user.source_product_id() != snapshot.source_product_id()
+        {
+            return Err(GameReviewRefreshError::ReviewInputGameMismatch);
+        }
+        Ok(Self {
+            snapshot,
+            critic,
+            user,
+        })
+    }
+
+    pub fn snapshot(&self) -> &GameSnapshot {
+        &self.snapshot
+    }
+
+    pub fn critic(&self) -> &ReviewInput {
+        &self.critic
+    }
+
+    pub fn user(&self) -> &ReviewInput {
+        &self.user
+    }
+
+    pub fn into_parts(self) -> (GameSnapshot, ReviewInput, ReviewInput) {
+        (self.snapshot, self.critic, self.user)
+    }
+}
+
+/// Application-owned async source boundary for a snapshot and its two separated review inputs.
+pub trait AsyncReviewSourceIngestionPort: Send + Sync {
+    type Error;
+    type IngestFuture<'a>: Future<Output = Result<ReviewSourceIngestion, Self::Error>> + Send + 'a
+    where
+        Self: 'a;
+
+    fn ingest_reviews(&self, request: SourceIngestionRequest) -> Self::IngestFuture<'_>;
+}
+
+/// Await source work before acquiring the concrete durable store, then atomically publish the
+/// snapshot, review inputs, and derived jobs through the application-owned refresh boundary.
+pub async fn execute_async_review_source_ingestion<P, C, StoreError>(
+    source_port: &P,
+    persist_refresh: C,
+    request: SourceIngestionRequest,
+    schedule: ReviewSummaryJobSchedule,
+    created_at: JobTimestamp,
+) -> Result<(), ReviewSourceIngestionError<P::Error, StoreError>>
+where
+    P: AsyncReviewSourceIngestionPort,
+    C: FnOnce(&GameReviewRefresh) -> Result<(), StoreError>,
+{
+    let ingestion = source_port
+        .ingest_reviews(request)
+        .await
+        .map_err(ReviewSourceIngestionError::Source)?;
+    let (snapshot, critic, user) = ingestion.into_parts();
+    let refresh = GameReviewRefresh::new(snapshot, critic, user, schedule, created_at)
+        .map_err(ReviewSourceIngestionError::InvalidRefresh)?;
+    persist_refresh(&refresh).map_err(ReviewSourceIngestionError::Store)
+}
+
+#[derive(Debug)]
+pub enum ReviewSourceIngestionError<SourceError, StoreError> {
+    Source(SourceError),
+    InvalidRefresh(GameReviewRefreshError),
     Store(StoreError),
 }
 
@@ -1473,6 +2143,14 @@ pub trait JobStore {
 
     fn claim_next(&mut self, request: JobClaimRequest) -> Result<Option<ClaimedJob>, Self::Error>;
 
+    /// Claim only one of the explicitly application-owned job types. Adapters must filter in the
+    /// same durable transaction that recovers leases and creates the claim attempt.
+    fn claim_next_matching(
+        &mut self,
+        request: JobClaimRequest,
+        accepted_types: &[RuntimeJobType],
+    ) -> Result<Option<ClaimedJob>, Self::Error>;
+
     fn complete(&mut self, completion: JobCompletion) -> Result<(), Self::Error>;
 
     fn fail(&mut self, failure: JobFailure) -> Result<JobFailureResult, Self::Error>;
@@ -1541,6 +2219,7 @@ fn validate_job_text(field: &'static str, value: &str) -> Result<(), JobInputErr
 pub enum RuntimeJobType {
     SourceHourlyDiscovery,
     SourceGameIngestion,
+    LlmReviewSummary,
 }
 
 impl RuntimeJobType {
@@ -1548,6 +2227,7 @@ impl RuntimeJobType {
         match self {
             Self::SourceHourlyDiscovery => "source.hourly-discovery",
             Self::SourceGameIngestion => "source.game-ingestion",
+            Self::LlmReviewSummary => "llm.review-summary",
         }
     }
 
@@ -1555,10 +2235,66 @@ impl RuntimeJobType {
         match value {
             "source.hourly-discovery" => Some(Self::SourceHourlyDiscovery),
             "source.game-ingestion" => Some(Self::SourceGameIngestion),
+            "llm.review-summary" => Some(Self::LlmReviewSummary),
             _ => None,
         }
     }
 }
+
+/// A small application-owned allowlist used at durable claim time, not merely when routing an
+/// already claimed job. This keeps source and summary workers from taking each other's work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeJobTypeFilter(Vec<RuntimeJobType>);
+
+impl RuntimeJobTypeFilter {
+    pub fn new(
+        job_types: impl IntoIterator<Item = RuntimeJobType>,
+    ) -> Result<Self, RuntimeJobTypeFilterError> {
+        let mut types = job_types.into_iter().collect::<Vec<_>>();
+        types.sort_unstable();
+        types.dedup();
+        if types.is_empty() {
+            return Err(RuntimeJobTypeFilterError::Empty);
+        }
+        Ok(Self(types))
+    }
+
+    pub fn source_lane() -> Self {
+        Self(vec![
+            RuntimeJobType::SourceHourlyDiscovery,
+            RuntimeJobType::SourceGameIngestion,
+        ])
+    }
+
+    pub fn llm_lane() -> Self {
+        Self(vec![RuntimeJobType::LlmReviewSummary])
+    }
+
+    pub fn all() -> Self {
+        Self(vec![
+            RuntimeJobType::SourceHourlyDiscovery,
+            RuntimeJobType::SourceGameIngestion,
+            RuntimeJobType::LlmReviewSummary,
+        ])
+    }
+
+    pub fn job_types(&self) -> &[RuntimeJobType] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeJobTypeFilterError {
+    Empty,
+}
+
+impl fmt::Display for RuntimeJobTypeFilterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("runtime claim filter must include at least one job type")
+    }
+}
+
+impl std::error::Error for RuntimeJobTypeFilterError {}
 
 /// The canonical opaque work-reference prefix for one Metacritic source-ingestion job.
 pub const SOURCE_INGESTION_WORK_REFERENCE_PREFIX: &str = "metacritic-game:";

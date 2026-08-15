@@ -309,6 +309,79 @@ fn validate_snapshot_text(
     Ok(())
 }
 
+/// The two independently sourced review populations required by the assignment.
+///
+/// This value crosses every inner port so a critic input can never be silently
+/// interpreted as a user input, or vice versa.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ReviewKind {
+    Critic,
+    User,
+}
+
+impl ReviewKind {
+    pub const ALL: [Self; 2] = [Self::Critic, Self::User];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Critic => "critic",
+            Self::User => "user",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "critic" => Some(Self::Critic),
+            "user" => Some(Self::User),
+            _ => None,
+        }
+    }
+}
+
+/// The M011 request boundary: one source page per kind, never unbounded pagination.
+pub const REVIEW_INPUT_LIMIT: usize = 20;
+
+/// The maximum UTF-8 byte length retained from one untrusted source excerpt.
+pub const REVIEW_EXCERPT_MAX_BYTES: usize = 1_024;
+
+/// One non-empty, bounded review excerpt that may be handed to a local summarizer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewExcerpt(String);
+
+impl ReviewExcerpt {
+    pub fn new(value: impl Into<String>) -> Result<Self, ReviewExcerptError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(ReviewExcerptError::Blank);
+        }
+        if value.len() > REVIEW_EXCERPT_MAX_BYTES {
+            return Err(ReviewExcerptError::TooLong);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewExcerptError {
+    Blank,
+    TooLong,
+}
+
+impl fmt::Display for ReviewExcerptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Blank => formatter.write_str("review excerpt must not be blank"),
+            Self::TooLong => formatter.write_str("review excerpt exceeds the retained bound"),
+        }
+    }
+}
+
+impl std::error::Error for ReviewExcerptError {}
+
 /// A source-adapter cursor for a later newest-first browse request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct BrowseCursor(u64);

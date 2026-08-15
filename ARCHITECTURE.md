@@ -286,10 +286,28 @@ adapter, while the binary injects a separate SQLite read connection and binds
 the embedded server in the same process as the unchanged runtime. Fixture tests
 seed snapshots through the accepted upsert boundary and never open a listener.
 
+M011 completes the bounded offline review-to-summary vertical for stored games. A source
+ingestion refresh retrieves at most the first 20 synthetic fixture reviews independently for
+each critic and user kind, maps bounded untrusted excerpts into source-agnostic review inputs,
+and computes individual input hashes plus one combined refresh fingerprint. SQLite atomically
+replaces the game snapshot and both kind-separated review inputs, then creates exactly two
+fingerprint-scoped `llm.review-summary` jobs; an exact replay leaves the current jobs unchanged.
+The application owns typed lane claims, review/summarizer ports, refresh scheduling, and the
+fenced summary write. The source lane may claim only source job types, while the LLM lane may
+claim only summary jobs; SQLite remains the only durable queue, lease, retry, and settlement
+authority. The local deterministic extractive fallback is composed in the binary behind the
+summarizer port and uses only persisted excerpts to produce separate critic and user
+likes/dislikes results, or an explicit unavailable result when no excerpts exist. A summary write
+matches both kind and refresh fingerprint, so an old worker result cannot replace the current
+refresh. The catalogue detail read model and `/games/{id}` render only persisted critic and user
+outputs, including the unavailable state. All M011 tests use local synthetic fixtures and
+in-process HTTP rendering; they make no source or provider call.
+
 Passing CI proves the bounded workspace
 claims and deterministic canary, policy, state-adapter, queue, M006 runtime,
 M007 discovery handler, M008 snapshot foundation, and M009 offline vertical; it
-also proves M010's deterministic offline catalogue fixtures. It does not prove
+also proves M010's deterministic offline catalogue fixtures and M011's synthetic
+review-to-summary vertical. It does not prove
 complete product behavior or complete architecture conformance.
 M006's scheduler identity, dispatcher-capacity, and stale-completion branches
 have focused mutation evidence; M009's three allowed manual mutation attempts

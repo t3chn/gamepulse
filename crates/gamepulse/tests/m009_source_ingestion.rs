@@ -22,7 +22,8 @@ use gamepulse_storage_sqlite::{
 use gamepulse_worker_source::{
     GameIdentity, GameIngestionTransport, HourlyDiscoveryHandler, ListMode, ListingTransport,
     MetacriticDailyCrawlSource, MetacriticGameIngestionSource, PlatformDetail, PlatformUserScore,
-    SourceIngestionHandler, parse_game_detail, parse_platform_user_score_for_snapshot,
+    ReviewKind, ReviewPage, SourceIngestionHandler, parse_game_detail,
+    parse_platform_user_score_for_snapshot,
 };
 use runtime::{Runtime, RuntimeClock, RuntimeClockError, RuntimeConfig, RuntimeTaskOutcome};
 use serde_json::{Value, json};
@@ -144,6 +145,10 @@ impl GameIngestionTransport for FixtureGameIngestionTransport {
         = Pin<Box<dyn Future<Output = Result<PlatformUserScore, Self::Error>> + Send + 'a>>
     where
         Self: 'a;
+    type FetchReviewPageFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<ReviewPage, Self::Error>> + Send + 'a>>
+    where
+        Self: 'a;
 
     fn fetch_game_detail(&self, expected: GameIdentity) -> Self::FetchDetailFuture<'_> {
         self.state
@@ -189,6 +194,16 @@ impl GameIngestionTransport for FixtureGameIngestionTransport {
             parse_platform_user_score_for_snapshot(&expected_game, &expected_platform, &body)
                 .map_err(|_| FixtureError::InvalidFixture);
         Box::pin(async move { result })
+    }
+
+    fn fetch_review_page(
+        &self,
+        _expected_game: GameIdentity,
+        _kind: ReviewKind,
+        _offset: u32,
+        _limit: u32,
+    ) -> Self::FetchReviewPageFuture<'_> {
+        Box::pin(async { Err(FixtureError::Unavailable) })
     }
 }
 

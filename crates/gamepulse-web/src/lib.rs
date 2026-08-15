@@ -11,8 +11,8 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use gamepulse_application::{
-    CatalogueGameDetail, CataloguePage, CatalogueQuery, GameCatalogueReadPort, SourceProductId,
-    load_catalogue, load_catalogue_game,
+    CatalogueGameDetail, CataloguePage, CatalogueQuery, CatalogueReviewSummary,
+    GameCatalogueReadPort, SourceProductId, load_catalogue, load_catalogue_game,
 };
 
 const EMPTY_PLATFORMS: &str = "No stored platforms";
@@ -349,6 +349,34 @@ struct CatalogueGameCardView {
         <p>{{ game.developers }}</p>
       </section>
       <section>
+        <h2>Critic review summary</h2>
+        {% match game.critic_summary %}
+        {% when Some with (summary) %}
+          {% match summary.status %}
+          {% when ReviewSummaryStatus::Pending %}<p>Summary pending for the current stored review refresh.</p>
+          {% when ReviewSummaryStatus::Unavailable %}<p>Unavailable: no stored critic excerpts.</p>
+          {% when ReviewSummaryStatus::Available %}
+          <h3>Likes</h3><ul>{% for item in summary.likes %}<li>{{ item }}</li>{% endfor %}</ul>
+          <h3>Dislikes</h3><ul>{% for item in summary.dislikes %}<li>{{ item }}</li>{% endfor %}</ul>
+          {% endmatch %}
+        {% when None %}<p>No stored critic review summary.</p>
+        {% endmatch %}
+      </section>
+      <section>
+        <h2>User review summary</h2>
+        {% match game.user_summary %}
+        {% when Some with (summary) %}
+          {% match summary.status %}
+          {% when ReviewSummaryStatus::Pending %}<p>Summary pending for the current stored review refresh.</p>
+          {% when ReviewSummaryStatus::Unavailable %}<p>Unavailable: no stored user excerpts.</p>
+          {% when ReviewSummaryStatus::Available %}
+          <h3>Likes</h3><ul>{% for item in summary.likes %}<li>{{ item }}</li>{% endfor %}</ul>
+          <h3>Dislikes</h3><ul>{% for item in summary.dislikes %}<li>{{ item }}</li>{% endfor %}</ul>
+          {% endmatch %}
+        {% when None %}<p>No stored user review summary.</p>
+        {% endmatch %}
+      </section>
+      <section>
         <h2>Similar stored games</h2>
         {% if game.similar_games.len() == 0 %}
         <p>No similar stored games found.</p>
@@ -398,6 +426,8 @@ impl GameDetailTemplate {
                     })
                     .collect(),
                 developers: display_values(game.developers(), EMPTY_DEVELOPERS),
+                critic_summary: game.critic_summary().map(review_summary_view),
+                user_summary: game.user_summary().map(review_summary_view),
                 similar_games: game
                     .similar_games()
                     .iter()
@@ -437,7 +467,42 @@ struct CatalogueGameDetailView {
     video: Option<CatalogueVideoView>,
     platform_scores: Vec<CataloguePlatformScoreView>,
     developers: String,
+    critic_summary: Option<ReviewSummaryView>,
+    user_summary: Option<ReviewSummaryView>,
     similar_games: Vec<SimilarGameView>,
+}
+
+fn review_summary_view(summary: &CatalogueReviewSummary) -> ReviewSummaryView {
+    match summary {
+        CatalogueReviewSummary::Pending => ReviewSummaryView {
+            status: ReviewSummaryStatus::Pending,
+            likes: Vec::new(),
+            dislikes: Vec::new(),
+        },
+        CatalogueReviewSummary::Unavailable => ReviewSummaryView {
+            status: ReviewSummaryStatus::Unavailable,
+            likes: Vec::new(),
+            dislikes: Vec::new(),
+        },
+        CatalogueReviewSummary::Available { likes, dislikes } => ReviewSummaryView {
+            status: ReviewSummaryStatus::Available,
+            likes: likes.clone(),
+            dislikes: dislikes.clone(),
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReviewSummaryStatus {
+    Pending,
+    Unavailable,
+    Available,
+}
+
+struct ReviewSummaryView {
+    status: ReviewSummaryStatus,
+    likes: Vec<String>,
+    dislikes: Vec<String>,
 }
 
 struct CatalogueCoverView {

@@ -1,0 +1,10 @@
+{
+  "data": {
+    "items": [
+      { "id": "synthetic-critic-1", "score": 92, "quote": "Critics praise the synthetic controls." },
+      { "id": "synthetic-critic-2", "score": 55, "quote": "Critics dislike the boring synthetic finale." }
+    ],
+    "totalResults": 2
+  },
+  "links": { "next": null }
+}
