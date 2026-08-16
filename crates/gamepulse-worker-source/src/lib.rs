@@ -25,10 +25,11 @@ use gamepulse_application::{
     AsyncDailyCrawlSourcePort, AsyncReviewSourceIngestionPort, AsyncSourceIngestionPort,
     CrawlDayKey, CrawlDiscoveryRequest, DailyCrawlStatePort, DiscoveryCandidate, DiscoveryPage,
     GameReviewRefreshStore, GameSnapshotStore, JobHandler, JobHandlerFailure, JobHandlerFuture,
-    JobHandlerResult, ReviewInput, ReviewSourceIngestion, ReviewSummaryJobSchedule, RuntimeJobType,
-    SourceIngestionJobSchedule, SourceIngestionRequest, TypedJob,
-    execute_async_daily_crawl_with_source_ingestion_jobs, execute_async_review_source_ingestion,
-    execute_async_source_ingestion, persist_game_review_refresh, upsert_game_snapshot,
+    JobHandlerResult, ReviewInput, ReviewSourceIngestion, ReviewSourceIngestionError,
+    ReviewSummaryJobSchedule, RuntimeJobType, SourceIngestionJobSchedule, SourceIngestionRequest,
+    TypedJob, execute_async_daily_crawl_with_source_ingestion_jobs,
+    execute_async_review_source_ingestion, execute_async_source_ingestion,
+    persist_game_review_refresh, upsert_game_snapshot,
 };
 use gamepulse_domain::{
     BrowseCursor, GameCoverDescriptor, GameDeveloper, GamePlatformScore, GamePublicCoverUrl,
@@ -47,7 +48,6 @@ const HOURLY_SCHEDULE_SECONDS: u64 = 60 * 60;
 const HOURS_PER_UTC_DAY: u64 = 24;
 const MAX_SCHEDULED_HOUR_SLOT: u64 = (i64::MAX as u64) / HOURLY_SCHEDULE_SECONDS;
 const HOURLY_DISCOVERY_FAILURE: &str = "source hourly discovery failed";
-const SOURCE_INGESTION_FAILURE: &str = "source game ingestion failed";
 const REVIEW_PAGE_LIMIT: u32 = 20;
 const PUBLIC_HTML_BASE_URL: &str = "https://www.metacritic.com/";
 const PUBLIC_HTML_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
@@ -58,6 +58,48 @@ const MAX_PUBLIC_HTML_PARSE_DEPTH: usize = 64;
 const MAX_PUBLIC_HTML_ATTRIBUTES_PER_ELEMENT: usize = 64;
 const MAX_PUBLIC_HTML_ATTRIBUTE_BYTES: usize = 65_536;
 const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
+
+/// Fixed, non-sensitive categories for terminal mandatory source-ingestion failures.
+///
+/// These strings are safe to persist and emit from the binary-owned observability boundary. They
+/// deliberately contain no source-derived material and must not be expanded with transport data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceIngestionFailureCategory {
+    ReviewContinuationLink,
+    OtherMandatoryStage,
+}
+
+impl SourceIngestionFailureCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReviewContinuationLink => "review_continuation_link",
+            Self::OtherMandatoryStage => "other_mandatory_stage",
+        }
+    }
+}
+
+/// Reduce any persisted source-ingestion handler failure to a fixed diagnostic category.
+///
+/// The fallback intentionally treats unrecognized input as the bounded other-stage category
+/// rather than exposing it through diagnostics.
+pub fn classify_source_ingestion_handler_failure(
+    handler_failure: &str,
+) -> SourceIngestionFailureCategory {
+    if handler_failure == SourceIngestionFailureCategory::ReviewContinuationLink.as_str() {
+        SourceIngestionFailureCategory::ReviewContinuationLink
+    } else {
+        SourceIngestionFailureCategory::OtherMandatoryStage
+    }
+}
+
+/// Classify a review-page parser error without exposing its source-derived details.
+pub fn classify_review_page_source_error(error: &SourceError) -> SourceIngestionFailureCategory {
+    if matches!(error, SourceError::InvalidContinuation) {
+        SourceIngestionFailureCategory::ReviewContinuationLink
+    } else {
+        SourceIngestionFailureCategory::OtherMandatoryStage
+    }
+}
 
 /// Translate the exact durable hourly schedule reference into its UTC calendar day.
 ///
@@ -487,6 +529,14 @@ pub trait GameIngestionTransport: Send + Sync {
         offset: u32,
         limit: u32,
     ) -> Self::FetchReviewPageFuture<'_>;
+
+    /// Classify a rejected mandatory review-page request without reflecting the source error.
+    ///
+    /// Fixture and future transports default to the bounded fallback. The verified direct-HTTP
+    /// transport overrides only the parser condition that M016 can identify safely.
+    fn review_page_failure_category(&self, _error: &Self::Error) -> SourceIngestionFailureCategory {
+        SourceIngestionFailureCategory::OtherMandatoryStage
+    }
 }
 
 /// One already-bounded response from the optional public-HTML source.
@@ -1397,7 +1447,9 @@ where
         let source_port = Arc::clone(&self.source_port);
         Box::pin(async move {
             let Ok(request) = SourceIngestionRequest::from_work_reference(job.work_ref()) else {
-                return JobHandlerResult::Failed(JobHandlerFailure::new(SOURCE_INGESTION_FAILURE));
+                return JobHandlerResult::Failed(JobHandlerFailure::new(
+                    SourceIngestionFailureCategory::OtherMandatoryStage.as_str(),
+                ));
             };
 
             let outcome = execute_async_source_ingestion(
@@ -1415,9 +1467,9 @@ where
 
             match outcome {
                 Ok(()) => JobHandlerResult::Succeeded,
-                Err(_) => {
-                    JobHandlerResult::Failed(JobHandlerFailure::new(SOURCE_INGESTION_FAILURE))
-                }
+                Err(_) => JobHandlerResult::Failed(JobHandlerFailure::new(
+                    SourceIngestionFailureCategory::OtherMandatoryStage.as_str(),
+                )),
             }
         })
     }
@@ -1449,7 +1501,9 @@ impl<T, C> MetacriticGameReviewSource<T, C> {
 
 #[derive(Debug)]
 pub enum MetacriticGameReviewError<E> {
-    Transport(E),
+    DetailTransport(E),
+    PlatformUserScoreTransport(E),
+    ReviewPageTransport(E),
     MismatchedGameIdentity,
     MismatchedReviewKind,
     Snapshot(GameSnapshotMappingError),
@@ -1460,7 +1514,13 @@ pub enum MetacriticGameReviewError<E> {
 impl<E> fmt::Display for MetacriticGameReviewError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Transport(_) => {
+            Self::DetailTransport(_) => {
+                formatter.write_str("Metacritic review ingestion transport failed")
+            }
+            Self::PlatformUserScoreTransport(_) => {
+                formatter.write_str("Metacritic review ingestion transport failed")
+            }
+            Self::ReviewPageTransport(_) => {
                 formatter.write_str("Metacritic review ingestion transport failed")
             }
             Self::MismatchedGameIdentity => formatter.write_str(
@@ -1479,6 +1539,11 @@ impl<E> fmt::Display for MetacriticGameReviewError<E> {
 }
 
 impl<E: std::error::Error + 'static> std::error::Error for MetacriticGameReviewError<E> {}
+
+/// Source-worker extension for reducing an opaque ingestion error to a safe durable category.
+pub trait ReviewSourceFailureClassifier: AsyncReviewSourceIngestionPort {
+    fn failure_category(&self, error: &Self::Error) -> SourceIngestionFailureCategory;
+}
 
 impl<T, C> AsyncReviewSourceIngestionPort for MetacriticGameReviewSource<T, C>
 where
@@ -1508,7 +1573,7 @@ where
                 let detail = transport
                     .fetch_game_detail(expected_game.clone())
                     .await
-                    .map_err(MetacriticGameReviewError::Transport)?;
+                    .map_err(MetacriticGameReviewError::DetailTransport)?;
                 if detail.id != expected_game.id || detail.slug != expected_game.slug {
                     return Err(MetacriticGameReviewError::MismatchedGameIdentity);
                 }
@@ -1518,7 +1583,7 @@ where
                         transport
                             .fetch_platform_user_score(expected_game.clone(), platform)
                             .await
-                            .map_err(MetacriticGameReviewError::Transport)?,
+                            .map_err(MetacriticGameReviewError::PlatformUserScoreTransport)?,
                     );
                 }
                 let snapshot = map_game_detail_to_snapshot(&detail, user_scores)
@@ -1528,7 +1593,7 @@ where
                     let page = transport
                         .fetch_review_page(expected_game.clone(), kind, 0, REVIEW_PAGE_LIMIT)
                         .await
-                        .map_err(MetacriticGameReviewError::Transport)?;
+                        .map_err(MetacriticGameReviewError::ReviewPageTransport)?;
                     if page.kind != kind {
                         return Err(MetacriticGameReviewError::MismatchedReviewKind);
                     }
@@ -1558,6 +1623,34 @@ where
             ReviewSourceIngestion::new(snapshot, critic, user)
                 .map_err(MetacriticGameReviewError::Ingestion)
         })
+    }
+}
+
+impl<T, C> ReviewSourceFailureClassifier for MetacriticGameReviewSource<T, C>
+where
+    T: GameIngestionTransport + Send + Sync + 'static,
+    T::Error: Send + 'static,
+    C: OptionalPublicCoverEnricher + Send + Sync + 'static,
+{
+    fn failure_category(&self, error: &Self::Error) -> SourceIngestionFailureCategory {
+        match error {
+            MetacriticGameReviewError::ReviewPageTransport(error)
+                if self.transport.review_page_failure_category(error)
+                    == SourceIngestionFailureCategory::ReviewContinuationLink =>
+            {
+                SourceIngestionFailureCategory::ReviewContinuationLink
+            }
+            MetacriticGameReviewError::DetailTransport(_)
+            | MetacriticGameReviewError::PlatformUserScoreTransport(_)
+            | MetacriticGameReviewError::ReviewPageTransport(_)
+            | MetacriticGameReviewError::MismatchedGameIdentity
+            | MetacriticGameReviewError::MismatchedReviewKind
+            | MetacriticGameReviewError::Snapshot(_)
+            | MetacriticGameReviewError::ReviewInput(_)
+            | MetacriticGameReviewError::Ingestion(_) => {
+                SourceIngestionFailureCategory::OtherMandatoryStage
+            }
+        }
     }
 }
 
@@ -1592,7 +1685,7 @@ impl<S, P> JobHandler for ReviewSourceIngestionHandler<S, P>
 where
     S: GameReviewRefreshStore + Send + 'static,
     S::Error: Send + 'static,
-    P: AsyncReviewSourceIngestionPort + Send + Sync + 'static,
+    P: AsyncReviewSourceIngestionPort + ReviewSourceFailureClassifier + Send + Sync + 'static,
     P::Error: Send + 'static,
 {
     fn job_type(&self) -> RuntimeJobType {
@@ -1605,7 +1698,9 @@ where
         let summary_schedule = self.summary_schedule;
         Box::pin(async move {
             let Ok(request) = SourceIngestionRequest::from_work_reference(job.work_ref()) else {
-                return JobHandlerResult::Failed(JobHandlerFailure::new(SOURCE_INGESTION_FAILURE));
+                return JobHandlerResult::Failed(JobHandlerFailure::new(
+                    SourceIngestionFailureCategory::OtherMandatoryStage.as_str(),
+                ));
             };
             let outcome = execute_async_review_source_ingestion(
                 source_port.as_ref(),
@@ -1623,8 +1718,14 @@ where
             .await;
             match outcome {
                 Ok(()) => JobHandlerResult::Succeeded,
-                Err(_) => {
-                    JobHandlerResult::Failed(JobHandlerFailure::new(SOURCE_INGESTION_FAILURE))
+                Err(ReviewSourceIngestionError::Source(error)) => JobHandlerResult::Failed(
+                    JobHandlerFailure::new(source_port.failure_category(&error).as_str()),
+                ),
+                Err(ReviewSourceIngestionError::InvalidRefresh(_))
+                | Err(ReviewSourceIngestionError::Store(_)) => {
+                    JobHandlerResult::Failed(JobHandlerFailure::new(
+                        SourceIngestionFailureCategory::OtherMandatoryStage.as_str(),
+                    ))
                 }
             }
         })
@@ -2096,6 +2197,10 @@ impl GameIngestionTransport for MetacriticCanaryClient {
             )
             .await
         })
+    }
+
+    fn review_page_failure_category(&self, error: &Self::Error) -> SourceIngestionFailureCategory {
+        classify_review_page_source_error(error)
     }
 }
 
@@ -3159,6 +3264,31 @@ mod tests {
             decode_response_body(vec![0xff]),
             Err(SourceError::InvalidResponseUtf8)
         ));
+    }
+
+    #[test]
+    fn direct_http_review_continuation_failures_have_one_fixed_category() {
+        let client = MetacriticCanaryClient::new().expect("client configuration must be valid");
+        let source = MetacriticGameReviewSource::new(client.clone());
+        let review_error =
+            MetacriticGameReviewError::ReviewPageTransport(SourceError::InvalidContinuation);
+
+        assert_eq!(
+            client.review_page_failure_category(&SourceError::InvalidContinuation),
+            SourceIngestionFailureCategory::ReviewContinuationLink
+        );
+        assert_eq!(
+            source.failure_category(&review_error),
+            SourceIngestionFailureCategory::ReviewContinuationLink
+        );
+        assert_eq!(
+            client.review_page_failure_category(&SourceError::InvalidLimit),
+            SourceIngestionFailureCategory::OtherMandatoryStage
+        );
+        assert_eq!(
+            classify_source_ingestion_handler_failure("untrusted diagnostic input"),
+            SourceIngestionFailureCategory::OtherMandatoryStage
+        );
     }
 
     fn assert_request(url: Url, expected_path: &str, expected_pairs: &[(&str, &str)]) {

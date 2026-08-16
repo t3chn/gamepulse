@@ -383,6 +383,27 @@ fn source_cover_and_review_outcome_categories_are_fixed_and_text_free() {
         "failed"
     );
     assert_eq!(
+        observability::source_failure_category(
+            RuntimeJobType::SourceGameIngestion,
+            &JobHandlerResult::Failed(JobHandlerFailure::new("review_continuation_link")),
+        ),
+        "review_continuation_link"
+    );
+    assert_eq!(
+        observability::source_failure_category(
+            RuntimeJobType::SourceGameIngestion,
+            &JobHandlerResult::Failed(JobHandlerFailure::new("untrusted source failure")),
+        ),
+        "other_mandatory_stage"
+    );
+    assert_eq!(
+        observability::source_failure_category(
+            RuntimeJobType::SourceHourlyDiscovery,
+            &JobHandlerResult::Failed(JobHandlerFailure::new("untrusted source failure")),
+        ),
+        "not_applicable"
+    );
+    assert_eq!(
         observability::review_kind_category(&summary_job(ReviewKind::Critic)),
         "critic"
     );

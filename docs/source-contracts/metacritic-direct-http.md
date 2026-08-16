@@ -164,6 +164,23 @@ and `totalResults=12` can accept only `offset=10&limit=10`. This exception does
 not apply to finder/list continuations, user reviews, later critic pages, or a
 review continuation that M011 would follow.
 
+## M016 safe terminal diagnostics
+
+When a mandatory game-ingestion attempt fails, its durable handler failure and
+the binary-owned source event carry only one fixed category. A review-page
+parser rejection of a continuation is `review_continuation_link`; every other
+mandatory-path failure is `other_mandatory_stage`. The categories contain no
+source-derived material and are the only source-ingestion failure values that
+the observability boundary may emit.
+
+M016 changes no continuation acceptance rule. In particular, the M015 critic
+first-page effective-page-size exception remains the sole narrow compatibility
+rule. The current safe evidence establishes a review-continuation mismatch but
+does not retain the response relationship needed to authorize another parser
+rule. A later acceptance change requires separately authorized, bounded
+evidence that proves its exact relationship while preserving all host, path,
+query-key, progression, and total-boundary validation.
+
 ## Remaining risks
 
 - The backend is a public site implementation, not a versioned public API.

@@ -2,9 +2,9 @@
 
 use gamepulse_domain::SourceProductId;
 use gamepulse_worker_source::{
-    GameId, GameIdentity, ListMode, ReviewKind, SourceError, map_listing_page_for_daily_crawl,
-    map_review_page_to_input, parse_game_detail, parse_listing_page, parse_review_page,
-    parse_user_score_summary,
+    GameId, GameIdentity, ListMode, ReviewKind, SourceError, SourceIngestionFailureCategory,
+    classify_review_page_source_error, map_listing_page_for_daily_crawl, map_review_page_to_input,
+    parse_game_detail, parse_listing_page, parse_review_page, parse_user_score_summary,
 };
 
 const LISTING: &str = include_str!("fixtures/listing-page.json");
@@ -246,6 +246,13 @@ fn accepts_only_the_verified_server_clamp_for_the_first_critic_page() {
             Err(SourceError::InvalidContinuation)
         ));
     }
+    let continuation_error =
+        parse_review_page(ReviewKind::Critic, "example-game", 0, 20, &non_advancing)
+            .expect_err("non-progressing continuation must fail before review input mapping");
+    assert_eq!(
+        classify_review_page_source_error(&continuation_error),
+        SourceIngestionFailureCategory::ReviewContinuationLink
+    );
 
     let user_path = M015_CRITIC_SERVER_CLAMP.replace("/critic/", "/user/");
     assert!(matches!(

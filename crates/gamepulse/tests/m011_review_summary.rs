@@ -24,8 +24,8 @@ use gamepulse_storage_sqlite::{
 use gamepulse_worker_llm::{LocalExtractiveReviewSummarizer, ReviewSummaryHandler};
 use gamepulse_worker_source::{
     GameDetail, GameIdentity, GameIngestionTransport, MetacriticGameReviewSource, PlatformDetail,
-    PlatformUserScore, ReviewPage, ReviewSourceIngestionHandler, parse_game_detail,
-    parse_platform_user_score_for_snapshot, parse_review_page,
+    PlatformUserScore, ReviewPage, ReviewSourceIngestionHandler, SourceIngestionFailureCategory,
+    parse_game_detail, parse_platform_user_score_for_snapshot, parse_review_page,
 };
 use runtime::{Runtime, RuntimeClock, RuntimeClockError, RuntimeConfig, RuntimeTaskOutcome};
 
@@ -76,12 +76,13 @@ impl RuntimeClock for FixedClock {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FixtureError {
     Unavailable,
+    ReviewContinuationLink,
 }
 
 #[derive(Clone, Default)]
 struct FixtureTransport {
     calls: Arc<Mutex<Vec<String>>>,
-    fail_reviews: bool,
+    review_failure: Option<FixtureError>,
 }
 
 impl FixtureTransport {
@@ -92,10 +93,10 @@ impl FixtureTransport {
             .clone()
     }
 
-    fn with_review_failure() -> Self {
+    fn with_review_continuation_failure() -> Self {
         Self {
             calls: Arc::new(Mutex::new(Vec::new())),
-            fail_reviews: true,
+            review_failure: Some(FixtureError::ReviewContinuationLink),
         }
     }
 }
@@ -158,8 +159,8 @@ impl GameIngestionTransport for FixtureTransport {
             .lock()
             .expect("fixture calls must not be poisoned")
             .push(format!("review:{}:{offset}:{limit}", kind.as_str()));
-        if self.fail_reviews {
-            return Box::pin(async { Err(FixtureError::Unavailable) });
+        if let Some(error) = self.review_failure {
+            return Box::pin(async move { Err(error) });
         }
         let body = match kind {
             ReviewKind::Critic => CRITIC_REVIEWS,
@@ -170,6 +171,15 @@ impl GameIngestionTransport for FixtureTransport {
             parse_review_page(kind, &slug, offset, limit, body)
                 .map_err(|_| FixtureError::Unavailable)
         })
+    }
+
+    fn review_page_failure_category(&self, error: &Self::Error) -> SourceIngestionFailureCategory {
+        match error {
+            FixtureError::ReviewContinuationLink => {
+                SourceIngestionFailureCategory::ReviewContinuationLink
+            }
+            FixtureError::Unavailable => SourceIngestionFailureCategory::OtherMandatoryStage,
+        }
     }
 }
 
@@ -363,7 +373,7 @@ async fn fixture_refresh_creates_two_separated_summary_jobs_and_renders_persiste
 }
 
 #[tokio::test]
-async fn source_review_failure_settles_without_a_partial_snapshot_or_review_refresh() {
+async fn source_review_continuation_failure_is_durable_and_leaves_no_partial_refresh() {
     let database = TemporaryDatabase::new();
     let queue = Arc::new(Mutex::new(
         SqliteJobStore::open(&database.path).expect("queue database must open"),
@@ -387,7 +397,7 @@ async fn source_review_failure_settles_without_a_partial_snapshot_or_review_refr
         .expect("source job must enqueue");
     let source_handler: Arc<dyn JobHandler> = Arc::new(ReviewSourceIngestionHandler::new(
         reviews.clone(),
-        MetacriticGameReviewSource::new(FixtureTransport::with_review_failure()),
+        MetacriticGameReviewSource::new(FixtureTransport::with_review_continuation_failure()),
         ReviewSummaryJobSchedule::new(1).expect("summary schedule must be valid"),
     ));
     let mut runtime = Runtime::new(
@@ -418,6 +428,16 @@ async fn source_review_failure_settles_without_a_partial_snapshot_or_review_refr
             .expect("count must load");
         assert_eq!(count, 0, "{table} must remain empty after a source failure");
     }
+    let mut attempts = SqliteJobStore::open(&database.path).expect("queue database must reopen");
+    assert_eq!(
+        attempts
+            .attempts("m011-source-failure")
+            .expect("attempt history must load")
+            .as_slice()
+            .first()
+            .and_then(gamepulse_application::JobAttempt::error),
+        Some("review_continuation_link")
+    );
 }
 
 #[test]

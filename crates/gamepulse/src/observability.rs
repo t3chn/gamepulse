@@ -11,7 +11,9 @@ use axum::response::Response;
 use gamepulse_application::{
     JobHandler, JobHandlerFuture, JobHandlerResult, ReviewSummaryRequest, RuntimeJobType, TypedJob,
 };
-use gamepulse_worker_source::{GameIdentity, OptionalPublicCoverEnricher};
+use gamepulse_worker_source::{
+    GameIdentity, OptionalPublicCoverEnricher, classify_source_ingestion_handler_failure,
+};
 use tracing_subscriber::filter;
 use tracing_subscriber::layer::Layer;
 use tracing_subscriber::prelude::*;
@@ -209,6 +211,7 @@ where
                         target: "gamepulse::source",
                         source_stage = source_stage_category(job_type),
                         outcome = handler_outcome_category(&outcome),
+                        source_failure_category = source_failure_category(job_type, &outcome),
                         "source stage aggregate settled"
                     );
                 }
@@ -264,6 +267,18 @@ pub(crate) fn handler_outcome_category(outcome: &JobHandlerResult) -> &'static s
     match outcome {
         JobHandlerResult::Succeeded => "succeeded",
         JobHandlerResult::Failed(_) => "failed",
+    }
+}
+
+pub(crate) fn source_failure_category(
+    job_type: RuntimeJobType,
+    outcome: &JobHandlerResult,
+) -> &'static str {
+    match (job_type, outcome) {
+        (RuntimeJobType::SourceGameIngestion, JobHandlerResult::Failed(failure)) => {
+            classify_source_ingestion_handler_failure(failure.message()).as_str()
+        }
+        _ => "not_applicable",
     }
 }
 
