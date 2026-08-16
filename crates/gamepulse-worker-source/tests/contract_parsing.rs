@@ -15,12 +15,36 @@ const USER_SCORE: &str = include_str!("fixtures/user-score.json");
 const M011_CRITIC_REVIEWS: &str = include_str!("fixtures/m011-critic-review-page.json");
 const M011_USER_REVIEWS: &str = include_str!("fixtures/m011-user-review-page.json");
 const M015_CRITIC_SERVER_CLAMP: &str = include_str!("fixtures/m015-critic-server-clamp-page.json");
+const M017_REVIEW_TERMINAL_WITH_ITEMS: &str =
+    include_str!("fixtures/m017-review-terminal-with-items.json");
+const M017_REVIEW_TERMINAL_EMPTY: &str = include_str!("fixtures/m017-review-terminal-empty.json");
 
 fn example_game() -> GameIdentity {
     GameIdentity {
         id: GameId(101),
         slug: "example-game".to_owned(),
     }
+}
+
+fn without_next(body: &str) -> String {
+    let mut document: serde_json::Value = serde_json::from_str(body).expect("fixture must decode");
+    document["links"]
+        .as_object_mut()
+        .expect("fixture links must be an object")
+        .remove("next");
+    serde_json::to_string(&document).expect("fixture must encode")
+}
+
+fn with_explicit_null_next(body: &str) -> String {
+    let mut document: serde_json::Value = serde_json::from_str(body).expect("fixture must decode");
+    document["links"]["next"] = serde_json::Value::Null;
+    serde_json::to_string(&document).expect("fixture must encode")
+}
+
+fn with_explicit_null_href(body: &str) -> String {
+    let mut document: serde_json::Value = serde_json::from_str(body).expect("fixture must decode");
+    document["links"]["next"]["href"] = serde_json::Value::Null;
+    serde_json::to_string(&document).expect("fixture must encode")
 }
 
 #[test]
@@ -267,6 +291,90 @@ fn accepts_only_the_verified_server_clamp_for_the_first_critic_page() {
             20,
             M015_CRITIC_SERVER_CLAMP,
         ),
+        Err(SourceError::InvalidContinuation)
+    ));
+}
+
+#[test]
+fn accepts_only_exhausted_review_placeholders_as_terminal() {
+    let game = example_game();
+    let critic = parse_review_page(
+        ReviewKind::Critic,
+        &game.slug,
+        0,
+        20,
+        M017_REVIEW_TERMINAL_WITH_ITEMS,
+    )
+    .expect("exhausted critic placeholder must be terminal");
+    let user = parse_review_page(
+        ReviewKind::User,
+        &game.slug,
+        0,
+        20,
+        M017_REVIEW_TERMINAL_EMPTY,
+    )
+    .expect("exhausted user placeholder must be terminal");
+
+    assert_eq!(critic.reviews.len(), 4);
+    assert_eq!(critic.total_results, 4);
+    assert_eq!(critic.next, None);
+    assert!(user.reviews.is_empty());
+    assert_eq!(user.total_results, 0);
+    assert_eq!(user.next, None);
+
+    let missing_next = without_next(M017_REVIEW_TERMINAL_EMPTY);
+    assert_eq!(
+        parse_review_page(ReviewKind::User, &game.slug, 0, 20, &missing_next)
+            .expect("missing next must remain terminal")
+            .next,
+        None
+    );
+    assert_eq!(
+        parse_review_page(
+            ReviewKind::Critic,
+            &game.slug,
+            0,
+            3,
+            &without_next(CRITIC_REVIEWS),
+        )
+        .expect("missing next must preserve the existing terminal behavior")
+        .next,
+        None
+    );
+
+    for body in [
+        with_explicit_null_next(M017_REVIEW_TERMINAL_WITH_ITEMS),
+        with_explicit_null_href(M017_REVIEW_TERMINAL_WITH_ITEMS),
+        with_explicit_null_next(M017_REVIEW_TERMINAL_EMPTY),
+        with_explicit_null_href(M017_REVIEW_TERMINAL_EMPTY),
+    ] {
+        assert!(matches!(
+            parse_review_page(ReviewKind::Critic, &game.slug, 0, 20, &body),
+            Err(SourceError::InvalidContinuation)
+        ));
+    }
+
+    let non_exhausted =
+        M017_REVIEW_TERMINAL_WITH_ITEMS.replace("\"totalResults\": 4", "\"totalResults\": 5");
+    assert!(matches!(
+        parse_review_page(ReviewKind::Critic, &game.slug, 0, 20, &non_exhausted),
+        Err(SourceError::InvalidContinuation)
+    ));
+
+    let exhausted_listing = LISTING.replace("\"totalResults\": 42", "\"totalResults\": 2");
+    for body in [
+        with_explicit_null_next(&exhausted_listing),
+        with_explicit_null_href(&exhausted_listing),
+    ] {
+        assert!(matches!(
+            parse_listing_page(ListMode::NewReleases, 0, 20, &body),
+            Err(SourceError::InvalidContinuation)
+        ));
+    }
+
+    let listing_placeholder = LISTING.replace("\"href\":", "\"placeholder\":");
+    assert!(matches!(
+        parse_listing_page(ListMode::NewReleases, 0, 20, &listing_placeholder),
         Err(SourceError::InvalidContinuation)
     ));
 }

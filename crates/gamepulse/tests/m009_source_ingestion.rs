@@ -282,7 +282,10 @@ fn single_candidate_listing() -> String {
     let mut listing: Value = serde_json::from_str(LISTING_FIXTURE).expect("listing fixture JSON");
     listing["data"]["items"] = Value::Array(vec![listing["data"]["items"][0].clone()]);
     listing["data"]["totalResults"] = json!(1);
-    listing["links"]["next"] = Value::Null;
+    listing["links"]
+        .as_object_mut()
+        .expect("listing fixture links must be an object")
+        .remove("next");
     serde_json::to_string(&listing).expect("listing fixture must encode")
 }
 

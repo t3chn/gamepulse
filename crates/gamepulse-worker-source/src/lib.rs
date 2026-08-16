@@ -2244,6 +2244,7 @@ pub fn parse_listing_page(
                 offset,
                 limit,
                 total_results: envelope.data.total_results,
+                review_item_count: None,
                 critic_first_page_item_count: None,
             },
         )?,
@@ -2366,6 +2367,7 @@ pub fn parse_review_page(
     let critic_first_page_item_count =
         (kind == ReviewKind::Critic && offset == 0 && limit == REVIEW_PAGE_LIMIT)
             .then_some(reviews.len());
+    let review_item_count = reviews.len();
 
     Ok(ReviewPage {
         kind,
@@ -2378,6 +2380,7 @@ pub fn parse_review_page(
                 offset,
                 limit,
                 total_results: envelope.data.total_results,
+                review_item_count: Some(review_item_count),
                 critic_first_page_item_count,
             },
         )?,
@@ -2765,17 +2768,28 @@ struct ContinuationContext<'a> {
     offset: u32,
     limit: u32,
     total_results: u64,
+    review_item_count: Option<usize>,
     critic_first_page_item_count: Option<usize>,
 }
 
 fn parse_continuation(
-    raw: Option<RawLink>,
+    raw: RawNextLink,
     context: ContinuationContext<'_>,
 ) -> Result<Option<Continuation>, SourceError> {
-    let Some(raw) = raw else {
-        return Ok(None);
+    let raw = match raw {
+        RawNextLink::Missing => return Ok(None),
+        RawNextLink::Null => return Err(SourceError::InvalidContinuation),
+        RawNextLink::Link(raw) => raw,
     };
-    let href = raw.href.ok_or(SourceError::InvalidContinuation)?;
+    let href = match raw.href {
+        RawHref::Missing => {
+            return is_exhausted_review_page(&context)
+                .then_some(None)
+                .ok_or(SourceError::InvalidContinuation);
+        }
+        RawHref::Null => return Err(SourceError::InvalidContinuation),
+        RawHref::Value(href) => href,
+    };
     let url = Url::parse(&href).map_err(|_| SourceError::InvalidContinuation)?;
     if !is_backend_path(&url, context.path) {
         return Err(SourceError::InvalidContinuation);
@@ -2819,6 +2833,17 @@ fn parse_continuation(
     }
 }
 
+fn is_exhausted_review_page(context: &ContinuationContext<'_>) -> bool {
+    let Some(item_count) = context.review_item_count else {
+        return false;
+    };
+    let Ok(item_count) = u64::try_from(item_count) else {
+        return false;
+    };
+
+    u64::from(context.offset).checked_add(item_count) == Some(context.total_results)
+}
+
 fn is_requested_page_continuation(
     context: &ContinuationContext<'_>,
     expected_offset: u32,
@@ -2860,7 +2885,10 @@ fn validate_backend_link(
     field: &'static str,
 ) -> Result<(), SourceError> {
     let href = raw
-        .and_then(|link| link.href)
+        .and_then(|link| match link.href {
+            RawHref::Value(href) => Some(href),
+            RawHref::Missing | RawHref::Null => None,
+        })
         .ok_or(SourceError::MismatchedSelfLink { field })?;
     let url = Url::parse(&href).map_err(|_| SourceError::MismatchedSelfLink { field })?;
     if !is_backend_path(&url, expected_path) {
@@ -2914,12 +2942,53 @@ struct RawLinks {
     #[serde(default, rename = "self")]
     self_: Option<RawLink>,
     #[serde(default)]
-    next: Option<RawLink>,
+    next: RawNextLink,
 }
 
 #[derive(Deserialize)]
 struct RawLink {
-    href: Option<String>,
+    #[serde(default)]
+    href: RawHref,
+}
+
+#[derive(Default)]
+enum RawNextLink {
+    #[default]
+    Missing,
+    Null,
+    Link(RawLink),
+}
+
+impl<'de> Deserialize<'de> for RawNextLink {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<RawLink>::deserialize(deserializer).map(|raw| match raw {
+            Some(raw) => Self::Link(raw),
+            None => Self::Null,
+        })
+    }
+}
+
+#[derive(Default)]
+enum RawHref {
+    #[default]
+    Missing,
+    Null,
+    Value(String),
+}
+
+impl<'de> Deserialize<'de> for RawHref {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer).map(|href| match href {
+            Some(href) => Self::Value(href),
+            None => Self::Null,
+        })
+    }
 }
 
 #[derive(Deserialize)]

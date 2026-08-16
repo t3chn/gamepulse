@@ -173,13 +173,18 @@ mandatory-path failure is `other_mandatory_stage`. The categories contain no
 source-derived material and are the only source-ingestion failure values that
 the observability boundary may emit.
 
-M016 changes no continuation acceptance rule. In particular, the M015 critic
-first-page effective-page-size exception remains the sole narrow compatibility
-rule. The current safe evidence establishes a review-continuation mismatch but
-does not retain the response relationship needed to authorize another parser
-rule. A later acceptance change requires separately authorized, bounded
-evidence that proves its exact relationship while preserving all host, path,
-query-key, progression, and total-boundary validation.
+M016 changes no continuation acceptance rule. M017 adds one separately
+authorized review-only terminal normalization: a present `links.next` object
+whose `href` field is absent, rather than JSON `null`, is terminal only when
+the requested offset plus the parsed review-item count equals
+`data.totalResults` exactly, using checked arithmetic. A non-exhausted review
+placeholder remains invalid. A missing `links.next` retains its established
+terminal meaning, while explicit `links.next: null` or `href: null` is invalid.
+Finder/list continuations do not receive the normalization. The M015 critic
+first-page effective-page-size exception remains narrow, and every non-empty
+review or listing continuation still requires the existing exact host, path,
+duplicate-query-key, positive-limit, progression, overflow, and total-boundary
+validation.
 
 ## Remaining risks
 
