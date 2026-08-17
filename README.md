@@ -217,6 +217,17 @@ the others are fail-closed diagnostic results. Full behavior and boundaries are
 recorded in
 [`docs/source-contracts/metacritic-direct-http.md`](docs/source-contracts/metacritic-direct-http.md).
 
+M031 makes the output a single validated `gamepulse.diagnostic.v1` aggregate
+report. The wrapper accepts only the exact controlled Cargo transcript with one
+report: no extra fields, duplicate JSON, noise, reordered or repeated framing,
+or inconsistent count, ceiling, exchange order, parser, category, or verdict
+combination. Positive reports exit `0`; every schema-valid fail-closed verdict
+is still printed as evidence and exits `3`. Invalid output or an internal
+wrapper failure prints only `diagnostic command failed` to stderr and exits
+`1`. Invalid mode exits `2` with no report. `request_count` is the exact
+budget-reserved diagnostic attempt count, not a reconstruction of a historical
+wire count.
+
 ## Repository boundary
 
 This repository must remain self-contained for evaluation. Private application

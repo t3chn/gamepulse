@@ -29,13 +29,17 @@ mise run diagnostic-mutation
 
 The command copies only the current Git-tracked file set to a temporary
 directory outside the repository, runs offline, and removes the temporary
-directory on exit. It has a hard ceiling of two
+directory on exit. It has a hard ceiling of three
 mutants:
 
 1. allow a fourth request after the diagnostic ceiling;
 2. turn a parser rejection into acceptance in the aggregate-only diagnostic
    path.
+3. turn a schema-valid fail-closed diagnostic exit into a success exit.
 
-Each mutant must be caught by its named fixture test. A compiling survivor
-fails the command. The harness never calls a public source, prints no fixture
-payload, and never patches the working tree.
+For each named mutant, the harness first proves that exact baseline test passes,
+then verifies one and only one literal mutation was applied. It counts a mutant
+as caught only when that same named test fails. A compile, Cargo, harness, copy,
+or other infrastructure failure is reported separately and never counted as a
+caught mutant. A compiling survivor fails the command. The harness never calls
+a public source, prints no fixture payload, and never patches the working tree.

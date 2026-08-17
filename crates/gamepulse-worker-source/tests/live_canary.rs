@@ -17,6 +17,7 @@ const MAX_RESPONSE_BYTES: usize = 1_048_576;
 const NEW_RELEASES_LIMIT: u32 = 20;
 const REVIEW_LIMIT: u32 = 20;
 const LIVE_OPT_IN: &str = "GAMEPULSE_M028_LIVE_DIAGNOSTIC";
+const DIAGNOSTIC_SCHEMA_VERSION: &str = "gamepulse.diagnostic.v1";
 
 const LISTING: &str = include_str!("fixtures/listing-page.json");
 const M011_CRITIC: &str = include_str!("fixtures/m011-critic-review-page.json");
@@ -91,6 +92,14 @@ enum ParserOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ExchangeKind {
+    Finder,
+    CriticReview,
+    UserReview,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 struct LinkChecks {
     scheme: bool,
     host: bool,
@@ -113,10 +122,31 @@ impl LinkChecks {
             total_boundary: false,
         }
     }
+
+    const fn all_false(self) -> bool {
+        !self.scheme
+            && !self.host
+            && !self.path
+            && !self.query
+            && !self.progression
+            && !self.limit
+            && !self.total_boundary
+    }
+
+    const fn all_true(self) -> bool {
+        self.scheme
+            && self.host
+            && self.path
+            && self.query
+            && self.progression
+            && self.limit
+            && self.total_boundary
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct ExchangeReport {
+    request: ExchangeKind,
     status_category: StatusCategory,
     expected_content_type: bool,
     utf8: bool,
@@ -139,6 +169,7 @@ enum SafeCategory {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct DiagnosticReport {
+    schema_version: &'static str,
     mode: DiagnosticMode,
     request_count: u8,
     request_ceiling: u8,
@@ -148,7 +179,175 @@ struct DiagnosticReport {
 
 impl DiagnosticReport {
     fn render(&self) -> String {
+        assert!(
+            self.is_schema_valid(),
+            "aggregate diagnostic report must satisfy schema v1"
+        );
         serde_json::to_string(self).expect("aggregate diagnostic report must serialize")
+    }
+
+    fn is_schema_valid(&self) -> bool {
+        let expected_requests = [
+            ExchangeKind::Finder,
+            ExchangeKind::CriticReview,
+            ExchangeKind::UserReview,
+        ];
+        let accepted = self
+            .exchanges
+            .iter()
+            .all(|exchange| exchange.parser == ParserOutcome::Accepted);
+        let prior_exchanges_accepted = self
+            .exchanges
+            .get(..self.exchanges.len().saturating_sub(1))
+            .is_some_and(|exchanges| {
+                exchanges
+                    .iter()
+                    .all(|exchange| exchange.parser == ParserOutcome::Accepted)
+            });
+        let terminal_valid = match self.terminal_verdict {
+            TerminalVerdict::FixtureValidated => {
+                self.mode == DiagnosticMode::Fixture
+                    && self.request_count == 3
+                    && accepted
+                    && self
+                        .exchanges
+                        .first()
+                        .is_some_and(|exchange| exchange.item_count > 0)
+            }
+            TerminalVerdict::ContractReady => {
+                self.mode != DiagnosticMode::Fixture
+                    && self.request_count == self.mode.ceiling()
+                    && accepted
+                    && self
+                        .exchanges
+                        .first()
+                        .is_some_and(|exchange| exchange.item_count > 0)
+            }
+            TerminalVerdict::AccessDenied => self.exchanges.last().is_some_and(|exchange| {
+                prior_exchanges_accepted
+                    && exchange.status_category == StatusCategory::Forbidden
+                    && exchange.parser == ParserOutcome::Rejected
+            }),
+            TerminalVerdict::RateLimited => self.exchanges.last().is_some_and(|exchange| {
+                prior_exchanges_accepted
+                    && exchange.status_category == StatusCategory::RateLimited
+                    && exchange.parser == ParserOutcome::Rejected
+            }),
+            TerminalVerdict::SourceRejected => self.exchanges.last().is_some_and(|exchange| {
+                prior_exchanges_accepted
+                    && self.exchanges.iter().all(|exchange| {
+                        exchange.status_category != StatusCategory::Forbidden
+                            && exchange.status_category != StatusCategory::RateLimited
+                    })
+                    && exchange.parser == ParserOutcome::Rejected
+            }),
+            TerminalVerdict::NoCandidate => {
+                self.request_count == 1
+                    && self.exchanges.len() == 1
+                    && self.exchanges[0].request == ExchangeKind::Finder
+                    && self.exchanges[0].parser == ParserOutcome::Accepted
+                    && self.exchanges[0].item_count == 0
+            }
+            TerminalVerdict::RequestBudgetExhausted => {
+                self.request_count == self.request_ceiling && accepted
+            }
+        };
+
+        self.schema_version == DIAGNOSTIC_SCHEMA_VERSION
+            && self.request_ceiling == self.mode.ceiling()
+            && self.request_count > 0
+            && self.request_count <= self.request_ceiling
+            && usize::from(self.request_count) == self.exchanges.len()
+            && self
+                .exchanges
+                .iter()
+                .zip(expected_requests)
+                .all(|(exchange, expected)| {
+                    exchange.request == expected && exchange.is_schema_valid()
+                })
+            && terminal_valid
+    }
+}
+
+impl ExchangeReport {
+    fn is_schema_valid(&self) -> bool {
+        let is_review = self.request != ExchangeKind::Finder;
+        let presence_valid_for_rejected = match (self.continuation_presence, self.href_presence) {
+            (ContinuationPresence::NotChecked, HrefPresence::NotApplicable)
+            | (ContinuationPresence::Missing, HrefPresence::NotApplicable)
+            | (ContinuationPresence::Null, HrefPresence::NotApplicable)
+            | (ContinuationPresence::Other, HrefPresence::NotApplicable) => {
+                self.link_checks.all_false()
+            }
+            (
+                ContinuationPresence::Object,
+                HrefPresence::Missing | HrefPresence::Null | HrefPresence::Other,
+            ) => self.link_checks.all_false(),
+            (ContinuationPresence::Object, HrefPresence::String) => true,
+            _ => false,
+        };
+
+        match self.parser {
+            ParserOutcome::Accepted => {
+                self.status_category == StatusCategory::Ok
+                    && self.expected_content_type
+                    && self.utf8
+                    && self.json
+                    && self.numeric_total
+                    && self.safe_category == SafeCategory::OtherMandatoryStage
+                    && match (self.continuation_presence, self.href_presence) {
+                        (ContinuationPresence::Missing, HrefPresence::NotApplicable) => {
+                            self.link_checks.all_false()
+                        }
+                        (ContinuationPresence::Object, HrefPresence::Missing) => {
+                            is_review && self.link_checks.all_false()
+                        }
+                        (ContinuationPresence::Object, HrefPresence::String) => {
+                            self.link_checks.all_true()
+                        }
+                        _ => false,
+                    }
+            }
+            ParserOutcome::Rejected => {
+                self.status_category != StatusCategory::NotAttempted
+                    && if self.status_category != StatusCategory::Ok {
+                        !self.utf8
+                            && !self.json
+                            && !self.numeric_total
+                            && self.item_count == 0
+                            && self.continuation_presence == ContinuationPresence::NotChecked
+                            && self.href_presence == HrefPresence::NotApplicable
+                            && self.link_checks.all_false()
+                            && self.safe_category == SafeCategory::OtherMandatoryStage
+                    } else {
+                        let structural_stage_valid = match self.continuation_presence {
+                            ContinuationPresence::NotChecked => {
+                                !self.json && !self.numeric_total && self.item_count == 0
+                            }
+                            ContinuationPresence::Missing
+                            | ContinuationPresence::Null
+                            | ContinuationPresence::Object
+                            | ContinuationPresence::Other => {
+                                self.expected_content_type && self.utf8 && self.json
+                            }
+                        };
+                        structural_stage_valid
+                            && presence_valid_for_rejected
+                            && match self.safe_category {
+                                SafeCategory::OtherMandatoryStage => true,
+                                SafeCategory::ReviewContinuationLink => {
+                                    is_review
+                                        && self.continuation_presence
+                                            == ContinuationPresence::Object
+                                        && self.expected_content_type
+                                        && self.utf8
+                                        && self.json
+                                        && self.numeric_total
+                                }
+                            }
+                    }
+            }
+        }
     }
 }
 
@@ -162,6 +361,20 @@ enum ProbeRequest<'a> {
 }
 
 impl ProbeRequest<'_> {
+    const fn exchange_kind(self) -> ExchangeKind {
+        match self {
+            Self::Finder => ExchangeKind::Finder,
+            Self::Review {
+                kind: ReviewKind::Critic,
+                ..
+            } => ExchangeKind::CriticReview,
+            Self::Review {
+                kind: ReviewKind::User,
+                ..
+            } => ExchangeKind::UserReview,
+        }
+    }
+
     const fn requested_limit(self) -> u32 {
         match self {
             Self::Finder => NEW_RELEASES_LIMIT,
@@ -332,7 +545,7 @@ impl DiagnosticCanary {
     async fn execute(&mut self, request: ProbeRequest<'_>) -> Execution {
         if !self.budget.reserve() {
             return Execution {
-                report: skipped_report(),
+                report: skipped_report(request),
                 candidate_slug: None,
                 budget_exhausted: true,
             };
@@ -342,7 +555,7 @@ impl DiagnosticCanary {
             Ok(response) => response,
             Err(()) => {
                 return Execution {
-                    report: rejected_transport_report(),
+                    report: rejected_transport_report(request),
                     candidate_slug: None,
                     budget_exhausted: false,
                 };
@@ -380,6 +593,7 @@ impl DiagnosticCanary {
         };
 
         DiagnosticReport {
+            schema_version: DIAGNOSTIC_SCHEMA_VERSION,
             mode: self.mode,
             request_count: self.budget.attempts,
             request_ceiling: self.budget.ceiling,
@@ -395,8 +609,9 @@ fn is_accepted(exchanges: &[ExchangeReport]) -> bool {
         .all(|report| report.parser == ParserOutcome::Accepted)
 }
 
-fn skipped_report() -> ExchangeReport {
+fn skipped_report(request: ProbeRequest<'_>) -> ExchangeReport {
     ExchangeReport {
+        request: request.exchange_kind(),
         status_category: StatusCategory::NotAttempted,
         expected_content_type: false,
         utf8: false,
@@ -411,8 +626,9 @@ fn skipped_report() -> ExchangeReport {
     }
 }
 
-fn rejected_transport_report() -> ExchangeReport {
+fn rejected_transport_report(request: ProbeRequest<'_>) -> ExchangeReport {
     ExchangeReport {
+        request: request.exchange_kind(),
         status_category: StatusCategory::Other,
         expected_content_type: false,
         utf8: false,
@@ -431,7 +647,11 @@ fn inspect_response(request: ProbeRequest<'_>, response: DiagnosticResponse) -> 
     let status_category = status_category(response.status);
     if status_category != StatusCategory::Ok || !response.content_type_is_json {
         return Execution {
-            report: rejected_response_report(status_category, response.content_type_is_json),
+            report: rejected_response_report(
+                request,
+                status_category,
+                response.content_type_is_json,
+            ),
             candidate_slug: None,
             budget_exhausted: false,
         };
@@ -439,7 +659,7 @@ fn inspect_response(request: ProbeRequest<'_>, response: DiagnosticResponse) -> 
 
     if response.body.len() > MAX_RESPONSE_BYTES {
         return Execution {
-            report: rejected_response_report(status_category, true),
+            report: rejected_response_report(request, status_category, true),
             candidate_slug: None,
             budget_exhausted: false,
         };
@@ -447,7 +667,7 @@ fn inspect_response(request: ProbeRequest<'_>, response: DiagnosticResponse) -> 
 
     let Ok(body) = String::from_utf8(response.body) else {
         return Execution {
-            report: rejected_response_report(status_category, true),
+            report: rejected_response_report(request, status_category, true),
             candidate_slug: None,
             budget_exhausted: false,
         };
@@ -488,6 +708,7 @@ fn inspect_response(request: ProbeRequest<'_>, response: DiagnosticResponse) -> 
 
     Execution {
         report: ExchangeReport {
+            request: request.exchange_kind(),
             status_category,
             expected_content_type: true,
             utf8: true,
@@ -506,10 +727,12 @@ fn inspect_response(request: ProbeRequest<'_>, response: DiagnosticResponse) -> 
 }
 
 fn rejected_response_report(
+    request: ProbeRequest<'_>,
     status_category: StatusCategory,
     expected_content_type: bool,
 ) -> ExchangeReport {
     ExchangeReport {
+        request: request.exchange_kind(),
         status_category,
         expected_content_type,
         utf8: false,
@@ -866,6 +1089,236 @@ fn json_without_next(body: &str) -> String {
     serde_json::to_string(&value).expect("fixture must serialize")
 }
 
+fn valid_exchange(request: ExchangeKind, item_count: u64) -> ExchangeReport {
+    ExchangeReport {
+        request,
+        status_category: StatusCategory::Ok,
+        expected_content_type: true,
+        utf8: true,
+        json: true,
+        item_count,
+        numeric_total: true,
+        continuation_presence: ContinuationPresence::Missing,
+        href_presence: HrefPresence::NotApplicable,
+        link_checks: LinkChecks::unchecked(),
+        parser: ParserOutcome::Accepted,
+        safe_category: SafeCategory::OtherMandatoryStage,
+    }
+}
+
+fn report_with_terminal(
+    mode: DiagnosticMode,
+    terminal_verdict: TerminalVerdict,
+) -> DiagnosticReport {
+    let count = match terminal_verdict {
+        TerminalVerdict::AccessDenied
+        | TerminalVerdict::RateLimited
+        | TerminalVerdict::SourceRejected
+        | TerminalVerdict::NoCandidate => 1,
+        TerminalVerdict::FixtureValidated
+        | TerminalVerdict::ContractReady
+        | TerminalVerdict::RequestBudgetExhausted => mode.ceiling(),
+    };
+    let mut exchanges = [
+        valid_exchange(ExchangeKind::Finder, 1),
+        valid_exchange(ExchangeKind::CriticReview, 1),
+        valid_exchange(ExchangeKind::UserReview, 1),
+    ]
+    .into_iter()
+    .take(usize::from(count))
+    .collect::<Vec<_>>();
+
+    match terminal_verdict {
+        TerminalVerdict::AccessDenied => {
+            exchanges[0].status_category = StatusCategory::Forbidden;
+            exchanges[0].parser = ParserOutcome::Rejected;
+            exchanges[0].utf8 = false;
+            exchanges[0].json = false;
+            exchanges[0].item_count = 0;
+            exchanges[0].numeric_total = false;
+            exchanges[0].continuation_presence = ContinuationPresence::NotChecked;
+            exchanges[0].href_presence = HrefPresence::NotApplicable;
+        }
+        TerminalVerdict::RateLimited => {
+            exchanges[0].status_category = StatusCategory::RateLimited;
+            exchanges[0].parser = ParserOutcome::Rejected;
+            exchanges[0].utf8 = false;
+            exchanges[0].json = false;
+            exchanges[0].item_count = 0;
+            exchanges[0].numeric_total = false;
+            exchanges[0].continuation_presence = ContinuationPresence::NotChecked;
+            exchanges[0].href_presence = HrefPresence::NotApplicable;
+        }
+        TerminalVerdict::SourceRejected => {
+            exchanges[0].status_category = StatusCategory::Other;
+            exchanges[0].parser = ParserOutcome::Rejected;
+            exchanges[0].utf8 = false;
+            exchanges[0].json = false;
+            exchanges[0].item_count = 0;
+            exchanges[0].numeric_total = false;
+            exchanges[0].continuation_presence = ContinuationPresence::NotChecked;
+            exchanges[0].href_presence = HrefPresence::NotApplicable;
+        }
+        TerminalVerdict::NoCandidate => exchanges[0].item_count = 0,
+        TerminalVerdict::FixtureValidated
+        | TerminalVerdict::ContractReady
+        | TerminalVerdict::RequestBudgetExhausted => {}
+    }
+
+    DiagnosticReport {
+        schema_version: DIAGNOSTIC_SCHEMA_VERSION,
+        mode,
+        request_count: count,
+        request_ceiling: mode.ceiling(),
+        terminal_verdict,
+        exchanges,
+    }
+}
+
+fn cargo_harness_output(_test_name: &str, report: &str) -> String {
+    format!(
+        "\nrunning 1 test\n{report}\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+    )
+}
+
+fn run_wrapper_with_cargo_output(mode: &str, cargo_stdout: &str) -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEMPORARY_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("worker-source manifest must remain two directories below the repository root");
+    let temporary_root = std::env::temp_dir().join(format!(
+        "gamepulse-diagnostic-wrapper-{}-{}",
+        std::process::id(),
+        NEXT_TEMPORARY_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&temporary_root).expect("wrapper test directory must be created");
+    let cargo_path = temporary_root.join("cargo");
+    let output_path = temporary_root.join("cargo-output");
+    std::fs::write(
+        &cargo_path,
+        "#!/usr/bin/env bash\ncat \"$GAMEPULSE_TEST_CARGO_OUTPUT\"\nexit \"${GAMEPULSE_TEST_CARGO_EXIT:-0}\"\n",
+    )
+    .expect("wrapper test cargo shim must be written");
+    std::fs::set_permissions(&cargo_path, std::fs::Permissions::from_mode(0o700))
+        .expect("wrapper test cargo shim must be executable");
+    std::fs::write(&output_path, cargo_stdout).expect("wrapper test output must be written");
+
+    let mut path_entries = vec![temporary_root.clone()];
+    path_entries.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let output = Command::new("/bin/bash")
+        .arg(repository_root.join("scripts/diagnostic_canary.sh"))
+        .arg(mode)
+        .current_dir(repository_root)
+        .env(
+            "PATH",
+            std::env::join_paths(path_entries).expect("test PATH must be valid"),
+        )
+        .env("GAMEPULSE_TEST_CARGO_OUTPUT", &output_path)
+        .env("GAMEPULSE_TEST_CARGO_EXIT", "0")
+        .output()
+        .expect("diagnostic wrapper must start");
+
+    std::fs::remove_dir_all(&temporary_root).expect("wrapper test directory must be removed");
+    output
+}
+
+fn run_wrapper_with_unusable_tmpdir(mode: &str) -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEMPORARY_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("worker-source manifest must remain two directories below the repository root");
+    let temporary_root = std::env::temp_dir().join(format!(
+        "gamepulse-diagnostic-wrapper-tmpdir-{}-{}",
+        std::process::id(),
+        NEXT_TEMPORARY_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&temporary_root).expect("wrapper test directory must be created");
+    let cargo_path = temporary_root.join("cargo");
+    let output_path = temporary_root.join("cargo-output");
+    let unusable_tmpdir = temporary_root.join("unusable-tmpdir");
+    std::fs::write(
+        &cargo_path,
+        "#!/usr/bin/env bash\ncat \"$GAMEPULSE_TEST_CARGO_OUTPUT\"\nexit 0\n",
+    )
+    .expect("wrapper test cargo shim must be written");
+    std::fs::set_permissions(&cargo_path, std::fs::Permissions::from_mode(0o700))
+        .expect("wrapper test cargo shim must be executable");
+    std::fs::write(&output_path, "").expect("wrapper test output must be written");
+    std::fs::write(&unusable_tmpdir, "blocked").expect("unusable tmpdir marker must be written");
+
+    let mut path_entries = vec![temporary_root.clone()];
+    path_entries.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let output = Command::new("/bin/bash")
+        .arg(repository_root.join("scripts/diagnostic_canary.sh"))
+        .arg(mode)
+        .current_dir(repository_root)
+        .env(
+            "PATH",
+            std::env::join_paths(path_entries).expect("test PATH must be valid"),
+        )
+        .env("GAMEPULSE_TEST_CARGO_OUTPUT", &output_path)
+        .env("TMPDIR", &unusable_tmpdir)
+        .output()
+        .expect("diagnostic wrapper must start");
+
+    std::fs::remove_dir_all(&temporary_root).expect("wrapper test directory must be removed");
+    output
+}
+
+fn run_mutation_harness_with_failing_cargo() -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEMPORARY_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("worker-source manifest must remain two directories below the repository root");
+    let temporary_root = std::env::temp_dir().join(format!(
+        "gamepulse-diagnostic-mutation-{}-{}",
+        std::process::id(),
+        NEXT_TEMPORARY_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&temporary_root).expect("mutation test directory must be created");
+    let cargo_path = temporary_root.join("cargo");
+    std::fs::write(&cargo_path, "#!/usr/bin/env bash\nexit 42\n")
+        .expect("mutation test cargo shim must be written");
+    std::fs::set_permissions(&cargo_path, std::fs::Permissions::from_mode(0o700))
+        .expect("mutation test cargo shim must be executable");
+
+    let mut path_entries = vec![temporary_root.clone()];
+    path_entries.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let output = Command::new("/bin/bash")
+        .arg(repository_root.join("scripts/diagnostic_mutation.sh"))
+        .current_dir(repository_root)
+        .env(
+            "PATH",
+            std::env::join_paths(path_entries).expect("test PATH must be valid"),
+        )
+        .output()
+        .expect("diagnostic mutation harness must start");
+
+    std::fs::remove_dir_all(&temporary_root).expect("mutation test directory must be removed");
+    output
+}
+
 fn print_report(report: &DiagnosticReport) {
     println!("{}", report.render());
 }
@@ -877,7 +1330,7 @@ fn live_opted_in() {
 }
 
 #[tokio::test]
-async fn diagnostic_fixture_mode_exercises_the_three_request_path() {
+async fn diagnostic_fixture_report() {
     let report = DiagnosticCanary::fixture(
         DiagnosticMode::Fixture,
         [
@@ -899,7 +1352,34 @@ async fn diagnostic_fixture_mode_exercises_the_three_request_path() {
             && exchange.json
             && exchange.numeric_total
     }));
+    assert!(report.is_schema_valid());
     print_report(&report);
+}
+
+#[tokio::test]
+async fn diagnostic_fixture_validates_positive_finder_and_review_continuation_modes() {
+    let finder = DiagnosticCanary::fixture(DiagnosticMode::Finder, [fixture_response(LISTING)])
+        .run()
+        .await;
+    assert_eq!(finder.request_count, 1);
+    assert_eq!(finder.request_ceiling, 1);
+    assert_eq!(finder.terminal_verdict, TerminalVerdict::ContractReady);
+    assert!(finder.is_schema_valid());
+
+    let review = DiagnosticCanary::fixture(
+        DiagnosticMode::ReviewContinuation,
+        [
+            fixture_response(LISTING),
+            fixture_response(M011_CRITIC),
+            fixture_response(M011_USER),
+        ],
+    )
+    .run()
+    .await;
+    assert_eq!(review.request_count, 3);
+    assert_eq!(review.request_ceiling, 3);
+    assert_eq!(review.terminal_verdict, TerminalVerdict::ContractReady);
+    assert!(review.is_schema_valid());
 }
 
 #[tokio::test]
@@ -922,6 +1402,7 @@ async fn diagnostic_fixture_status_and_body_failures_stop_before_a_follow_up() {
         assert_eq!(report.terminal_verdict, expected_verdict);
         assert_eq!(report.exchanges[0].status_category, status_category(status));
         assert_eq!(report.exchanges[0].parser, ParserOutcome::Rejected);
+        assert!(report.is_schema_valid());
     }
 
     for response in [
@@ -936,7 +1417,25 @@ async fn diagnostic_fixture_status_and_body_failures_stop_before_a_follow_up() {
         assert_eq!(report.request_count, 1);
         assert_eq!(report.terminal_verdict, TerminalVerdict::SourceRejected);
         assert_eq!(report.exchanges[0].parser, ParserOutcome::Rejected);
+        assert!(report.is_schema_valid());
     }
+}
+
+#[tokio::test]
+async fn diagnostic_fixture_reports_no_candidate_as_valid_fail_closed_evidence() {
+    let mut body: Value = serde_json::from_str(LISTING).expect("fixture must be JSON");
+    body["data"]["items"] = serde_json::json!([]);
+    let body = serde_json::to_string(&body).expect("fixture must serialize");
+    let report = DiagnosticCanary::fixture(
+        DiagnosticMode::ReviewContinuation,
+        [fixture_response(&body)],
+    )
+    .run()
+    .await;
+
+    assert_eq!(report.request_count, 1);
+    assert_eq!(report.terminal_verdict, TerminalVerdict::NoCandidate);
+    assert!(report.is_schema_valid());
 }
 
 #[tokio::test]
@@ -1015,6 +1514,7 @@ async fn diagnostic_fixture_reports_continuation_and_href_shapes_without_source_
         assert_eq!(exchange.continuation_presence, continuation);
         assert_eq!(exchange.href_presence, href);
         assert_eq!(exchange.parser, parser);
+        assert!(report.is_schema_valid());
     }
 }
 
@@ -1024,6 +1524,7 @@ async fn diagnostic_fixture_reports_valid_and_invalid_link_relations() {
         .run()
         .await;
     assert_eq!(valid.exchanges[0].parser, ParserOutcome::Accepted);
+    assert!(valid.is_schema_valid());
     assert_eq!(
         valid.exchanges[0].link_checks,
         LinkChecks {
@@ -1052,6 +1553,7 @@ async fn diagnostic_fixture_reports_valid_and_invalid_link_relations() {
         let exchange = &report.exchanges[0];
         assert_eq!(exchange.parser, ParserOutcome::Rejected);
         assert_eq!(exchange.safe_category, SafeCategory::OtherMandatoryStage);
+        assert!(report.is_schema_valid());
         assert!(
             !exchange.link_checks.scheme
                 || !exchange.link_checks.host
@@ -1129,6 +1631,30 @@ async fn diagnostic_fixture_accepts_only_the_review_terminal_placeholder_shape()
 }
 
 #[tokio::test]
+async fn diagnostic_fixture_review_link_rejection_remains_parseable() {
+    let non_terminal =
+        M017_REVIEW_TERMINAL_EMPTY.replace("\"totalResults\": 0", "\"totalResults\": 1");
+    let report = DiagnosticCanary::fixture(
+        DiagnosticMode::ReviewContinuation,
+        [
+            fixture_response(LISTING),
+            fixture_response(M011_CRITIC),
+            fixture_response(&non_terminal),
+        ],
+    )
+    .run()
+    .await;
+
+    assert_eq!(report.request_count, 3);
+    assert_eq!(report.terminal_verdict, TerminalVerdict::SourceRejected);
+    assert_eq!(
+        report.exchanges[2].safe_category,
+        SafeCategory::ReviewContinuationLink
+    );
+    assert!(report.is_schema_valid());
+}
+
+#[tokio::test]
 async fn diagnostic_fixture_stops_early_and_fails_closed_at_the_request_ceiling() {
     let canary = DiagnosticCanary::fixture(
         DiagnosticMode::ReviewContinuation,
@@ -1172,7 +1698,7 @@ async fn diagnostic_fixture_stops_early_and_fails_closed_at_the_request_ceiling(
     assert_eq!(canary.budget.attempts, 3);
     assert_eq!(canary.transport.fixture_calls(), 3);
     let exhausted = canary.finish(
-        vec![first.report, second.report, third.report, fourth.report],
+        vec![first.report, second.report, third.report],
         true,
         fourth.budget_exhausted,
     );
@@ -1181,6 +1707,7 @@ async fn diagnostic_fixture_stops_early_and_fails_closed_at_the_request_ceiling(
         exhausted.terminal_verdict,
         TerminalVerdict::RequestBudgetExhausted
     );
+    assert!(exhausted.is_schema_valid());
 }
 
 #[tokio::test]
@@ -1215,6 +1742,314 @@ async fn diagnostic_privacy_output_never_contains_fixture_source_data() {
         );
     }
     assert_eq!(report.terminal_verdict, TerminalVerdict::SourceRejected);
+}
+
+#[test]
+fn diagnostic_report_schema_rejects_inconsistent_terminal_evidence() {
+    let mut report = report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady);
+    assert!(report.is_schema_valid());
+
+    report.terminal_verdict = TerminalVerdict::SourceRejected;
+    assert!(!report.is_schema_valid());
+
+    let mut invalid_link =
+        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady);
+    invalid_link.exchanges[0].href_presence = HrefPresence::String;
+    assert!(!invalid_link.is_schema_valid());
+}
+
+#[test]
+fn diagnostic_report_schema_rejects_impossible_exchange_truth_table_combinations() {
+    let valid = report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady);
+    assert!(valid.is_schema_valid());
+
+    let mut accepted_not_checked = valid.clone();
+    accepted_not_checked.exchanges[0].continuation_presence = ContinuationPresence::NotChecked;
+    assert!(!accepted_not_checked.is_schema_valid());
+
+    let mut accepted_finder_placeholder = valid.clone();
+    accepted_finder_placeholder.exchanges[0].continuation_presence = ContinuationPresence::Object;
+    accepted_finder_placeholder.exchanges[0].href_presence = HrefPresence::Missing;
+    assert!(!accepted_finder_placeholder.is_schema_valid());
+
+    let mut accepted_unchecked_link = valid.clone();
+    accepted_unchecked_link.exchanges[0].continuation_presence = ContinuationPresence::Object;
+    accepted_unchecked_link.exchanges[0].href_presence = HrefPresence::String;
+    assert!(!accepted_unchecked_link.is_schema_valid());
+
+    let mut rejected_not_attempted = valid.clone();
+    rejected_not_attempted.exchanges[0].parser = ParserOutcome::Rejected;
+    rejected_not_attempted.exchanges[0].status_category = StatusCategory::NotAttempted;
+    rejected_not_attempted.exchanges[0].continuation_presence = ContinuationPresence::NotChecked;
+    rejected_not_attempted.exchanges[0].href_presence = HrefPresence::NotApplicable;
+    rejected_not_attempted.terminal_verdict = TerminalVerdict::SourceRejected;
+    assert!(!rejected_not_attempted.is_schema_valid());
+
+    let mut rejected_inconsistent_presence = valid.clone();
+    rejected_inconsistent_presence.exchanges[0].parser = ParserOutcome::Rejected;
+    rejected_inconsistent_presence.exchanges[0].continuation_presence =
+        ContinuationPresence::Missing;
+    rejected_inconsistent_presence.exchanges[0].href_presence = HrefPresence::String;
+    rejected_inconsistent_presence.terminal_verdict = TerminalVerdict::SourceRejected;
+    assert!(!rejected_inconsistent_presence.is_schema_valid());
+
+    let mut finder_review_category = valid.clone();
+    finder_review_category.exchanges[0].parser = ParserOutcome::Rejected;
+    finder_review_category.exchanges[0].continuation_presence = ContinuationPresence::Object;
+    finder_review_category.exchanges[0].href_presence = HrefPresence::String;
+    finder_review_category.exchanges[0].link_checks = LinkChecks {
+        scheme: true,
+        host: true,
+        path: true,
+        query: true,
+        progression: true,
+        limit: true,
+        total_boundary: true,
+    };
+    finder_review_category.exchanges[0].safe_category = SafeCategory::ReviewContinuationLink;
+    finder_review_category.terminal_verdict = TerminalVerdict::SourceRejected;
+    assert!(!finder_review_category.is_schema_valid());
+
+    let mut incomplete_review_category = report_with_terminal(
+        DiagnosticMode::ReviewContinuation,
+        TerminalVerdict::ContractReady,
+    );
+    incomplete_review_category.exchanges[2].parser = ParserOutcome::Rejected;
+    incomplete_review_category.exchanges[2].continuation_presence = ContinuationPresence::Object;
+    incomplete_review_category.exchanges[2].href_presence = HrefPresence::String;
+    incomplete_review_category.exchanges[2].safe_category = SafeCategory::ReviewContinuationLink;
+    incomplete_review_category.exchanges[2].numeric_total = false;
+    incomplete_review_category.terminal_verdict = TerminalVerdict::SourceRejected;
+    assert!(!incomplete_review_category.is_schema_valid());
+}
+
+#[test]
+fn diagnostic_wrapper_accepts_positive_finder_and_review_reports() {
+    for (mode, test_name, report) in [
+        (
+            "fixture",
+            "diagnostic_fixture_report",
+            report_with_terminal(DiagnosticMode::Fixture, TerminalVerdict::FixtureValidated),
+        ),
+        (
+            "finder",
+            "diagnostic_live_finder",
+            report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady),
+        ),
+        (
+            "review-continuation",
+            "diagnostic_live_review_continuation",
+            report_with_terminal(
+                DiagnosticMode::ReviewContinuation,
+                TerminalVerdict::ContractReady,
+            ),
+        ),
+    ] {
+        assert!(report.is_schema_valid());
+        let rendered = report.render();
+        let output =
+            run_wrapper_with_cargo_output(mode, &cargo_harness_output(test_name, &rendered));
+        assert!(output.status.success());
+        assert_eq!(output.stdout, format!("{rendered}\n").as_bytes());
+        assert_eq!(output.stderr, b"");
+    }
+}
+
+#[test]
+fn diagnostic_wrapper_preserves_every_fail_closed_verdict_with_exit_three() {
+    for terminal_verdict in [
+        TerminalVerdict::AccessDenied,
+        TerminalVerdict::RateLimited,
+        TerminalVerdict::SourceRejected,
+        TerminalVerdict::NoCandidate,
+        TerminalVerdict::RequestBudgetExhausted,
+    ] {
+        let report = report_with_terminal(DiagnosticMode::ReviewContinuation, terminal_verdict);
+        assert!(report.is_schema_valid());
+        let rendered = report.render();
+        let output = run_wrapper_with_cargo_output(
+            "review-continuation",
+            &cargo_harness_output("diagnostic_live_review_continuation", &rendered),
+        );
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, format!("{rendered}\n").as_bytes());
+        assert_eq!(output.stderr, b"");
+    }
+}
+
+#[test]
+fn diagnostic_wrapper_fails_closed_on_invalid_or_noisy_zero_exit_output() {
+    let valid =
+        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady).render();
+    let harness = |report: &str| cargo_harness_output("diagnostic_live_finder", report);
+    let extra_sensitive_field = format!(
+        "{},\"source_path\":\"marker\"}}",
+        valid
+            .strip_suffix('}')
+            .expect("report must end in an object")
+    );
+    let mut invalid_cases = vec![
+        harness(""),
+        harness("{malformed"),
+        harness(&format!("{valid}\n{valid}")),
+        harness(&valid.replacen(
+            "\"mode\":\"finder\",",
+            "\"mode\":\"finder\",\"mode\":\"finder\",",
+            1,
+        )),
+        harness(&valid.replace("\"request_count\":1", "\"request_count\":\"1\"")),
+        harness(&valid.replace("\"request_count\":1", "\"request_count\":2")),
+        harness(&valid.replace("\"request_ceiling\":1", "\"request_ceiling\":3")),
+        harness(&valid.replace("\"request\":\"finder\"", "\"request\":\"critic_review\"")),
+        harness(&valid.replace(
+            "\"expected_content_type\":true",
+            "\"expected_content_type\":\"true\"",
+        )),
+        harness(&valid.replace(
+            "\"terminal_verdict\":\"contract_ready\"",
+            "\"terminal_verdict\":\"source_rejected\"",
+        )),
+        harness(&extra_sensitive_field),
+        format!("source noise\n{}", harness(&valid)),
+    ];
+
+    let mut accepted_not_checked =
+        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady);
+    accepted_not_checked.exchanges[0].continuation_presence = ContinuationPresence::NotChecked;
+    invalid_cases.push(harness(
+        &serde_json::to_string(&accepted_not_checked)
+            .expect("invalid aggregate report must serialize for wrapper validation"),
+    ));
+
+    let mut accepted_finder_placeholder =
+        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady);
+    accepted_finder_placeholder.exchanges[0].continuation_presence = ContinuationPresence::Object;
+    accepted_finder_placeholder.exchanges[0].href_presence = HrefPresence::Missing;
+    invalid_cases.push(harness(
+        &serde_json::to_string(&accepted_finder_placeholder)
+            .expect("invalid aggregate report must serialize for wrapper validation"),
+    ));
+
+    let mut accepted_unchecked_link =
+        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady);
+    accepted_unchecked_link.exchanges[0].continuation_presence = ContinuationPresence::Object;
+    accepted_unchecked_link.exchanges[0].href_presence = HrefPresence::String;
+    invalid_cases.push(harness(
+        &serde_json::to_string(&accepted_unchecked_link)
+            .expect("invalid aggregate report must serialize for wrapper validation"),
+    ));
+
+    let mut rejected_not_attempted =
+        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady);
+    rejected_not_attempted.exchanges[0].parser = ParserOutcome::Rejected;
+    rejected_not_attempted.exchanges[0].status_category = StatusCategory::NotAttempted;
+    rejected_not_attempted.exchanges[0].continuation_presence = ContinuationPresence::NotChecked;
+    rejected_not_attempted.exchanges[0].href_presence = HrefPresence::NotApplicable;
+    rejected_not_attempted.terminal_verdict = TerminalVerdict::SourceRejected;
+    invalid_cases.push(harness(
+        &serde_json::to_string(&rejected_not_attempted)
+            .expect("invalid aggregate report must serialize for wrapper validation"),
+    ));
+
+    let mut rejected_inconsistent_presence =
+        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady);
+    rejected_inconsistent_presence.exchanges[0].parser = ParserOutcome::Rejected;
+    rejected_inconsistent_presence.exchanges[0].href_presence = HrefPresence::String;
+    rejected_inconsistent_presence.terminal_verdict = TerminalVerdict::SourceRejected;
+    invalid_cases.push(harness(
+        &serde_json::to_string(&rejected_inconsistent_presence)
+            .expect("invalid aggregate report must serialize for wrapper validation"),
+    ));
+
+    let mut finder_review_category =
+        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady);
+    finder_review_category.exchanges[0].parser = ParserOutcome::Rejected;
+    finder_review_category.exchanges[0].continuation_presence = ContinuationPresence::Object;
+    finder_review_category.exchanges[0].href_presence = HrefPresence::String;
+    finder_review_category.exchanges[0].link_checks = LinkChecks {
+        scheme: true,
+        host: true,
+        path: true,
+        query: true,
+        progression: true,
+        limit: true,
+        total_boundary: true,
+    };
+    finder_review_category.exchanges[0].safe_category = SafeCategory::ReviewContinuationLink;
+    finder_review_category.terminal_verdict = TerminalVerdict::SourceRejected;
+    invalid_cases.push(harness(
+        &serde_json::to_string(&finder_review_category)
+            .expect("invalid aggregate report must serialize for wrapper validation"),
+    ));
+
+    for cargo_stdout in invalid_cases {
+        let output = run_wrapper_with_cargo_output("finder", &cargo_stdout);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.stdout, b"");
+        assert_eq!(output.stderr, b"diagnostic command failed\n");
+    }
+
+    let mut incomplete_review_category = report_with_terminal(
+        DiagnosticMode::ReviewContinuation,
+        TerminalVerdict::ContractReady,
+    );
+    incomplete_review_category.exchanges[2].parser = ParserOutcome::Rejected;
+    incomplete_review_category.exchanges[2].continuation_presence = ContinuationPresence::Object;
+    incomplete_review_category.exchanges[2].href_presence = HrefPresence::String;
+    incomplete_review_category.exchanges[2].safe_category = SafeCategory::ReviewContinuationLink;
+    incomplete_review_category.exchanges[2].numeric_total = false;
+    incomplete_review_category.terminal_verdict = TerminalVerdict::SourceRejected;
+    let output = run_wrapper_with_cargo_output(
+        "review-continuation",
+        &cargo_harness_output(
+            "diagnostic_live_review_continuation",
+            &serde_json::to_string(&incomplete_review_category)
+                .expect("invalid aggregate report must serialize for wrapper validation"),
+        ),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(output.stderr, b"diagnostic command failed\n");
+}
+
+#[test]
+fn diagnostic_wrapper_rejects_every_noncanonical_controlled_transcript() {
+    let valid =
+        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady).render();
+    let summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s";
+    let canonical = cargo_harness_output("diagnostic_live_finder", &valid);
+    let invalid_cases = [
+        format!("source noise\n{canonical}"),
+        canonical.replacen("\n.\n", "\n.\n.\n", 1),
+        format!("\n{valid}\nrunning 1 test\n.\n{summary}\n"),
+        format!("\nrunning 1 test\n.\n{summary}\n"),
+        format!("\nrunning 1 test\n{valid}\n{summary}\n"),
+        format!("\nrunning 1 test\n{valid}\n.\n"),
+        format!("{canonical}\n"),
+    ];
+
+    for cargo_stdout in invalid_cases {
+        let output = run_wrapper_with_cargo_output("finder", &cargo_stdout);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.stdout, b"");
+        assert_eq!(output.stderr, b"diagnostic command failed\n");
+    }
+}
+
+#[test]
+fn diagnostic_wrapper_hides_unusable_tmpdir_details() {
+    let output = run_wrapper_with_unusable_tmpdir("finder");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(output.stderr, b"diagnostic command failed\n");
+}
+
+#[test]
+fn diagnostic_mutation_harness_rejects_infrastructure_failures() {
+    let output = run_mutation_harness_with_failing_cargo();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stdout, b"request-ceiling: baseline_failed\n");
+    assert_eq!(output.stderr, b"");
 }
 
 #[test]

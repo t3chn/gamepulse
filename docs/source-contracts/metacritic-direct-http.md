@@ -211,15 +211,96 @@ info or fragment before it is sent. The isolated client sets only
 bounded timeout and body, and does not enable cookies, authentication, browser
 state, HTML, media, CDN, YouTube, or LLM traffic.
 
-Its sole output is a serialized aggregate report: mode, request count and
-ceiling, terminal verdict, status category, content-type/UTF-8/JSON booleans,
-item count, numeric-total boolean, continuation and href presence kinds,
-boolean link checks, parser accept/reject, and one fixed safe category. The
-report has no raw status, payload, review text, source identity, URL, header,
-cookie, credential, response body, or local path. `contract_ready` and
-`fixture_validated` are positive structural evidence; `access_denied`,
-`rate_limited`, `source_rejected`, `no_candidate`, and
-`request_budget_exhausted` are terminal fail-closed results.
+Its sole output is the M031 serialized aggregate report described below. It
+has no raw status, payload, review text, source identity, URL, header, cookie,
+credential, response body, or local path.
+
+## M031 validated aggregate report and process exit contract
+
+Every normal terminal diagnostic result is one minified JSON object conforming
+to `gamepulse.diagnostic.v1`. The wrapper accepts exactly one such object and
+prints that unchanged object as its complete stdout. It rejects any missing,
+malformed, duplicate, noisy, privacy-unsafe, or semantically inconsistent
+output. The fixture command remains local-only; it is the only command used by
+the repository's deterministic diagnostic tests.
+
+The v1 top-level object has exactly these fields and no others:
+
+| Field | Contract |
+| --- | --- |
+| `schema_version` | Exact string `gamepulse.diagnostic.v1`. |
+| `mode` | `fixture`, `finder`, or `review_continuation`; it must exactly match the wrapper mode. |
+| `request_count` | Exact positive integer count of budget-reserved diagnostic request attempts. It equals the number of exchange records and cannot exceed `request_ceiling`. It does not retroactively assert an exact wire count. |
+| `request_ceiling` | Exact integer `1` for finder and `3` for fixture or review-continuation. |
+| `terminal_verdict` | One allowed verdict listed below. |
+| `exchanges` | An ordered array with exactly `request_count` aggregate-only records. |
+
+Every exchange has exactly the fixed request kind (`finder`, then
+`critic_review`, then `user_review` as far as the count reaches), fixed status
+category, content-type/UTF-8/JSON booleans, non-negative integer item count,
+numeric-total boolean, continuation and `href` presence kinds, all seven
+boolean link checks, parser outcome, and fixed safe category. Unknown fields at
+any level are invalid; this intentionally excludes source-derived and
+path-bearing data.
+
+The following is the complete exchange truth table. Any combination not shown
+is invalid. `all false` means every link-check boolean is `false`; `all true`
+means every link-check boolean is `true`; `diagnostic evidence` means typed
+boolean evidence which cannot make the parser accepted.
+
+| Parser outcome | Status | Structural booleans | Continuation / href | Link checks | Safe category | Request kind |
+| --- | --- | --- | --- | --- | --- | --- |
+| `accepted` | `ok` | all four are `true` | `missing` / `not_applicable` | all false | `other_mandatory_stage` | any |
+| `accepted` | `ok` | all four are `true` | `object` / `missing` | all false | `other_mandatory_stage` | review only |
+| `accepted` | `ok` | all four are `true` | `object` / `string` | all true | `other_mandatory_stage` | any |
+| `rejected` | non-`ok`, never `not_attempted` | UTF-8, JSON, and numeric-total are `false`; expected-content-type is boolean evidence | `not_checked` / `not_applicable` | all false | `other_mandatory_stage` | any |
+| `rejected` | `ok` | JSON and numeric-total are `false`; expected-content-type and UTF-8 are boolean evidence; item count is zero | `not_checked` / `not_applicable` | all false | `other_mandatory_stage` | any |
+| `rejected` | `ok` | expected-content-type, UTF-8, and JSON are `true`; numeric-total is boolean evidence | `missing`, `null`, or `other` / `not_applicable` | all false | `other_mandatory_stage` | any |
+| `rejected` | `ok` | expected-content-type, UTF-8, and JSON are `true`; numeric-total is boolean evidence | `object` / `missing`, `null`, or `other` | all false | `other_mandatory_stage` | any |
+| `rejected` | `ok` | expected-content-type, UTF-8, JSON, and numeric-total are `true` | `object` / any href kind | diagnostic evidence | `review_continuation_link` | review only |
+| `rejected` | `ok` | expected-content-type, UTF-8, and JSON are `true`; numeric-total is boolean evidence | `object` / `string` | diagnostic evidence | `other_mandatory_stage` | any |
+
+In particular, `accepted` with `not_checked`, a non-review accepted
+`object`/`missing` continuation, a rejected `not_attempted` exchange, and a
+finder `review_continuation_link` category are impossible. The producer and
+wrapper enforce this same table.
+
+The semantic terminal rules are also part of the schema: positive
+`fixture_validated` is exactly the three local fixture exchanges, while
+positive `contract_ready` is exactly one accepted finder exchange or three
+accepted review-continuation exchanges, in each case with a non-empty finder
+aggregate. `access_denied` and `rate_limited` end at their first rejected
+exchange, respectively with `forbidden` and `rate_limited` status.
+`source_rejected` ends at its first rejected exchange with only `ok` or
+`other` status. `no_candidate` is one accepted empty finder exchange; and
+`request_budget_exhausted` has a full ceiling-sized accepted prefix.
+`not_attempted` is never emitted in a report. This makes a fail-closed result
+parseable evidence without making it positive evidence.
+
+Wrapper exit codes are deliberately separate from the underlying test process:
+
+| Exit | Meaning | stdout |
+| --- | --- | --- |
+| `0` | Valid `fixture_validated` or `contract_ready` report. | The one validated report. |
+| `3` | Valid fail-closed `access_denied`, `rate_limited`, `source_rejected`, `no_candidate`, or `request_budget_exhausted` report. | The one validated report. |
+| `1` | Internal/validation failure, including non-zero underlying process status, unavailable validator, invalid report, duplicate JSON, or noise. | Empty; stderr is exactly `diagnostic command failed`. |
+| `2` | Invalid wrapper mode. | No report. |
+
+The wrapper accepts one complete, exact transcript only: one leading empty
+line, `running 1 test`, one single-line JSON report, `.`, the Cargo success
+summary, and one trailing empty line.
+The report is the only JSON object. Reordered, repeated, missing, or additional
+framing; source noise; duplicate JSON keys; and every bad report shape are
+invalid. Wrapper setup, redirection, and cleanup errors use the same
+report-free safe failure path; cleanup is quiet and best-effort.
+
+M030 evidence is preserved without reinterpretation: exactly one
+review-continuation command invocation occurred, with no retry; its process
+exit status was `0`; no valid aggregate report supplied a numeric request count
+and trustworthy parser/structural fields; the exact wire count remains UNKNOWN
+within `0..3`; no narrow source/parser mismatch was proven; and repository and
+temporary-state cleanup remained clean. M031 does not recreate or fill in that
+missing live evidence.
 
 ## Remaining risks
 
