@@ -23,6 +23,10 @@ run = "cargo test --workspace --all-targets --locked"
 description = "Verify the Cargo workspace architecture contract"
 run = "cargo test --locked -p gamepulse --test architecture_fitness"
 
+[tasks.demo]
+description = "Start the deterministic local GamePulse preview"
+run = "bash scripts/demo.sh"
+
 [tasks.ci]
 description = "Run the local CI checks"
 run = [

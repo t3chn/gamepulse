@@ -1,10 +1,14 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process;
+use std::process::{self, Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use axum::body::to_bytes;
 use axum::http::StatusCode;
@@ -16,9 +20,15 @@ use gamepulse_application::{
 use gamepulse_storage_sqlite::{SqliteGameCatalogueReadStore, SqliteGameSnapshotStore};
 
 static NEXT_TEMPORARY_DATABASE: AtomicU64 = AtomicU64::new(0);
+static NEXT_BROWSER_SMOKE_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+const BROWSER_SMOKE_ATTEMPTS: usize = 40;
+const BROWSER_SMOKE_DELAY: Duration = Duration::from_millis(100);
+const BROWSER_INSPECTION_WINDOW: Duration = Duration::from_secs(40);
 
 struct TemporaryDatabase {
     path: PathBuf,
+    remove_on_drop: bool,
 }
 
 impl TemporaryDatabase {
@@ -29,15 +39,32 @@ impl TemporaryDatabase {
             process::id()
         ));
         let _ = fs::remove_file(&path);
-        Self { path }
+        Self {
+            path,
+            remove_on_drop: true,
+        }
+    }
+
+    fn retained(path: PathBuf) -> Self {
+        assert!(path.is_absolute(), "fixture database path must be absolute");
+        assert!(
+            !path.exists(),
+            "fixture database path must not already exist"
+        );
+        Self {
+            path,
+            remove_on_drop: false,
+        }
     }
 }
 
 impl Drop for TemporaryDatabase {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-        let _ = fs::remove_file(self.path.with_extension("sqlite3-shm"));
-        let _ = fs::remove_file(self.path.with_extension("sqlite3-wal"));
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(self.path.with_extension("sqlite3-shm"));
+            let _ = fs::remove_file(self.path.with_extension("sqlite3-wal"));
+        }
     }
 }
 
@@ -164,6 +191,17 @@ async fn read_response(response: Response) -> (StatusCode, String) {
     )
 }
 
+#[test]
+#[ignore = "manual source-disabled production UI smoke fixture setup"]
+fn seeds_deterministic_visual_fixture_at_requested_path() {
+    let path = std::env::var_os("GAMEPULSE_M019_FIXTURE_PATH")
+        .map(PathBuf::from)
+        .expect("GAMEPULSE_M019_FIXTURE_PATH must be set");
+    let database = TemporaryDatabase::retained(path);
+    let catalogue = fixture_catalogue(&database);
+    drop(catalogue);
+}
+
 fn assert_in_order(body: &str, fragments: &[&str]) {
     let mut previous = 0;
     for fragment in fragments {
@@ -173,6 +211,175 @@ fn assert_in_order(body: &str, fragments: &[&str]) {
             .unwrap_or_else(|| panic!("missing fragment {fragment:?} in response"));
         previous = found + fragment.len();
     }
+}
+
+struct BrowserSmokeDirectory {
+    path: PathBuf,
+}
+
+impl BrowserSmokeDirectory {
+    fn new() -> Self {
+        let sequence = NEXT_BROWSER_SMOKE_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "gamepulse-m019-browser-{}-{sequence}",
+            process::id()
+        ));
+        fs::create_dir(&path).expect("browser smoke directory must be created exactly once");
+        Self { path }
+    }
+
+    fn database_path(&self) -> PathBuf {
+        self.path.join("gamepulse.sqlite3")
+    }
+
+    fn log_path(&self) -> PathBuf {
+        self.path.join("gamepulse.log")
+    }
+}
+
+impl Drop for BrowserSmokeDirectory {
+    fn drop(&mut self) {
+        let database = self.database_path();
+        let _ = fs::remove_file(&database);
+        let _ = fs::remove_file(database.with_extension("sqlite3-shm"));
+        let _ = fs::remove_file(database.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(self.log_path());
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+struct BrowserSmokeProcess {
+    child: Child,
+}
+
+impl BrowserSmokeProcess {
+    fn shutdown(&mut self) {
+        let signal = Command::new("/bin/kill")
+            .arg("-INT")
+            .arg(self.child.id().to_string())
+            .status()
+            .expect("browser smoke SIGINT helper must start");
+        assert!(signal.success(), "browser smoke SIGINT helper must succeed");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(status.success(), "browser smoke binary must stop cleanly");
+                    return;
+                }
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => panic!("browser smoke binary did not stop within five seconds"),
+                Err(error) => panic!("browser smoke binary status check failed: {error}"),
+            }
+        }
+    }
+}
+
+impl Drop for BrowserSmokeProcess {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn reserve_loopback_port() -> u16 {
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("browser smoke must reserve a port");
+    let port = listener
+        .local_addr()
+        .expect("reserved browser smoke listener must have an address")
+        .port();
+    drop(listener);
+    port
+}
+
+fn browser_smoke_http_status(port: u16, target: &str) -> std::io::Result<u16> {
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&address, BROWSER_SMOKE_DELAY)?;
+    stream.set_read_timeout(Some(BROWSER_SMOKE_DELAY))?;
+    stream.write_all(
+        format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes(),
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse::<u16>().ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing HTTP status"))
+}
+
+#[test]
+#[ignore = "manual browser visual inspection of the source-disabled release binary"]
+fn source_disabled_release_fixture_stays_available_for_bounded_browser_inspection() {
+    let temporary = BrowserSmokeDirectory::new();
+    let database = TemporaryDatabase::retained(temporary.database_path());
+    let catalogue = fixture_catalogue(&database);
+    drop(catalogue);
+    drop(database);
+
+    let port = reserve_loopback_port();
+    let manifest_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_directory
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("gamepulse manifest must remain two levels below workspace root")
+        .to_path_buf();
+    let release_binary = workspace_root.join("target/release/gamepulse");
+    assert!(
+        release_binary.is_file(),
+        "build the release binary before browser inspection"
+    );
+    let log = fs::File::create(temporary.log_path()).expect("browser smoke log must be created");
+    let stdout = log
+        .try_clone()
+        .expect("browser smoke log must be cloneable for stdout");
+    let mut process = BrowserSmokeProcess {
+        child: Command::new(release_binary)
+            .env("GAMEPULSE_DATABASE_PATH", temporary.database_path())
+            .env("GAMEPULSE_HTTP_ADDRESS", format!("127.0.0.1:{port}"))
+            .env("GAMEPULSE_LOG_FORMAT", "human")
+            .env("GAMEPULSE_SOURCE_WORK_ENABLED", "false")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("source-disabled release binary must start"),
+    };
+    for attempt in 0..BROWSER_SMOKE_ATTEMPTS {
+        if matches!(browser_smoke_http_status(port, "/health/ready"), Ok(200)) {
+            break;
+        }
+        if attempt + 1 == BROWSER_SMOKE_ATTEMPTS {
+            panic!("source-disabled release binary did not become ready");
+        }
+        thread::sleep(BROWSER_SMOKE_DELAY);
+    }
+    assert_eq!(
+        browser_smoke_http_status(port, "/health/live")
+            .expect("browser smoke liveness request must return a status"),
+        200
+    );
+    assert_eq!(
+        browser_smoke_http_status(port, "/games")
+            .expect("browser smoke catalogue request must return a status"),
+        200
+    );
+    assert_eq!(
+        browser_smoke_http_status(port, "/games/101")
+            .expect("browser smoke detail request must return a status"),
+        200
+    );
+    println!("M019_BROWSER_READY http://127.0.0.1:{port}/games");
+    thread::sleep(BROWSER_INSPECTION_WINDOW);
+    process.shutdown();
+    let log = fs::read_to_string(temporary.log_path()).expect("browser smoke log must be readable");
+    assert!(log.contains("source work disabled"));
+    assert!(log.contains("process started"));
+    assert!(log.contains("process stopped"));
 }
 
 #[tokio::test]
@@ -195,9 +402,25 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
             "href=\"/games/105\">Echo",
         ],
     );
-    assert!(all_games.contains("Metascore: Not stored"));
-    assert!(all_games.contains("src=\"https://www.metacritic.com/images/example-game.jpg\""));
-    assert!(all_games.contains("<p>Cover unavailable.</p>"));
+    assert!(
+        all_games
+            .contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
+    );
+    assert!(all_games.contains("<main id=\"main-content\" class=\"page-shell\">"));
+    assert!(all_games.contains(
+        "<form class=\"catalogue-controls\" action=\"/games\" method=\"get\" role=\"search\">"
+    ));
+    assert!(all_games.contains("<ol class=\"game-grid\" aria-label=\"Stored games\">"));
+    assert!(all_games.contains("class=\"cover-placeholder\" aria-hidden=\"true\""));
+    assert!(all_games.contains("Cover reference stored · external image not loaded"));
+    assert!(all_games.contains("No local cover image stored"));
+    assert!(all_games.contains("class=\"score-badge__label\">Metascore"));
+    assert!(
+        all_games
+            .contains("background: var(--primary-strong); color: var(--canvas); font-weight: 800;")
+    );
+    assert!(!all_games.contains("<img"));
+    assert!(!all_games.contains("src=\"https://www.metacritic.com/images/example-game.jpg\""));
 
     let (status, search) = read_response(
         gamepulse_web::catalogue_response(Arc::clone(&catalogue), Some("q=aLpHa")).await,
@@ -206,6 +429,7 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
     assert_eq!(status, StatusCode::OK);
     assert!(search.contains("href=\"/games/101\">Alpha"));
     assert!(!search.contains("href=\"/games/102\">Beta"));
+    assert!(search.contains("value=\"aLpHa\""));
 
     let (status, platform) = read_response(
         gamepulse_web::catalogue_response(Arc::clone(&catalogue), Some("platform=PC")).await,
@@ -227,10 +451,19 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
         read_response(gamepulse_web::game_detail_response(Arc::clone(&catalogue), 101).await).await;
     assert_eq!(status, StatusCode::OK);
     assert!(detail.contains("Alpha &#60;untrusted&#62; description"));
-    assert!(detail.contains("src=\"https://www.metacritic.com/images/example-game.jpg\""));
-    assert!(detail.contains("onerror=\"this.onerror=null;this.replaceWith(document.createTextNode('Cover unavailable.'))\""));
+    assert!(detail.contains("<nav class=\"breadcrumb\" aria-label=\"Breadcrumb\">"));
+    assert!(detail.contains(
+        "<div class=\"cover-placeholder cover-placeholder--large\" aria-hidden=\"true\">GP</div>"
+    ));
+    assert!(detail.contains("<caption>Stored score comparison by platform</caption>"));
+    assert!(detail.contains("<th scope=\"col\">Userscore</th>"));
+    assert!(detail.contains("<details class=\"provenance\">"));
+    assert!(!detail.contains("<img"));
+    assert!(!detail.contains("src=\"https://www.metacritic.com/images/example-game.jpg\""));
     assert!(detail.contains("products/example"));
-    assert!(detail.contains("href=\"https://video.example.test/embed\""));
+    assert!(detail.contains(
+        "href=\"https://video.example.test/embed\" rel=\"noopener noreferrer\" target=\"_blank\""
+    ));
     assert_in_order(
         &detail,
         &[
@@ -246,7 +479,7 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
         read_response(gamepulse_web::game_detail_response(Arc::clone(&catalogue), 104).await).await;
     assert_eq!(status, StatusCode::OK);
     assert!(linked_detail.contains("<h1>Delta</h1>"));
-    assert!(linked_detail.contains("<p>Cover unavailable.</p>"));
+    assert!(linked_detail.contains("No local cover image stored"));
 
     let (status, empty) = read_response(
         gamepulse_web::catalogue_response(Arc::clone(&catalogue), Some("q=missing")).await,
@@ -254,9 +487,19 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(empty.contains("No stored games match this catalogue query."));
+    assert!(empty.contains(
+        "<section class=\"empty-state\" aria-labelledby=\"empty-title\" role=\"status\">"
+    ));
+    assert!(empty.contains("href=\"/games\">Clear catalogue filters</a>"));
 
     let (status, not_found) =
         read_response(gamepulse_web::game_detail_response(catalogue, 999).await).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(not_found.is_empty());
+    assert!(not_found.contains("<main id=\"main-content\" class=\"page-shell\">"));
+    assert!(
+        not_found.contains(
+            "<section class=\"empty-state not-found\" aria-labelledby=\"not-found-title\">"
+        )
+    );
+    assert!(not_found.contains("This game is not in the stored catalogue."));
 }

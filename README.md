@@ -97,6 +97,20 @@ export GAMEPULSE_SOURCE_WORK_ENABLED="false"
 cargo run --locked -p gamepulse
 ```
 
+### Deterministic local demo
+
+```bash
+mise run demo
+```
+
+The command checks that `127.0.0.1:3000` is free, builds the existing release
+binary offline, seeds deterministic local SQLite fixture data, and starts the
+source-disabled UI at [http://127.0.0.1:3000/games](http://127.0.0.1:3000/games).
+It uses embedded assets and loopback requests only. Press `Ctrl-C` to stop the
+server; the bounded temporary fixture directory is removed on shutdown. If the
+port is occupied or loopback binding is unavailable, the command exits without
+leaving fixture data behind.
+
 Logging is local-only. It records fixed lifecycle, HTTP method/normalized route
 class/process-local request-ID/status/elapsed-time, scheduler, durable-job,
 source-stage, optional-cover-category, and review-summary-category fields. It
