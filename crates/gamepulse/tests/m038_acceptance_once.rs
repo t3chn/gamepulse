@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use acceptance::{
-    AcceptanceCommand, AcceptanceTerminal, database_path_is_fresh, parse_entry_command,
-    run_acceptance_once,
+    ACCEPTANCE_HELP, AcceptanceCommand, AcceptanceTerminal, database_path_is_fresh,
+    parse_entry_command, run_acceptance_once,
 };
 use gamepulse_application::{
     AcceptanceCycleReadPort, AcceptanceCycleSnapshot, AsyncDailyCrawlSourcePort,
@@ -495,8 +495,10 @@ fn acceptance_command_defaults_to_twenty_requires_a_fresh_absolute_database_and_
         std::ffi::OsString::from("acceptance-once"),
         std::ffi::OsString::from("--database"),
         std::ffi::OsString::from("/tmp/gamepulse-m038-fresh.sqlite3"),
+        std::ffi::OsString::from("--target"),
+        std::ffi::OsString::from("20"),
         std::ffi::OsString::from("--deadline-seconds"),
-        std::ffi::OsString::from("60"),
+        std::ffi::OsString::from("180"),
     ])
     .expect("command must parse");
     let acceptance::EntryCommand::Acceptance(command) = command else {
@@ -580,20 +582,60 @@ fn acceptance_command_defaults_to_twenty_requires_a_fresh_absolute_database_and_
 }
 
 #[test]
-fn malformed_or_missing_explicit_target_exits_two_without_opening_sqlite() {
-    for target in [Some("twenty"), None] {
-        let database = TemporaryDatabase::new("invalid-target");
+fn acceptance_help_exits_successfully_before_runtime_composition() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_gamepulse"))
+        .arg("acceptance-once")
+        .arg("--help")
+        .output()
+        .expect("fixture binary must start for help");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, ACCEPTANCE_HELP.as_bytes());
+    assert!(output.stderr.is_empty());
+    assert!(ACCEPTANCE_HELP.contains("--database <ABSOLUTE_DATABASE_PATH>"));
+    assert!(ACCEPTANCE_HELP.contains("--target 20"));
+    assert!(ACCEPTANCE_HELP.contains("--deadline-seconds <POSITIVE_SECONDS>"));
+}
+
+#[test]
+fn malformed_or_missing_acceptance_arguments_exit_two_without_opening_sqlite() {
+    let database = TemporaryDatabase::new("invalid-arguments");
+    let database_argument = database.path.as_os_str().to_os_string();
+    let invalid_argument_sets = vec![
+        vec![
+            std::ffi::OsString::from("--deadline-seconds"),
+            std::ffi::OsString::from("1"),
+        ],
+        vec![
+            std::ffi::OsString::from("--database"),
+            database_argument.clone(),
+        ],
+        vec![
+            std::ffi::OsString::from("--database"),
+            database_argument.clone(),
+            std::ffi::OsString::from("--deadline-seconds"),
+            std::ffi::OsString::from("0"),
+        ],
+        vec![
+            std::ffi::OsString::from("--database"),
+            database_argument.clone(),
+            std::ffi::OsString::from("--deadline-seconds"),
+            std::ffi::OsString::from("1"),
+            std::ffi::OsString::from("--target"),
+            std::ffi::OsString::from("twenty"),
+        ],
+        vec![
+            std::ffi::OsString::from("--database"),
+            database_argument,
+            std::ffi::OsString::from("--deadline-seconds"),
+            std::ffi::OsString::from("1"),
+            std::ffi::OsString::from("--target"),
+        ],
+    ];
+
+    for arguments in invalid_argument_sets {
         let mut process = std::process::Command::new(env!("CARGO_BIN_EXE_gamepulse"));
-        process
-            .arg("acceptance-once")
-            .arg("--database")
-            .arg(&database.path)
-            .arg("--deadline-seconds")
-            .arg("1")
-            .arg("--target");
-        if let Some(target) = target {
-            process.arg(target);
-        }
+        process.arg("acceptance-once").args(arguments);
 
         let output = process
             .output()

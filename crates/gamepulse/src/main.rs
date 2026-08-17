@@ -112,6 +112,9 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(EntryCommand::AcceptanceHelp) => {
+            print!("{}", acceptance::ACCEPTANCE_HELP);
+        }
         Ok(EntryCommand::Acceptance(command)) => {
             let report = run_acceptance(command).await;
             println!("{}", report.to_json());

@@ -182,12 +182,22 @@ mutation testing begins when meaningful critical behavior exists.
 
 The explicit acceptance command is separate from ordinary service startup. It
 expects a fresh absolute database path and never deletes a caller file or its
-SQLite sidecars. Create and remove the temporary directory yourself:
+SQLite sidecars. Inspect the canonical offline help route first:
+
+```bash
+cargo run --locked --offline -p gamepulse -- acceptance-once --help
+```
+
+It documents the same command shape as the runnable template: a fresh absolute
+`--database` path, an optional explicit `--target 20`, and a required positive
+`--deadline-seconds` hard deadline. Create and remove the temporary directory
+yourself:
 
 ```bash
 acceptance_dir="$(mktemp -d /tmp/gamepulse-acceptance.XXXXXX)"
-cargo run --locked -p gamepulse -- acceptance-once \
+cargo run --locked --offline -p gamepulse -- acceptance-once \
   --database "$acceptance_dir/gamepulse.sqlite3" \
+  --target 20 \
   --deadline-seconds 180
 rm -rf -- "$acceptance_dir"
 ```

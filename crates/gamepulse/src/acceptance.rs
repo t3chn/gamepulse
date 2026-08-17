@@ -14,10 +14,21 @@ use crate::runtime::{Runtime, RuntimeClock, RuntimeTaskOutcome};
 
 pub const ACCEPTANCE_SUBCOMMAND: &str = "acceptance-once";
 pub const ACCEPTANCE_SCHEMA_VERSION: &str = "gamepulse.acceptance.v1";
+pub const ACCEPTANCE_HELP: &str = concat!(
+    "Usage:\n",
+    "  gamepulse acceptance-once --database <ABSOLUTE_DATABASE_PATH> --deadline-seconds <POSITIVE_SECONDS> [--target 20]\n\n",
+    "Run one evaluator acceptance cycle without starting the HTTP server or scheduler loop.\n\n",
+    "Options:\n",
+    "  --database <ABSOLUTE_DATABASE_PATH>  Required fresh absolute SQLite path.\n",
+    "  --deadline-seconds <POSITIVE_SECONDS>  Required positive hard deadline.\n",
+    "  --target 20  Optional explicit mandatory target; only 20 is accepted.\n",
+    "  --help  Show this help and exit.\n",
+);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EntryCommand {
     Serve,
+    AcceptanceHelp,
     Acceptance(AcceptanceCommand),
 }
 
@@ -71,6 +82,19 @@ pub fn parse_entry_command(
     if command.as_os_str() != OsStr::new(ACCEPTANCE_SUBCOMMAND) {
         return Err(CommandParseError);
     }
+
+    let first_argument = arguments.next();
+    if matches!(
+        first_argument.as_ref(),
+        Some(argument) if argument.as_os_str() == OsStr::new("--help")
+    ) {
+        return if arguments.next().is_none() {
+            Ok(EntryCommand::AcceptanceHelp)
+        } else {
+            Err(CommandParseError)
+        };
+    }
+    let mut arguments = first_argument.into_iter().chain(arguments);
 
     let mut database_path = None;
     let mut deadline_seconds = None;
