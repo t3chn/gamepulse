@@ -190,16 +190,28 @@ cargo run --locked --offline -p gamepulse -- acceptance-once --help
 
 It documents the same command shape as the runnable template: a fresh absolute
 `--database` path, an optional explicit `--target 20`, and a required positive
-`--deadline-seconds` hard deadline. Create and remove the temporary directory
-yourself:
+`--deadline-seconds` hard deadline. Keep the directory assignment as its own
+shell command: do not prefix `cargo run` with `acceptance_dir=...`, because
+shell argument expansion can then observe an unset path. This bounded subshell
+checks the generated path, forwards one quoted value to the binary, and removes
+only its caller-created temporary directory:
 
 ```bash
-acceptance_dir="$(mktemp -d /tmp/gamepulse-acceptance.XXXXXX)"
-cargo run --locked --offline -p gamepulse -- acceptance-once \
-  --database "$acceptance_dir/gamepulse.sqlite3" \
-  --target 20 \
-  --deadline-seconds 180
-rm -rf -- "$acceptance_dir"
+(
+  acceptance_dir="$(mktemp -d /tmp/gamepulse-acceptance.XXXXXX)" || exit 1
+  case "$acceptance_dir" in
+    /tmp/gamepulse-acceptance.*) ;;
+    *) printf '%s\n' 'acceptance temporary directory is invalid' >&2; exit 2 ;;
+  esac
+  database_path="$acceptance_dir/gamepulse.sqlite3"
+  cargo run --locked --offline -p gamepulse -- acceptance-once \
+    --database "$database_path" \
+    --target 20 \
+    --deadline-seconds 180
+  command_status=$?
+  rm -rf -- "$acceptance_dir"
+  exit "$command_status"
+)
 ```
 
 The command defaults to the current mandatory target of 20 only when `--target`

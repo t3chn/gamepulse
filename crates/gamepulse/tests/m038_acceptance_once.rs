@@ -8,8 +8,10 @@ mod runtime;
 
 use std::fs;
 use std::future::{Future, pending};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +39,53 @@ use runtime::{Runtime, RuntimeClock, RuntimeClockError, RuntimeConfig};
 
 static NEXT_DATABASE: AtomicUsize = AtomicUsize::new(0);
 
+const DOCUMENTED_HELP_COMMAND: &str =
+    "cargo run --locked --offline -p gamepulse -- acceptance-once --help";
+const DOCUMENTED_RUN_TEMPLATE_BODY: &str = concat!(
+    "  case \"$acceptance_dir\" in\n",
+    "    /tmp/gamepulse-acceptance.*) ;;\n",
+    "    *) printf '%s\\n' 'acceptance temporary directory is invalid' >&2; exit 2 ;;\n",
+    "  esac\n",
+    "  database_path=\"$acceptance_dir/gamepulse.sqlite3\"\n",
+    "  cargo run --locked --offline -p gamepulse -- acceptance-once \\\n",
+    "    --database \"$database_path\" \\\n",
+    "    --target 20 \\\n",
+    "    --deadline-seconds 180\n",
+    "  command_status=$?\n",
+    "  rm -rf -- \"$acceptance_dir\"\n",
+    "  exit \"$command_status\"\n",
+    ")\n",
+);
+const M041_CARGO_WRAPPER: &str = r#"#!/bin/sh
+printf '%s\n' "$@" > "$GAMEPULSE_M041_ARGUMENT_RECORD"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--" ]; then
+    shift
+    break
+  fi
+  shift
+done
+database_path=""
+database_value_next=false
+for argument in "$@"; do
+  if [ "$database_value_next" = true ]; then
+    database_path="$argument"
+    break
+  fi
+  if [ "$argument" = "--database" ]; then
+    database_value_next=true
+  fi
+done
+"$GAMEPULSE_M041_BINARY" "$@"
+status=$?
+if [ ! -e "$database_path" ] && [ -f "$database_path-wal" ] && [ "$(cat "$database_path-wal")" = "caller-owned-sidecar" ]; then
+  printf '%s\n' 'database_not_opened_before_runtime_composition' > "$GAMEPULSE_M041_COMPOSITION_RECORD"
+else
+  printf '%s\n' 'database_or_sidecar_changed' > "$GAMEPULSE_M041_COMPOSITION_RECORD"
+fi
+exit "$status"
+"#;
+
 struct TemporaryDatabase {
     path: PathBuf,
 }
@@ -60,6 +109,81 @@ impl Drop for TemporaryDatabase {
         let _ = fs::remove_file(&self.path);
         let _ = fs::remove_file(self.path.with_extension("sqlite3-shm"));
         let _ = fs::remove_file(self.path.with_extension("sqlite3-wal"));
+    }
+}
+
+struct TemporaryInvocationHarness {
+    root: PathBuf,
+    acceptance_dir: PathBuf,
+}
+
+impl TemporaryInvocationHarness {
+    fn new() -> Self {
+        let sequence = NEXT_DATABASE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "gamepulse-m041-invocation-{}-{sequence}",
+            std::process::id()
+        ));
+        let acceptance_dir = PathBuf::from("/tmp").join(format!(
+            "gamepulse-acceptance.m041 safe path-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("M041 harness directory must be created");
+        fs::create_dir(&acceptance_dir).expect("M041 acceptance directory must be created");
+        Self {
+            root,
+            acceptance_dir,
+        }
+    }
+
+    fn database_path(&self) -> PathBuf {
+        self.acceptance_dir.join("gamepulse.sqlite3")
+    }
+
+    fn argument_record(&self) -> PathBuf {
+        self.root.join("cargo-arguments")
+    }
+
+    fn composition_record(&self) -> PathBuf {
+        self.root.join("composition-guard")
+    }
+
+    fn write_cargo_wrapper(&self) {
+        let bin = self.root.join("bin");
+        fs::create_dir(&bin).expect("M041 cargo wrapper directory must be created");
+        let wrapper = bin.join("cargo");
+        fs::write(&wrapper, M041_CARGO_WRAPPER).expect("M041 cargo wrapper must be written");
+        let mut permissions = fs::metadata(&wrapper)
+            .expect("M041 cargo wrapper metadata must be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(wrapper, permissions).expect("M041 cargo wrapper must be executable");
+    }
+
+    fn shell(&self, script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.root.join("bin").display()),
+            )
+            .env("GAMEPULSE_M041_ACCEPTANCE_DIR", &self.acceptance_dir)
+            .env("GAMEPULSE_M041_ARGUMENT_RECORD", self.argument_record())
+            .env(
+                "GAMEPULSE_M041_COMPOSITION_RECORD",
+                self.composition_record(),
+            )
+            .env("GAMEPULSE_M041_BINARY", env!("CARGO_BIN_EXE_gamepulse"));
+        command
+    }
+}
+
+impl Drop for TemporaryInvocationHarness {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(&self.acceptance_dir);
     }
 }
 
@@ -595,6 +719,106 @@ fn acceptance_help_exits_successfully_before_runtime_composition() {
     assert!(ACCEPTANCE_HELP.contains("--database <ABSOLUTE_DATABASE_PATH>"));
     assert!(ACCEPTANCE_HELP.contains("--target 20"));
     assert!(ACCEPTANCE_HELP.contains("--deadline-seconds <POSITIVE_SECONDS>"));
+}
+
+#[test]
+fn documented_offline_shell_template_forwards_a_quoted_database_path_without_composition() {
+    let readme = include_str!("../../../README.md");
+    let documented_template = format!(
+        "(\n  acceptance_dir=\"$(mktemp -d /tmp/gamepulse-acceptance.XXXXXX)\" || exit 1\n{DOCUMENTED_RUN_TEMPLATE_BODY}"
+    );
+    assert!(
+        readme.contains(DOCUMENTED_HELP_COMMAND),
+        "README must preserve the canonical offline help command"
+    );
+    assert!(
+        readme.contains(&documented_template),
+        "README and process test must share the canonical command shape"
+    );
+
+    let harness = TemporaryInvocationHarness::new();
+    harness.write_cargo_wrapper();
+    let help = harness
+        .shell(DOCUMENTED_HELP_COMMAND)
+        .output()
+        .expect("documented help shell command must start");
+    assert!(help.status.success());
+    assert_eq!(help.stdout, ACCEPTANCE_HELP.as_bytes());
+    assert!(help.stderr.is_empty());
+
+    let database_path = harness.database_path();
+    assert!(database_path.is_absolute());
+    assert!(
+        !database_path.exists(),
+        "test database file must start fresh and non-empty as a path value"
+    );
+    fs::write(
+        PathBuf::from(format!("{}-wal", database_path.display())),
+        b"caller-owned-sidecar",
+    )
+    .expect("caller-owned sidecar must guard the no-composition process test");
+
+    for command in [
+        "cargo run --locked --offline -p gamepulse -- acceptance-once --deadline-seconds 180"
+            .to_string(),
+        "cargo run --locked --offline -p gamepulse -- acceptance-once --database '' --target 20 --deadline-seconds 180"
+            .to_string(),
+    ] {
+        let output = harness
+            .shell(&command)
+            .output()
+            .expect("invalid documented-shape shell command must start");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, b"invalid command\n");
+        assert!(
+            !database_path.exists(),
+            "invalid arguments must stop before SQLite opens"
+        );
+    }
+
+    let test_template = format!(
+        "(\n  acceptance_dir=\"$GAMEPULSE_M041_ACCEPTANCE_DIR\"\n{DOCUMENTED_RUN_TEMPLATE_BODY}"
+    );
+    let output = harness
+        .shell(&test_template)
+        .output()
+        .expect("documented acceptance shell template must start");
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("configuration report must be JSON");
+    assert_eq!(
+        report
+            .get("terminal_outcome")
+            .and_then(serde_json::Value::as_str),
+        Some("configuration_failure")
+    );
+    assert_eq!(
+        report.get("target").and_then(serde_json::Value::as_u64),
+        Some(20)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(&database_path.display().to_string()),
+        "aggregate report must not disclose the caller path"
+    );
+    assert_eq!(
+        fs::read_to_string(harness.argument_record())
+            .expect("shell-to-cargo argument record must be readable"),
+        format!(
+            "run\n--locked\n--offline\n-p\ngamepulse\n--\nacceptance-once\n--database\n{}\n--target\n20\n--deadline-seconds\n180\n",
+            database_path.display()
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(harness.composition_record())
+            .expect("pre-composition guard record must be readable"),
+        "database_not_opened_before_runtime_composition\n"
+    );
+    assert!(
+        !harness.acceptance_dir.exists(),
+        "the documented caller-owned cleanup must remove only its temporary directory"
+    );
 }
 
 #[test]
