@@ -132,13 +132,9 @@ fn later_runs_use_newest_browse_and_saved_continuation() {
         execute_daily_crawl(&mut state, &mut source, day("2026-08-14"))
             .expect("first selection must succeed"),
     );
-    selected(
+    let browse = selected(
         execute_daily_crawl(&mut state, &mut source, day("2026-08-14"))
             .expect("second selection must succeed"),
-    );
-    let third = selected(
-        execute_daily_crawl(&mut state, &mut source, day("2026-08-14"))
-            .expect("third selection must succeed"),
     );
 
     assert_eq!(
@@ -151,19 +147,23 @@ fn later_runs_use_newest_browse_and_saved_continuation() {
             },
         ]
     );
-    assert_eq!(third.state().browse_progress(), BrowseProgress::Exhausted);
+    assert_eq!(browse.state().browse_progress(), BrowseProgress::Exhausted);
 }
 
 #[test]
-fn two_browse_runs_consume_all_twenty_four_eligible_candidates_before_advancing() {
-    let candidates = (1..=24)
+fn replayed_browse_page_continues_until_one_hourly_commit_contains_twenty_candidates() {
+    let replayed_candidates = (1..=24)
+        .map(|id| candidate(id, &format!("game-{id}")))
+        .collect::<Vec<_>>();
+    let continuation_candidates = (25..=40)
         .map(|id| candidate(id, &format!("game-{id}")))
         .collect::<Vec<_>>();
     let mut state = MemoryStatePort::default();
     let mut source = FakeSourcePort::from_pages([
         Ok(page(vec![], None)),
-        Ok(page(candidates.clone(), Some(24))),
-        Ok(page(candidates, Some(24))),
+        Ok(page(replayed_candidates.clone(), Some(24))),
+        Ok(page(replayed_candidates, Some(24))),
+        Ok(page(continuation_candidates, Some(48))),
     ]);
 
     selected(
@@ -186,7 +186,7 @@ fn two_browse_runs_consume_all_twenty_four_eligible_candidates_before_advancing(
             .iter()
             .map(|candidate| candidate.source_product_id().value())
             .collect::<Vec<_>>(),
-        [21, 22, 23, 24]
+        (21..=40).collect::<Vec<_>>()
     );
     assert_eq!(
         source.calls,
@@ -194,13 +194,96 @@ fn two_browse_runs_consume_all_twenty_four_eligible_candidates_before_advancing(
             CrawlDiscoveryRequest::NewReleases,
             CrawlDiscoveryRequest::NewestBrowse { cursor: None },
             CrawlDiscoveryRequest::NewestBrowse { cursor: None },
+            CrawlDiscoveryRequest::NewestBrowse {
+                cursor: Some(BrowseCursor::new(24)),
+            },
         ]
     );
     assert_eq!(
         second_browse.state().browse_progress(),
-        BrowseProgress::Continue(BrowseCursor::new(24))
+        BrowseProgress::Continue(BrowseCursor::new(48))
     );
-    assert_eq!(second_browse.state().selected_or_processed().len(), 24);
+    assert_eq!(second_browse.state().selected_or_processed().len(), 40);
+    assert_eq!(state.commits.len(), 3);
+    assert_eq!(state.commits[2].selected().len(), 20);
+}
+
+#[test]
+fn browse_continuation_commits_a_short_selection_only_after_explicit_exhaustion() {
+    let processed =
+        (1..=20).map(|id| gamepulse_application::SourceProductId::new(id).expect("valid ID"));
+    let mut state = MemoryStatePort {
+        states: BTreeMap::from([(
+            day("2026-08-14"),
+            DailyCrawlState::restored(day("2026-08-14"), processed, true, BrowseProgress::Initial),
+        )]),
+        ..Default::default()
+    };
+    let mut source = FakeSourcePort::from_pages([
+        Ok(page(
+            (1..=24)
+                .map(|id| candidate(id, &format!("game-{id}")))
+                .collect(),
+            Some(24),
+        )),
+        Ok(page(
+            (25..=30)
+                .map(|id| candidate(id, &format!("game-{id}")))
+                .collect(),
+            None,
+        )),
+    ]);
+
+    let selection = selected(
+        execute_daily_crawl(&mut state, &mut source, day("2026-08-14"))
+            .expect("explicit browse exhaustion must commit the available candidates"),
+    );
+
+    assert_eq!(selection.selected().len(), 10);
+    assert_eq!(
+        selection.state().browse_progress(),
+        BrowseProgress::Exhausted
+    );
+    assert_eq!(state.commits.len(), 1);
+    assert_eq!(
+        source.calls,
+        [
+            CrawlDiscoveryRequest::NewestBrowse { cursor: None },
+            CrawlDiscoveryRequest::NewestBrowse {
+                cursor: Some(BrowseCursor::new(24)),
+            },
+        ]
+    );
+}
+
+#[test]
+fn browse_continuation_limit_fails_without_a_partial_commit() {
+    let already_processed = gamepulse_application::SourceProductId::new(1).expect("valid ID");
+    let initial = DailyCrawlState::restored(
+        day("2026-08-14"),
+        [already_processed],
+        true,
+        BrowseProgress::Initial,
+    );
+    let mut state = MemoryStatePort {
+        states: BTreeMap::from([(day("2026-08-14"), initial.clone())]),
+        ..Default::default()
+    };
+    let pages = (0..8).map(|page_index| {
+        Ok(page(
+            vec![candidate(1, "already-processed")],
+            Some(24 * (page_index + 1) as u64),
+        ))
+    });
+    let mut source = FakeSourcePort::from_pages(pages);
+
+    assert!(matches!(
+        execute_daily_crawl(&mut state, &mut source, day("2026-08-14")),
+        Err(DailyCrawlError::BrowseContinuationLimit)
+    ));
+    assert_eq!(source.calls.len(), 8);
+    assert!(state.commits.is_empty());
+    assert_eq!(state.states.get(&day("2026-08-14")), Some(&initial));
 }
 
 #[test]

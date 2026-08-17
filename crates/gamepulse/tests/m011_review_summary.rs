@@ -14,9 +14,10 @@ use std::sync::{Arc, Mutex};
 use axum::body::to_bytes;
 use gamepulse_application::{
     GameReviewRefresh, GameReviewRefreshStore, JobHandler, JobHandlerRegistry, JobRequest,
-    JobStatus, JobStore, JobTimestamp, ReviewExcerpt, ReviewInput, ReviewKind, ReviewSummary,
-    ReviewSummaryJobSchedule, ReviewSummaryOutput, ReviewSummaryRequest, ReviewSummaryStore,
-    RuntimeJobType, RuntimeJobTypeFilter, SourceProductId,
+    JobStatus, JobStore, JobTimestamp, ReviewExcerpt, ReviewInput, ReviewKind,
+    ReviewRefreshFingerprint, ReviewSummary, ReviewSummaryJobSchedule, ReviewSummaryOutput,
+    ReviewSummaryRequest, ReviewSummaryStore, RuntimeJobType, RuntimeJobTypeFilter,
+    SourceProductId,
 };
 use gamepulse_storage_sqlite::{
     SqliteGameCatalogueReadStore, SqliteJobStore, SqliteReviewSummaryStore,
@@ -28,6 +29,7 @@ use gamepulse_worker_source::{
     parse_game_detail, parse_platform_user_score_for_snapshot, parse_review_page,
 };
 use runtime::{Runtime, RuntimeClock, RuntimeClockError, RuntimeConfig, RuntimeTaskOutcome};
+use rusqlite::{Connection, params};
 
 const DETAIL: &str =
     include_str!("../../gamepulse-worker-source/tests/fixtures/product-detail.json");
@@ -37,6 +39,21 @@ const CRITIC_REVIEWS: &str =
     include_str!("../../gamepulse-worker-source/tests/fixtures/m011-critic-review-page.json");
 const USER_REVIEWS: &str =
     include_str!("../../gamepulse-worker-source/tests/fixtures/m011-user-review-page.json");
+const DAILY_CRAWL_MIGRATION_0001: &str =
+    include_str!("../../gamepulse-storage-sqlite/migrations/0001_daily_crawl_state.sql");
+const JOB_QUEUE_MIGRATION_0002: &str =
+    include_str!("../../gamepulse-storage-sqlite/migrations/0002_job_queue.sql");
+const GAME_SNAPSHOT_MIGRATION_0003: &str =
+    include_str!("../../gamepulse-storage-sqlite/migrations/0003_game_snapshots.sql");
+const REVIEW_SUMMARY_MIGRATION_0004: &str =
+    include_str!("../../gamepulse-storage-sqlite/migrations/0004_review_summaries.sql");
+const PUBLIC_COVER_URL_MIGRATION_0005: &str =
+    include_str!("../../gamepulse-storage-sqlite/migrations/0005_public_cover_url.sql");
+const LEGACY_REVIEW_EXCERPT: &str = "A great legacy review excerpt.";
+const LEGACY_REVIEW_CONTENT_HASH: &str =
+    "00bcb53e4dcdb6a2fb1614b107de5495101bd18f9fc776b19713e16eb6c437f1";
+const LEGACY_REVIEW_FINGERPRINT: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
 
@@ -62,6 +79,100 @@ impl Drop for TemporaryDatabase {
         let _ = fs::remove_file(self.path.with_extension("sqlite3-shm"));
         let _ = fs::remove_file(self.path.with_extension("sqlite3-wal"));
     }
+}
+
+fn seed_version_five_pending_review_summary(database: &TemporaryDatabase) {
+    let connection = Connection::open(&database.path).expect("legacy database must open");
+    for migration in [
+        DAILY_CRAWL_MIGRATION_0001,
+        JOB_QUEUE_MIGRATION_0002,
+        GAME_SNAPSHOT_MIGRATION_0003,
+        REVIEW_SUMMARY_MIGRATION_0004,
+        PUBLIC_COVER_URL_MIGRATION_0005,
+    ] {
+        connection
+            .execute_batch(migration)
+            .expect("legacy migration must apply");
+    }
+    connection
+        .execute(
+            "INSERT INTO games (source_product_id, source_slug, title, description)
+             VALUES (?1, 'legacy-review-game', 'Legacy Review Game', 'Synthetic description')",
+            params![101_i64],
+        )
+        .expect("legacy game must persist");
+    connection
+        .execute(
+            "INSERT INTO review_inputs (
+                game_source_product_id, review_kind, content_hash, refresh_fingerprint
+             ) VALUES (?1, 'critic', ?2, ?3)",
+            params![
+                101_i64,
+                LEGACY_REVIEW_CONTENT_HASH,
+                LEGACY_REVIEW_FINGERPRINT
+            ],
+        )
+        .expect("legacy review input must persist");
+    connection
+        .execute(
+            "INSERT INTO review_input_excerpts (
+                game_source_product_id, review_kind, excerpt_position, excerpt
+             ) VALUES (?1, 'critic', 0, ?2)",
+            params![101_i64, LEGACY_REVIEW_EXCERPT],
+        )
+        .expect("legacy review excerpt must persist");
+    connection
+        .execute(
+            "INSERT INTO review_summaries (
+                game_source_product_id, review_kind, refresh_fingerprint, state
+             ) VALUES (?1, 'critic', ?2, 'pending')",
+            params![101_i64, LEGACY_REVIEW_FINGERPRINT],
+        )
+        .expect("legacy pending summary must persist");
+    connection
+        .pragma_update(None, "user_version", 5_i64)
+        .expect("legacy schema version must persist");
+}
+
+#[test]
+fn seeded_v5_nonempty_review_input_reopens_and_settles_pending_local_summary() {
+    let database = TemporaryDatabase::new();
+    seed_version_five_pending_review_summary(&database);
+
+    let source_product_id = SourceProductId::new(101).expect("test identity must be valid");
+    let request = ReviewSummaryRequest::new(
+        source_product_id,
+        ReviewKind::Critic,
+        ReviewRefreshFingerprint::parse(LEGACY_REVIEW_FINGERPRINT)
+            .expect("legacy fingerprint must be valid"),
+    );
+    let mut store = SqliteReviewSummaryStore::open(&database.path)
+        .expect("v5 database must migrate and reopen");
+    let input = store
+        .load_review_input(&request)
+        .expect("migrated legacy review input must validate")
+        .expect("pending legacy review input must remain current");
+
+    assert_eq!(input.content_hash().as_str(), LEGACY_REVIEW_CONTENT_HASH);
+    assert_eq!(input.excerpts()[0].as_str(), LEGACY_REVIEW_EXCERPT);
+    assert_eq!(input.excerpts()[0].polarity(), None);
+
+    let output = gamepulse_application::ReviewSummarizer::summarize(
+        &LocalExtractiveReviewSummarizer,
+        &input,
+    )
+    .expect("local summary must remain available after migration");
+    assert_eq!(
+        output,
+        ReviewSummaryOutput::available(vec![LEGACY_REVIEW_EXCERPT.to_owned()], Vec::new())
+            .expect("test summary must be valid")
+    );
+    assert_eq!(
+        store
+            .persist_review_summary(&ReviewSummary::new(request, output))
+            .expect("local summary must settle"),
+        gamepulse_application::FencedSummaryWrite::Applied
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -350,8 +461,35 @@ async fn fixture_refresh_creates_two_separated_summary_jobs_and_renders_persiste
             |row| row.get::<_, i64>(0),
         )
         .expect("summary jobs must reopen");
+    let polarities = reopened
+        .prepare(
+            "SELECT review_kind, excerpt_position, polarity
+             FROM review_input_excerpts
+             WHERE game_source_product_id = 101
+             ORDER BY review_kind ASC, excerpt_position ASC",
+        )
+        .expect("polarity query must prepare")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .expect("polarity query must execute")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("polarity rows must decode");
     assert_eq!(inputs, 2);
     assert_eq!(jobs, 2);
+    assert_eq!(
+        polarities,
+        [
+            ("critic".to_owned(), 0, Some("positive".to_owned())),
+            ("critic".to_owned(), 1, None),
+            ("user".to_owned(), 0, Some("positive".to_owned())),
+            ("user".to_owned(), 1, Some("negative".to_owned())),
+        ]
+    );
     let mut queue = SqliteJobStore::open(&database.path).expect("queue must reopen");
     assert_eq!(
         queue

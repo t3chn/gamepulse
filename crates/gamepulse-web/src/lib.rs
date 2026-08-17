@@ -95,6 +95,8 @@ h3 { margin: 0; font-size: 1.05rem; letter-spacing: -0.012em; }
 .game-card__top { display: grid; grid-template-columns: 4.25rem 1fr auto; gap: 0.85rem; align-items: start; }
 .cover-placeholder { display: grid; width: 100%; min-height: 5.25rem; place-items: center; border: 1px solid var(--line-strong); border-radius: 0.7rem; background: var(--surface-raised); color: var(--primary); font-size: 1.25rem; font-weight: 850; letter-spacing: -0.07em; }
 .cover-placeholder--large { width: 9.5rem; min-height: 12rem; font-size: 2rem; }
+.cover-image { display: block; width: 100%; min-height: 5.25rem; max-height: 12rem; border: 1px solid var(--line-strong); border-radius: 0.7rem; background: var(--surface-raised); object-fit: cover; }
+.cover-image--large { width: 9.5rem; min-height: 12rem; }
 .cover-status { margin: 0.65rem 0 0; color: var(--muted); font-size: 0.78rem; line-height: 1.4; }
 .game-title { color: var(--ink); text-decoration-color: transparent; }
 .game-title:hover, .game-title:focus-visible { color: var(--primary); text-decoration-color: currentColor; }
@@ -152,7 +154,7 @@ td:first-child { color: var(--ink); font-weight: 750; }
   .header-note { text-align: left; }
   .catalogue-controls, .detail-grid { grid-template-columns: 1fr; }
   .detail-hero { grid-template-columns: 1fr; }
-  .cover-placeholder--large { width: 100%; min-height: 8rem; }
+  .cover-placeholder--large, .cover-image--large { width: 100%; min-height: 8rem; }
   .content-section--wide { grid-row: auto; }
   .results-heading { align-items: flex-start; flex-direction: column; }
   .results-heading p { text-align: left; }
@@ -475,12 +477,15 @@ fn decode_hex(value: u8) -> Option<u8> {
         <li>
           <article class="game-card">
             <div class="game-card__top">
+              {% match game.public_cover_url %}
+              {% when Some with (cover_url) %}
+              <img class="cover-image" src="{{ cover_url }}" alt="Cover for {{ game.title }}">
+              {% when None %}
               <div class="cover-placeholder" aria-hidden="true">GP</div>
+              {% endmatch %}
               <div>
                 <h3><a class="game-title" href="/games/{{ game.source_product_id }}">{{ game.title }}</a></h3>
-                {% if game.has_cover_reference %}
-                <p class="cover-status">Cover reference stored · external image not loaded</p>
-                {% else %}
+                {% if !game.has_public_cover %}
                 <p class="cover-status">No local cover image stored</p>
                 {% endif %}
               </div>
@@ -545,7 +550,8 @@ impl CatalogueTemplate {
                 .map(|game| CatalogueGameCardView {
                     source_product_id: game.source_product_id().value(),
                     title: game.title().to_owned(),
-                    has_cover_reference: game.public_cover_url().is_some(),
+                    public_cover_url: game.public_cover_url().map(str::to_owned),
+                    has_public_cover: game.public_cover_url().is_some(),
                     highest_metascore: game.highest_metascore(),
                     platforms: game.platforms().to_vec(),
                     developers: game.developers().to_vec(),
@@ -563,7 +569,8 @@ struct CataloguePlatformView {
 struct CatalogueGameCardView {
     source_product_id: u64,
     title: String,
-    has_cover_reference: bool,
+    public_cover_url: Option<String>,
+    has_public_cover: bool,
     highest_metascore: Option<u8>,
     platforms: Vec<String>,
     developers: Vec<String>,
@@ -594,10 +601,13 @@ struct CatalogueGameCardView {
     <article>
       <header class="detail-hero">
         <div>
+          {% match game.public_cover_url %}
+          {% when Some with (cover_url) %}
+          <img class="cover-image cover-image--large" src="{{ cover_url }}" alt="Cover for {{ game.title }}">
+          {% when None %}
           <div class="cover-placeholder cover-placeholder--large" aria-hidden="true">GP</div>
-          {% if game.has_cover_reference %}
-          <p class="cover-status">Cover reference stored · external image not loaded</p>
-          {% else %}
+          {% endmatch %}
+          {% if !game.has_public_cover %}
           <p class="cover-status">No local cover image stored</p>
           {% endif %}
         </div>
@@ -732,7 +742,8 @@ impl GameDetailTemplate {
                     filename: cover.filename().to_owned(),
                     kind: cover.kind().to_owned(),
                 }),
-                has_cover_reference: game.public_cover_url().is_some(),
+                public_cover_url: game.public_cover_url().map(str::to_owned),
+                has_public_cover: game.public_cover_url().is_some(),
                 video: game.video_url().map(|value| CatalogueVideoView {
                     value: value.to_owned(),
                     is_safe_href: is_safe_http_link(value),
@@ -777,7 +788,8 @@ struct CatalogueGameDetailView {
     title: String,
     description: String,
     cover: Option<CatalogueCoverView>,
-    has_cover_reference: bool,
+    public_cover_url: Option<String>,
+    has_public_cover: bool,
     video: Option<CatalogueVideoView>,
     platform_scores: Vec<CataloguePlatformScoreView>,
     developers: Vec<String>,

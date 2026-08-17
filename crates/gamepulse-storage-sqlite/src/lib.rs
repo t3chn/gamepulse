@@ -29,13 +29,16 @@ const DAILY_CRAWL_SCHEMA_VERSION: i64 = 1;
 const JOB_QUEUE_SCHEMA_VERSION: i64 = 2;
 const GAME_SNAPSHOT_SCHEMA_VERSION: i64 = 3;
 const REVIEW_SUMMARY_SCHEMA_VERSION: i64 = 4;
-const SCHEMA_VERSION: i64 = 5;
+const PUBLIC_COVER_URL_SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const DAILY_CRAWL_MIGRATION_0001: &str = include_str!("../migrations/0001_daily_crawl_state.sql");
 const JOB_QUEUE_MIGRATION_0002: &str = include_str!("../migrations/0002_job_queue.sql");
 const GAME_SNAPSHOT_MIGRATION_0003: &str = include_str!("../migrations/0003_game_snapshots.sql");
 const REVIEW_SUMMARY_MIGRATION_0004: &str = include_str!("../migrations/0004_review_summaries.sql");
 const PUBLIC_COVER_URL_MIGRATION_0005: &str =
     include_str!("../migrations/0005_public_cover_url.sql");
+const REVIEW_EXCERPT_POLARITY_MIGRATION_0006: &str =
+    include_str!("../migrations/0006_review_excerpt_polarity.sql");
 
 /// Read-only SQLite readiness adapter for the configured persistent database.
 ///
@@ -353,6 +356,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(PUBLIC_COVER_URL_MIGRATION_0005)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(REVIEW_EXCERPT_POLARITY_MIGRATION_0006)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -377,6 +383,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(PUBLIC_COVER_URL_MIGRATION_0005)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(REVIEW_EXCERPT_POLARITY_MIGRATION_0006)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -399,6 +408,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(PUBLIC_COVER_URL_MIGRATION_0005)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(REVIEW_EXCERPT_POLARITY_MIGRATION_0006)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -419,6 +431,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(PUBLIC_COVER_URL_MIGRATION_0005)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(REVIEW_EXCERPT_POLARITY_MIGRATION_0006)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -429,12 +444,33 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
             validate_daily_crawl_schema(connection)?;
             validate_job_queue_schema(connection)?;
             validate_game_snapshot_schema_before_public_cover(connection)?;
-            validate_review_summary_schema(connection)?;
+            validate_review_summary_schema_before_polarity(connection)?;
             let transaction = connection
                 .transaction()
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .execute_batch(PUBLIC_COVER_URL_MIGRATION_0005)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(REVIEW_EXCERPT_POLARITY_MIGRATION_0006)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .commit()
+                .map_err(DailyCrawlStateStoreError::database)
+        }
+        PUBLIC_COVER_URL_SCHEMA_VERSION => {
+            validate_daily_crawl_schema(connection)?;
+            validate_job_queue_schema(connection)?;
+            validate_game_snapshot_schema(connection)?;
+            validate_review_summary_schema_before_polarity(connection)?;
+            let transaction = connection
+                .transaction()
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(REVIEW_EXCERPT_POLARITY_MIGRATION_0006)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -745,6 +781,19 @@ fn validate_public_cover_url_constraint_behavior(
 fn validate_review_summary_schema(
     connection: &Connection,
 ) -> Result<(), DailyCrawlStateStoreError> {
+    validate_review_summary_schema_inner(connection, true)
+}
+
+fn validate_review_summary_schema_before_polarity(
+    connection: &Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    validate_review_summary_schema_inner(connection, false)
+}
+
+fn validate_review_summary_schema_inner(
+    connection: &Connection,
+    includes_polarity: bool,
+) -> Result<(), DailyCrawlStateStoreError> {
     validate_table_columns(
         connection,
         "review_inputs",
@@ -755,16 +804,30 @@ fn validate_review_summary_schema(
             ("refresh_fingerprint", "TEXT", 1, 0),
         ],
     )?;
-    validate_table_columns(
-        connection,
-        "review_input_excerpts",
-        &[
-            ("game_source_product_id", "INTEGER", 1, 1),
-            ("review_kind", "TEXT", 1, 2),
-            ("excerpt_position", "INTEGER", 1, 3),
-            ("excerpt", "TEXT", 1, 0),
-        ],
-    )?;
+    if includes_polarity {
+        validate_table_columns(
+            connection,
+            "review_input_excerpts",
+            &[
+                ("game_source_product_id", "INTEGER", 1, 1),
+                ("review_kind", "TEXT", 1, 2),
+                ("excerpt_position", "INTEGER", 1, 3),
+                ("excerpt", "TEXT", 1, 0),
+                ("polarity", "TEXT", 0, 0),
+            ],
+        )?;
+    } else {
+        validate_table_columns(
+            connection,
+            "review_input_excerpts",
+            &[
+                ("game_source_product_id", "INTEGER", 1, 1),
+                ("review_kind", "TEXT", 1, 2),
+                ("excerpt_position", "INTEGER", 1, 3),
+                ("excerpt", "TEXT", 1, 0),
+            ],
+        )?;
+    }
     validate_table_columns(
         connection,
         "review_summaries",
@@ -2053,8 +2116,8 @@ mod tests {
     }
 
     #[test]
-    fn version_four_database_adds_the_public_cover_column_on_reopen() {
-        let database = TemporaryDatabase::new("upgrade-v4-to-v5-public-cover");
+    fn version_four_database_adds_public_cover_and_review_polarity_columns_on_reopen() {
+        let database = TemporaryDatabase::new("upgrade-v4-to-v6-cover-and-polarity");
         create_version_four_schema(&database);
 
         drop(SqliteDailyCrawlStateStore::open(&database.path).expect("database must migrate"));
@@ -2070,9 +2133,17 @@ mod tests {
             .expect("table info must load")
             .collect::<Result<Vec<_>, _>>()
             .expect("table info values must decode");
+        let review_excerpt_columns = connection
+            .prepare("PRAGMA table_info(review_input_excerpts)")
+            .expect("review excerpt table info must prepare")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("review excerpt table info must load")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("review excerpt columns must decode");
 
         assert_eq!(version, SCHEMA_VERSION);
         assert!(public_cover_column.contains(&"public_cover_url".to_owned()));
+        assert!(review_excerpt_columns.contains(&"polarity".to_owned()));
     }
 
     #[test]

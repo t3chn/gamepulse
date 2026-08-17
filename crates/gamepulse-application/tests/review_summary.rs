@@ -2,7 +2,7 @@
 
 use gamepulse_application::{
     GameReviewRefresh, GameReviewRefreshError, JobTimestamp, ReviewExcerpt, ReviewInput,
-    ReviewKind, ReviewSummaryJobSchedule, SourceProductId,
+    ReviewKind, ReviewPolarity, ReviewSummaryJobSchedule, SourceProductId,
 };
 
 fn snapshot() -> gamepulse_application::GameSnapshot {
@@ -62,6 +62,32 @@ fn kind_separated_hashes_produce_exactly_two_fingerprint_scoped_jobs() {
         refresh.input(ReviewKind::Critic).content_hash().as_str(),
         refresh.fingerprint().as_str()
     );
+}
+
+#[test]
+fn legacy_unpolarized_hashes_stay_stable_and_polarity_hashes_use_v2_encoding() {
+    const LEGACY_EXCERPT: &str = "A great legacy review excerpt.";
+    const LEGACY_HASH: &str = "00bcb53e4dcdb6a2fb1614b107de5495101bd18f9fc776b19713e16eb6c437f1";
+    const POLARITY_AWARE_V2_HASH: &str =
+        "43b669036eceb450670c995ae130ba4624f40bd40d49d5e0b989def51cfd5dfa";
+
+    let legacy = input(ReviewKind::Critic, &[LEGACY_EXCERPT]);
+    let polarity_aware = ReviewInput::new(
+        SourceProductId::new(101).expect("test identity must be valid"),
+        ReviewKind::Critic,
+        vec![
+            ReviewExcerpt::with_polarity(LEGACY_EXCERPT, Some(ReviewPolarity::Positive))
+                .expect("test excerpt must be valid"),
+        ],
+    )
+    .expect("test review input must be valid");
+
+    assert_eq!(legacy.content_hash().as_str(), LEGACY_HASH);
+    assert_eq!(
+        polarity_aware.content_hash().as_str(),
+        POLARITY_AWARE_V2_HASH
+    );
+    assert_ne!(legacy.content_hash(), polarity_aware.content_hash());
 }
 
 #[test]

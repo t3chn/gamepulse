@@ -85,7 +85,7 @@ pub(crate) fn upsert_snapshot_in_transaction(
                 cover_filename = excluded.cover_filename,
                 cover_kind = excluded.cover_kind,
                 video_url = excluded.video_url,
-                public_cover_url = excluded.public_cover_url",
+                public_cover_url = COALESCE(excluded.public_cover_url, games.public_cover_url)",
             params![
                 source_product_id,
                 snapshot.source_slug(),
@@ -401,6 +401,21 @@ mod tests {
         assert_eq!(platform_ids(&store), [7]);
         assert_eq!(row_count(&store, "game_developers"), 1);
         assert_eq!(developer_names(&store), ["Replacement Studio"]);
+    }
+
+    #[test]
+    fn available_public_cover_survives_a_later_snapshot_without_optional_enrichment() {
+        let mut store = SqliteGameSnapshotStore::open_in_memory().expect("store must open");
+
+        upsert_game_snapshot(&mut store, &replacement_snapshot())
+            .expect("enriched snapshot must persist");
+        upsert_game_snapshot(&mut store, &initial_snapshot())
+            .expect("mandatory snapshot without optional cover must persist");
+
+        assert_eq!(
+            public_cover_url(&store).as_deref(),
+            Some("https://www.metacritic.com/images/replacement.jpg")
+        );
     }
 
     #[test]

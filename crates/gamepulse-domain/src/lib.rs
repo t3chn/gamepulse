@@ -374,10 +374,22 @@ pub const REVIEW_EXCERPT_MAX_BYTES: usize = 1_024;
 
 /// One non-empty, bounded review excerpt that may be handed to a local summarizer.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReviewExcerpt(String);
+pub struct ReviewExcerpt {
+    text: String,
+    polarity: Option<ReviewPolarity>,
+}
 
 impl ReviewExcerpt {
     pub fn new(value: impl Into<String>) -> Result<Self, ReviewExcerptError> {
+        Self::with_polarity(value, None)
+    }
+
+    /// Preserve a source-derived polarity alongside the bounded excerpt for deterministic local
+    /// classification. A missing polarity deliberately remains distinct from a neutral excerpt.
+    pub fn with_polarity(
+        value: impl Into<String>,
+        polarity: Option<ReviewPolarity>,
+    ) -> Result<Self, ReviewExcerptError> {
         let value = value.into();
         if value.trim().is_empty() {
             return Err(ReviewExcerptError::Blank);
@@ -385,11 +397,42 @@ impl ReviewExcerpt {
         if value.len() > REVIEW_EXCERPT_MAX_BYTES {
             return Err(ReviewExcerptError::TooLong);
         }
-        Ok(Self(value))
+        Ok(Self {
+            text: value,
+            polarity,
+        })
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.text
+    }
+
+    pub const fn polarity(&self) -> Option<ReviewPolarity> {
+        self.polarity
+    }
+}
+
+/// A bounded source-score signal retained only when it is clearly positive or negative.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewPolarity {
+    Positive,
+    Negative,
+}
+
+impl ReviewPolarity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Positive => "positive",
+            Self::Negative => "negative",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "positive" => Some(Self::Positive),
+            "negative" => Some(Self::Negative),
+            _ => None,
+        }
     }
 }
 
@@ -583,6 +626,24 @@ pub fn select_daily_crawl(
     candidate_ids: impl IntoIterator<Item = SourceProductId>,
     next_browse_cursor: Option<BrowseCursor>,
 ) -> DailyCrawlTransition {
+    select_daily_crawl_up_to(
+        discovery,
+        candidate_ids,
+        next_browse_cursor,
+        DAILY_CRAWL_SELECTION_LIMIT,
+    )
+}
+
+/// Apply one successful discovery page while accepting no more than the remaining capacity of a
+/// larger atomic selection. Keeping the page-local replay rule here prevents continuation callers
+/// from accidentally advancing past candidates that did not fit in the current hourly batch.
+pub fn select_daily_crawl_up_to(
+    discovery: DailyCrawlDiscovery,
+    candidate_ids: impl IntoIterator<Item = SourceProductId>,
+    next_browse_cursor: Option<BrowseCursor>,
+    selection_limit: usize,
+) -> DailyCrawlTransition {
+    let selection_limit = selection_limit.min(DAILY_CRAWL_SELECTION_LIMIT);
     let mut seen_in_run = BTreeSet::new();
     let mut selected_product_ids = Vec::new();
     let mut has_remaining_eligible_candidate = false;
@@ -597,7 +658,7 @@ pub fn select_daily_crawl(
             continue;
         }
 
-        if selected_product_ids.len() < DAILY_CRAWL_SELECTION_LIMIT {
+        if selected_product_ids.len() < selection_limit {
             selected_product_ids.push(candidate_id);
         } else {
             has_remaining_eligible_candidate = true;

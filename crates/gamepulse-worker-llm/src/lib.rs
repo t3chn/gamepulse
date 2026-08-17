@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use gamepulse_application::{
-    JobHandler, JobHandlerFailure, JobHandlerFuture, JobHandlerResult, ReviewInput,
+    JobHandler, JobHandlerFailure, JobHandlerFuture, JobHandlerResult, ReviewInput, ReviewPolarity,
     ReviewSummarizer, ReviewSummary, ReviewSummaryOutput, ReviewSummaryRequest, ReviewSummaryStore,
     RuntimeJobType, TypedJob,
 };
@@ -28,13 +28,14 @@ impl ReviewSummarizer for LocalExtractiveReviewSummarizer {
         let mut dislikes = Vec::new();
         for excerpt in input.excerpts() {
             let text = excerpt.as_str();
-            let target = if contains_negative_token(text) {
-                &mut dislikes
-            } else {
-                &mut likes
-            };
-            if target.len() < 3 && !target.iter().any(|existing: &String| existing == text) {
-                target.push(text.to_owned());
+            match classify_review_excerpt(text, excerpt.polarity()) {
+                ExcerptSentiment::Like => push_summary_item(&mut likes, text),
+                ExcerptSentiment::Dislike => push_summary_item(&mut dislikes, text),
+                ExcerptSentiment::Mixed => {
+                    push_summary_item(&mut likes, text);
+                    push_summary_item(&mut dislikes, text);
+                }
+                ExcerptSentiment::Unknown => {}
             }
         }
         Ok(ReviewSummaryOutput::available(likes, dislikes)
@@ -42,15 +43,71 @@ impl ReviewSummarizer for LocalExtractiveReviewSummarizer {
     }
 }
 
-fn contains_negative_token(text: &str) -> bool {
-    text.to_ascii_lowercase()
+fn push_summary_item(target: &mut Vec<String>, text: &str) {
+    if target.len() < 3 && !target.iter().any(|existing| existing == text) {
+        target.push(text.to_owned());
+    }
+}
+
+/// The explainable result of classifying one persisted review excerpt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExcerptSentiment {
+    Like,
+    Dislike,
+    Mixed,
+    Unknown,
+}
+
+/// Classify explicit English sentiment with a bounded negation window. Explicit text wins over a
+/// retained score-derived polarity; polarity is used only when the text has no known sentiment.
+pub fn classify_review_excerpt(text: &str, polarity: Option<ReviewPolarity>) -> ExcerptSentiment {
+    let mut positive = false;
+    let mut negative = false;
+    let mut negation_window = 0_u8;
+
+    for token in text
         .split(|character: char| !character.is_ascii_alphabetic())
-        .any(|token| {
-            matches!(
-                token,
-                "bad" | "boring" | "poor" | "weak" | "dislike" | "not"
-            )
-        })
+        .filter(|token| !token.is_empty())
+    {
+        let token = token.to_ascii_lowercase();
+        if is_negator(&token) {
+            negation_window = 3;
+            continue;
+        }
+
+        let sentiment = match token.as_str() {
+            "good" | "great" | "excellent" | "enjoyable" | "fun" | "love" | "liked" | "strong"
+            | "polished" | "praise" | "satisfying" => Some(true),
+            "bad" | "boring" | "poor" | "weak" | "dislike" | "awful" | "terrible"
+            | "frustrating" | "broken" | "hate" => Some(false),
+            _ => None,
+        };
+
+        if let Some(is_positive) = sentiment {
+            match (is_positive, negation_window > 0) {
+                (true, false) | (false, true) => positive = true,
+                (false, false) | (true, true) => negative = true,
+            }
+            negation_window = 0;
+        } else {
+            negation_window = negation_window.saturating_sub(1);
+        }
+    }
+
+    match (positive, negative) {
+        (true, false) => ExcerptSentiment::Like,
+        (false, true) => ExcerptSentiment::Dislike,
+        (true, true) => ExcerptSentiment::Mixed,
+        (false, false) => match polarity {
+            Some(ReviewPolarity::Positive) => ExcerptSentiment::Like,
+            Some(ReviewPolarity::Negative) => ExcerptSentiment::Dislike,
+            None => ExcerptSentiment::Unknown,
+        },
+    }
+}
+
+fn is_negator(token: &str) -> bool {
+    matches!(token, "not" | "never" | "no" | "hardly" | "without")
 }
 
 /// The LLM-lane adapter for a durable, fingerprint-fenced summary job.
@@ -134,6 +191,8 @@ mod tests {
 
     use super::*;
 
+    const SENTIMENT_CASES: &str = include_str!("../tests/fixtures/review-sentiment-cases.txt");
+
     fn input(kind: ReviewKind, excerpts: &[&str]) -> ReviewInput {
         ReviewInput::new(
             SourceProductId::new(101).expect("test identity must be valid"),
@@ -193,6 +252,86 @@ mod tests {
                 ],
             )
             .expect("test summary must be valid")
+        );
+    }
+
+    #[test]
+    fn critic_and_user_fixture_cases_classify_explicit_negation_mixed_and_unknown_text() {
+        let cases = SENTIMENT_CASES
+            .lines()
+            .map(|line| {
+                let mut fields = line.splitn(3, '|');
+                let name = fields.next().expect("fixture name must be present");
+                let expected = fields.next().expect("fixture result must be present");
+                let text = fields.next().expect("fixture excerpt must be present");
+                (name, expected, text)
+            })
+            .collect::<Vec<_>>();
+        let expected = [
+            ("positive", ExcerptSentiment::Like),
+            ("negative", ExcerptSentiment::Dislike),
+            ("negated-positive", ExcerptSentiment::Dislike),
+            ("negated-negative", ExcerptSentiment::Like),
+            ("mixed", ExcerptSentiment::Mixed),
+            ("unknown", ExcerptSentiment::Unknown),
+        ];
+
+        for kind in ReviewKind::ALL {
+            let input = input(
+                kind,
+                &cases.iter().map(|(_, _, text)| *text).collect::<Vec<_>>(),
+            );
+            for ((name, expected_label, text), (expected_name, expected_sentiment)) in
+                cases.iter().zip(expected)
+            {
+                assert_eq!(name, &expected_name);
+                assert_eq!(
+                    *expected_label,
+                    match expected_sentiment {
+                        ExcerptSentiment::Like => "like",
+                        ExcerptSentiment::Dislike => "dislike",
+                        ExcerptSentiment::Mixed => "mixed",
+                        ExcerptSentiment::Unknown => "unknown",
+                    }
+                );
+                assert_eq!(classify_review_excerpt(text, None), expected_sentiment);
+            }
+            assert_eq!(
+                LocalExtractiveReviewSummarizer
+                    .summarize(&input)
+                    .expect("fixture fallback must be infallible"),
+                ReviewSummaryOutput::available(
+                    vec![
+                        cases[0].2.to_owned(),
+                        cases[3].2.to_owned(),
+                        cases[4].2.to_owned(),
+                    ],
+                    vec![
+                        cases[1].2.to_owned(),
+                        cases[2].2.to_owned(),
+                        cases[4].2.to_owned(),
+                    ],
+                )
+                .expect("fixture output must be valid")
+            );
+        }
+    }
+
+    #[test]
+    fn retained_score_polarity_is_used_only_when_text_is_unknown() {
+        let excerpt = ReviewExcerpt::with_polarity(
+            "The release date is Tuesday.",
+            Some(ReviewPolarity::Positive),
+        )
+        .expect("test excerpt must be valid");
+
+        assert_eq!(
+            classify_review_excerpt(excerpt.as_str(), excerpt.polarity()),
+            ExcerptSentiment::Like
+        );
+        assert_eq!(
+            classify_review_excerpt("The controls are not good.", Some(ReviewPolarity::Positive)),
+            ExcerptSentiment::Dislike
         );
     }
 

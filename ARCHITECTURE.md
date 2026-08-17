@@ -217,8 +217,11 @@ daily-crawl selection policy, M004's SQLite daily-crawl state adapter, M005's
 durable job-queue foundation, M006's bounded in-process runtime, and M007's
 hourly source-discovery handler. M003 keeps day reset, numeric-ID uniqueness,
 source-order selection, the 20-item cap, replay of a partially consumed browse
-page, and explicit browse exhaustion in the domain; the application owns the
-discovery and atomic state-commit ports. M004 durably commits the per-day state
+page, and explicit browse exhaustion in the domain. M021 makes a later browse
+selection follow at most eight validated continuation pages until it has exactly
+20 unique candidates or the source explicitly exhausts, then publish one atomic
+commit; a replayed 24-item page therefore cannot commit its remaining four alone.
+The application owns the discovery and atomic state-commit ports. M004 durably commits the per-day state
 and selected candidate slugs through that port. M005 adds an application-owned
 `JobStore` port plus a SQLite adapter that durably deduplicates stable jobs,
 records claims and lease expiry, bounds attempts, fences claim tokens and clock
@@ -298,8 +301,10 @@ seed snapshots through the accepted upsert boundary and never open a listener.
 
 M011 completes the bounded offline review-to-summary vertical for stored games. A source
 ingestion refresh retrieves at most the first 20 synthetic fixture reviews independently for
-each critic and user kind, maps bounded untrusted excerpts into source-agnostic review inputs,
-and computes individual input hashes plus one combined refresh fingerprint. SQLite atomically
+each critic and user kind, maps bounded untrusted excerpts and clear score-derived polarity into source-agnostic review inputs,
+and computes individual input hashes plus one combined refresh fingerprint. Inputs with no
+polarity retain their exact v5 hash encoding; inputs with any polarity use a domain-separated
+v2 encoding. SQLite atomically
 replaces the game snapshot and both kind-separated review inputs, then creates exactly two
 fingerprint-scoped `llm.review-summary` jobs; an exact replay leaves the current jobs unchanged.
 The application owns typed lane claims, review/summarizer ports, refresh scheduling, and the
@@ -310,7 +315,9 @@ summarizer port and uses only persisted excerpts to produce separate critic and 
 likes/dislikes results, or an explicit unavailable result when no excerpts exist. A summary write
 matches both kind and refresh fingerprint, so an old worker result cannot replace the current
 refresh. The catalogue detail read model and `/games/{id}` render only persisted critic and user
-outputs, including the unavailable state. All M011 tests use local synthetic fixtures and
+outputs, including the unavailable state. M021's local fallback classifies explicit positive,
+negative, negated, mixed, and unknown excerpt text deterministically; it consults persisted
+polarity only when text is unknown. All M011 tests use local synthetic fixtures and
 in-process HTTP rendering; they make no source or provider call.
 
 M012 adds one bounded optional public-HTML cover-enrichment substep to the
@@ -331,6 +338,12 @@ current source handler cannot observe the completion of its fixed 20-item batch
 without introducing `runs`/`run_items`, the proposed more-than-four
 parse-or-validation-failure batch disablement remains an operational revisit
 condition rather than durable run state.
+
+M021 renders a validated public cover URL only after source enrichment and SQLite snapshot
+persistence have carried it into the catalogue read model. Catalogue and detail templates use the
+persisted value directly without a server-side or render-time fetch; an absent URL retains the
+safe local placeholder. The original source descriptor remains provenance data and is never
+converted into a fabricated image URL.
 
 M013 adds local delivery readiness without changing the one-binary,
 one-process topology. `gamepulse-web` owns `GET /health/live` and

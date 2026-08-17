@@ -3,8 +3,8 @@ use std::path::Path;
 
 use gamepulse_application::{
     FencedSummaryWrite, GameReviewRefresh, GameReviewRefreshStore, ReviewExcerpt, ReviewInput,
-    ReviewKind, ReviewSummary, ReviewSummaryOutput, ReviewSummaryRequest, ReviewSummaryStore,
-    SourceProductId,
+    ReviewKind, ReviewPolarity, ReviewSummary, ReviewSummaryOutput, ReviewSummaryRequest,
+    ReviewSummaryStore, SourceProductId,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -78,9 +78,9 @@ impl GameReviewRefreshStore for SqliteReviewSummaryStore {
                 for (position, excerpt) in input.excerpts().iter().enumerate() {
                     transaction
                         .execute(
-                            "INSERT INTO review_input_excerpts (
-                                game_source_product_id, review_kind, excerpt_position, excerpt
-                             ) VALUES (?1, ?2, ?3, ?4)",
+                        "INSERT INTO review_input_excerpts (
+                                game_source_product_id, review_kind, excerpt_position, excerpt, polarity
+                             ) VALUES (?1, ?2, ?3, ?4, ?5)",
                             params![
                                 product_id,
                                 kind.as_str(),
@@ -88,6 +88,7 @@ impl GameReviewRefreshStore for SqliteReviewSummaryStore {
                                     ReviewSummaryStoreError::malformed("review excerpt position")
                                 })?,
                                 excerpt.as_str(),
+                                excerpt.polarity().map(ReviewPolarity::as_str),
                             ],
                         )
                         .map_err(ReviewSummaryStoreError::database)?;
@@ -192,7 +193,7 @@ impl ReviewSummaryStore for SqliteReviewSummaryStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT excerpt
+                "SELECT excerpt, polarity
                  FROM review_input_excerpts
                  WHERE game_source_product_id = ?1 AND review_kind = ?2
                  ORDER BY excerpt_position ASC",
@@ -200,13 +201,19 @@ impl ReviewSummaryStore for SqliteReviewSummaryStore {
             .map_err(ReviewSummaryStoreError::database)?;
         let excerpts = statement
             .query_map(params![product_id, request.kind().as_str()], |row| {
-                row.get::<_, String>(0)
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })
             .map_err(ReviewSummaryStoreError::database)?
             .map(|row| {
                 row.map_err(ReviewSummaryStoreError::database)
-                    .and_then(|excerpt| {
-                        ReviewExcerpt::new(excerpt).map_err(|_| {
+                    .and_then(|(excerpt, polarity)| {
+                        let polarity = match polarity.as_deref() {
+                            None => None,
+                            Some(value) => Some(ReviewPolarity::parse(value).ok_or_else(|| {
+                                ReviewSummaryStoreError::malformed("stored review excerpt polarity")
+                            })?),
+                        };
+                        ReviewExcerpt::with_polarity(excerpt, polarity).map_err(|_| {
                             ReviewSummaryStoreError::malformed("stored review excerpt")
                         })
                     })

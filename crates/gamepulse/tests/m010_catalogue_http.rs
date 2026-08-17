@@ -411,16 +411,16 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
         "<form class=\"catalogue-controls\" action=\"/games\" method=\"get\" role=\"search\">"
     ));
     assert!(all_games.contains("<ol class=\"game-grid\" aria-label=\"Stored games\">"));
+    assert!(all_games.contains(
+        "<img class=\"cover-image\" src=\"https://www.metacritic.com/images/example-game.jpg\" alt=\"Cover for Alpha\">"
+    ));
     assert!(all_games.contains("class=\"cover-placeholder\" aria-hidden=\"true\""));
-    assert!(all_games.contains("Cover reference stored · external image not loaded"));
     assert!(all_games.contains("No local cover image stored"));
     assert!(all_games.contains("class=\"score-badge__label\">Metascore"));
     assert!(
         all_games
             .contains("background: var(--primary-strong); color: var(--canvas); font-weight: 800;")
     );
-    assert!(!all_games.contains("<img"));
-    assert!(!all_games.contains("src=\"https://www.metacritic.com/images/example-game.jpg\""));
 
     let (status, search) = read_response(
         gamepulse_web::catalogue_response(Arc::clone(&catalogue), Some("q=aLpHa")).await,
@@ -453,13 +453,11 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
     assert!(detail.contains("Alpha &#60;untrusted&#62; description"));
     assert!(detail.contains("<nav class=\"breadcrumb\" aria-label=\"Breadcrumb\">"));
     assert!(detail.contains(
-        "<div class=\"cover-placeholder cover-placeholder--large\" aria-hidden=\"true\">GP</div>"
+        "<img class=\"cover-image cover-image--large\" src=\"https://www.metacritic.com/images/example-game.jpg\" alt=\"Cover for Alpha\">"
     ));
     assert!(detail.contains("<caption>Stored score comparison by platform</caption>"));
     assert!(detail.contains("<th scope=\"col\">Userscore</th>"));
     assert!(detail.contains("<details class=\"provenance\">"));
-    assert!(!detail.contains("<img"));
-    assert!(!detail.contains("src=\"https://www.metacritic.com/images/example-game.jpg\""));
     assert!(detail.contains("products/example"));
     assert!(detail.contains(
         "href=\"https://video.example.test/embed\" rel=\"noopener noreferrer\" target=\"_blank\""

@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gamepulse_application::{
-    BrowseProgress, CrawlDayKey, DailyCrawlCommit, DailyCrawlState, DailyCrawlStatePort,
+    AsyncDailyCrawlSourcePort, BrowseCursor, BrowseProgress, CrawlDayKey, CrawlDiscoveryRequest,
+    DailyCrawlCommit, DailyCrawlState, DailyCrawlStatePort, DiscoveryCandidate, DiscoveryPage,
     HourlyJobSchedule, JobHandler, JobHandlerRegistry, JobHandlerResult, JobRecord, JobStatus,
     JobStore, JobTimestamp, RuntimeJobType, SourceIngestionJobSchedule, TypedJob,
 };
@@ -94,6 +95,7 @@ enum MemoryStateError {
 #[derive(Default)]
 struct MemoryDailyCrawlState {
     states: BTreeMap<CrawlDayKey, DailyCrawlState>,
+    commits: Vec<DailyCrawlCommit>,
     fail_commit: bool,
 }
 
@@ -110,7 +112,63 @@ impl DailyCrawlStatePort for MemoryDailyCrawlState {
         }
         self.states
             .insert(commit.state().day().clone(), commit.state().clone());
+        self.commits.push(commit);
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct DirectDailySourceState {
+    responses: VecDeque<Result<DiscoveryPage, FixtureTransportError>>,
+    calls: Vec<CrawlDiscoveryRequest>,
+}
+
+#[derive(Clone, Default)]
+struct DirectDailySource {
+    state: Arc<Mutex<DirectDailySourceState>>,
+}
+
+impl DirectDailySource {
+    fn with_responses(
+        responses: impl IntoIterator<Item = Result<DiscoveryPage, FixtureTransportError>>,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(DirectDailySourceState {
+                responses: responses.into_iter().collect(),
+                calls: Vec::new(),
+            })),
+        }
+    }
+
+    fn calls(&self) -> Vec<CrawlDiscoveryRequest> {
+        self.state
+            .lock()
+            .expect("direct source state must not be poisoned")
+            .calls
+            .clone()
+    }
+}
+
+impl AsyncDailyCrawlSourcePort for DirectDailySource {
+    type Error = FixtureTransportError;
+    type DiscoverFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<DiscoveryPage, Self::Error>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn discover(&self, request: CrawlDiscoveryRequest) -> Self::DiscoverFuture<'_> {
+        let response = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("direct source state must not be poisoned");
+            state.calls.push(request);
+            state
+                .responses
+                .pop_front()
+                .expect("direct source needs one response per request")
+        };
+        Box::pin(async move { response })
     }
 }
 
@@ -173,8 +231,23 @@ fn fixture_browse_page() -> String {
         .replace("offset=20&limit=20", "offset=24&limit=24")
 }
 
+fn fixture_exhausted_browse_page() -> String {
+    fixture_browse_page().replace("\"next\": {", "\"later\": {")
+}
+
 fn source_ingestion_schedule() -> SourceIngestionJobSchedule {
     SourceIngestionJobSchedule::new(1).expect("source ingestion schedule must be valid")
+}
+
+fn direct_page(ids: std::ops::RangeInclusive<u64>, next: Option<u64>) -> DiscoveryPage {
+    DiscoveryPage::new(
+        ids.map(|id| {
+            DiscoveryCandidate::new(id, format!("game-{id}"))
+                .expect("direct fixture candidate must be valid")
+        })
+        .collect(),
+        next.map(BrowseCursor::new),
+    )
 }
 
 fn result_is_failure(result: JobHandlerResult) -> bool {
@@ -250,7 +323,7 @@ async fn same_utc_day_browses_and_a_new_utc_day_restarts_new_releases() {
     let state = Arc::new(Mutex::new(MemoryDailyCrawlState::default()));
     let transport = FixtureListingTransport::with_responses([
         Ok(LISTING_FIXTURE.to_owned()),
-        Ok(fixture_browse_page()),
+        Ok(fixture_exhausted_browse_page()),
         Ok(LISTING_FIXTURE.to_owned()),
     ]);
     let handler = HourlyDiscoveryHandler::new(
@@ -282,6 +355,61 @@ async fn same_utc_day_browses_and_a_new_utc_day_restarts_new_releases() {
     );
     let state = state.lock().expect("memory state must not be poisoned");
     assert_eq!(state.states.len(), 2);
+}
+
+#[tokio::test]
+async fn replayed_twenty_four_item_browse_page_continues_to_one_atomic_twenty_item_hourly_commit() {
+    let day = CrawlDayKey::new("1970-01-01").expect("test day must be valid");
+    let processed = (1..=20)
+        .map(|id| gamepulse_application::SourceProductId::new(id).expect("test ID must be valid"));
+    let state = Arc::new(Mutex::new(MemoryDailyCrawlState {
+        states: BTreeMap::from([(
+            day.clone(),
+            DailyCrawlState::restored(day.clone(), processed, true, BrowseProgress::Initial),
+        )]),
+        ..Default::default()
+    }));
+    let source = DirectDailySource::with_responses([
+        Ok(direct_page(1..=24, Some(24))),
+        Ok(direct_page(25..=40, Some(48))),
+    ]);
+    let handler =
+        HourlyDiscoveryHandler::new(state.clone(), source.clone(), source_ingestion_schedule());
+
+    assert!(matches!(
+        handler.handle(typed_hourly_job("hour-slot:0")).await,
+        JobHandlerResult::Succeeded
+    ));
+
+    assert_eq!(
+        source.calls(),
+        [
+            CrawlDiscoveryRequest::NewestBrowse { cursor: None },
+            CrawlDiscoveryRequest::NewestBrowse {
+                cursor: Some(BrowseCursor::new(24)),
+            },
+        ]
+    );
+    let state = state.lock().expect("memory state must not be poisoned");
+    assert_eq!(state.commits.len(), 1);
+    assert_eq!(state.commits[0].selected().len(), 20);
+    assert_eq!(state.commits[0].jobs().len(), 20);
+    assert_eq!(
+        state.commits[0]
+            .selected()
+            .iter()
+            .map(|candidate| candidate.source_product_id().value())
+            .collect::<Vec<_>>(),
+        (21..=40).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        state
+            .states
+            .get(&day)
+            .expect("updated state must persist")
+            .browse_progress(),
+        BrowseProgress::Continue(BrowseCursor::new(48))
+    );
 }
 
 #[tokio::test]

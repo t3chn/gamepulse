@@ -25,11 +25,11 @@ use gamepulse_application::{
     AsyncDailyCrawlSourcePort, AsyncReviewSourceIngestionPort, AsyncSourceIngestionPort,
     CrawlDayKey, CrawlDiscoveryRequest, DailyCrawlStatePort, DiscoveryCandidate, DiscoveryPage,
     GameReviewRefreshStore, GameSnapshotStore, JobHandler, JobHandlerFailure, JobHandlerFuture,
-    JobHandlerResult, ReviewInput, ReviewSourceIngestion, ReviewSourceIngestionError,
-    ReviewSummaryJobSchedule, RuntimeJobType, SourceIngestionJobSchedule, SourceIngestionRequest,
-    TypedJob, execute_async_daily_crawl_with_source_ingestion_jobs,
-    execute_async_review_source_ingestion, execute_async_source_ingestion,
-    persist_game_review_refresh, upsert_game_snapshot,
+    JobHandlerResult, ReviewInput, ReviewPolarity, ReviewSourceIngestion,
+    ReviewSourceIngestionError, ReviewSummaryJobSchedule, RuntimeJobType,
+    SourceIngestionJobSchedule, SourceIngestionRequest, TypedJob,
+    execute_async_daily_crawl_with_source_ingestion_jobs, execute_async_review_source_ingestion,
+    execute_async_source_ingestion, persist_game_review_refresh, upsert_game_snapshot,
 };
 use gamepulse_domain::{
     BrowseCursor, GameCoverDescriptor, GameDeveloper, GamePlatformScore, GamePublicCoverUrl,
@@ -1773,9 +1773,11 @@ pub fn map_review_page_to_input(
     let excerpts = page
         .reviews
         .iter()
-        .filter_map(|review| review.excerpt.as_deref())
-        .filter_map(bounded_review_excerpt)
-        .map(ReviewExcerpt::new)
+        .filter_map(|review| {
+            bounded_review_excerpt(review.excerpt.as_deref()?)
+                .map(|excerpt| (excerpt, score_polarity(page.kind, review.score)))
+        })
+        .map(|(excerpt, polarity)| ReviewExcerpt::with_polarity(excerpt, polarity))
         .collect::<Result<Vec<_>, _>>()
         .map_err(ReviewInputMappingError::InvalidExcerpt)?;
     ReviewInput::new(source_product_id, page.kind, excerpts)
@@ -1792,6 +1794,19 @@ fn bounded_review_excerpt(value: &str) -> Option<String> {
         end -= 1;
     }
     Some(value[..end].to_owned())
+}
+
+/// Keep only clear source-score polarity as a fallback signal. Explicit text sentiment remains
+/// the primary classifier, while mid-range or absent scores stay unknown rather than guessed.
+fn score_polarity(kind: ReviewKind, score: Option<f64>) -> Option<ReviewPolarity> {
+    let score = score?;
+    match kind {
+        ReviewKind::Critic if score >= 75.0 => Some(ReviewPolarity::Positive),
+        ReviewKind::Critic if score <= 45.0 => Some(ReviewPolarity::Negative),
+        ReviewKind::User if score >= 7.5 => Some(ReviewPolarity::Positive),
+        ReviewKind::User if score <= 4.5 => Some(ReviewPolarity::Negative),
+        ReviewKind::Critic | ReviewKind::User => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

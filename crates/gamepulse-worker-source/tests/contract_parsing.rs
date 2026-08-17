@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use gamepulse_domain::SourceProductId;
+use gamepulse_domain::{ReviewPolarity, SourceProductId};
 use gamepulse_worker_source::{
     GameId, GameIdentity, ListMode, ReviewKind, SourceError, SourceIngestionFailureCategory,
     classify_review_page_source_error, map_listing_page_for_daily_crawl, map_review_page_to_input,
@@ -199,6 +199,14 @@ fn maps_only_one_bounded_first_page_into_separate_synthetic_review_inputs() {
     assert_eq!(user_input.kind(), ReviewKind::User);
     assert_eq!(critic_input.excerpts().len(), 2);
     assert_eq!(user_input.excerpts().len(), 2);
+    assert_eq!(
+        critic_input.excerpts()[0].polarity(),
+        Some(ReviewPolarity::Positive)
+    );
+    assert_eq!(
+        user_input.excerpts()[0].polarity(),
+        Some(ReviewPolarity::Positive)
+    );
     assert_ne!(critic_input.content_hash(), user_input.content_hash());
 }
 

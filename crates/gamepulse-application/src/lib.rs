@@ -10,13 +10,18 @@ use std::sync::Arc;
 
 pub use gamepulse_domain::{
     APP_NAME, BrowseCursor, BrowseProgress, CrawlDayKey, CrawlDayKeyError, CrawlDiscoveryRequest,
-    DailyCrawlAction, DailyCrawlState, DailyCrawlTransition, GameCoverDescriptor, GameDeveloper,
-    GamePlatformScore, GamePublicCoverUrl, GameSnapshot, GameSnapshotValidationError,
-    GameVideoLink, Metascore, MetascoreError, REVIEW_EXCERPT_MAX_BYTES, REVIEW_INPUT_LIMIT,
-    ReviewExcerpt, ReviewExcerptError, ReviewKind, SourceProductId, SourceProductIdError,
-    Userscore, UserscoreError,
+    DAILY_CRAWL_SELECTION_LIMIT, DailyCrawlAction, DailyCrawlState, DailyCrawlTransition,
+    GameCoverDescriptor, GameDeveloper, GamePlatformScore, GamePublicCoverUrl, GameSnapshot,
+    GameSnapshotValidationError, GameVideoLink, Metascore, MetascoreError,
+    REVIEW_EXCERPT_MAX_BYTES, REVIEW_INPUT_LIMIT, ReviewExcerpt, ReviewExcerptError, ReviewKind,
+    ReviewPolarity, SourceProductId, SourceProductIdError, Userscore, UserscoreError,
 };
-use gamepulse_domain::{prepare_daily_crawl, select_daily_crawl};
+use gamepulse_domain::{prepare_daily_crawl, select_daily_crawl_up_to};
+
+/// One hourly browse selection can advance through at most this many source pages before failing
+/// closed. It bounds source work while still allowing a replayed page to be completed with later
+/// newest-first pages in the same atomic commit.
+const MAX_BROWSE_PAGES_PER_HOURLY_SELECTION: usize = 8;
 
 /// Application-owned durable boundary for replacing one complete game snapshot.
 ///
@@ -421,7 +426,8 @@ where
 }
 
 /// One kind-separated, bounded source input together with the durable content hash used for
-/// summary freshness. The hash is over the exact retained excerpt bytes and source kind.
+/// summary freshness. The hash is over the exact retained excerpt bytes, retained polarity, and
+/// source kind.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewInput {
     source_product_id: SourceProductId,
@@ -488,6 +494,28 @@ pub struct ReviewContentHash(String);
 
 impl ReviewContentHash {
     fn for_input(kind: ReviewKind, excerpts: &[ReviewExcerpt]) -> Self {
+        if excerpts.iter().all(|excerpt| excerpt.polarity().is_none()) {
+            return Self::legacy_for_input(kind, excerpts);
+        }
+
+        let mut bytes = Vec::new();
+        append_hash_field(&mut bytes, b"gamepulse-review-input:v2");
+        append_hash_field(&mut bytes, kind.as_str().as_bytes());
+        for excerpt in excerpts {
+            append_hash_field(&mut bytes, excerpt.as_str().as_bytes());
+            append_hash_field(
+                &mut bytes,
+                excerpt
+                    .polarity()
+                    .map(ReviewPolarity::as_str)
+                    .unwrap_or("unknown")
+                    .as_bytes(),
+            );
+        }
+        Self(sha256_hex(&bytes))
+    }
+
+    fn legacy_for_input(kind: ReviewKind, excerpts: &[ReviewExcerpt]) -> Self {
         let mut bytes = Vec::new();
         append_hash_field(&mut bytes, kind.as_str().as_bytes());
         for excerpt in excerpts {
@@ -1416,34 +1444,47 @@ where
     D: DailyCrawlSourcePort,
 {
     let expected_previous_state = state_port.load(&day).map_err(DailyCrawlError::Load)?;
-
-    let discovery = match prepare_daily_crawl(day, expected_previous_state.clone()) {
+    let mut discovery = match prepare_daily_crawl(day.clone(), expected_previous_state.clone()) {
         DailyCrawlAction::Discover(discovery) => discovery,
         DailyCrawlAction::Exhausted(state) => return Ok(DailyCrawlOutcome::Exhausted(state)),
     };
-    let request = discovery.request();
-    let page = source_port
-        .discover(request)
-        .map_err(DailyCrawlError::Source)?;
-    let transition = select_daily_crawl(
-        discovery,
-        page.candidates()
-            .iter()
-            .map(DiscoveryCandidate::source_product_id),
-        page.next_browse_cursor(),
-    );
-    let selected = selected_candidates(&page, &transition);
-    let state = transition.next_state().clone();
-    let commit = DailyCrawlCommit::new(expected_previous_state, state.clone(), selected.clone())
-        .map_err(DailyCrawlError::InvalidCommit)?;
+    let initial_request = discovery.request();
+    let mut selected = Vec::new();
+    let mut browse_page_count = 0;
 
-    state_port.commit(commit).map_err(DailyCrawlError::Commit)?;
+    loop {
+        let request = discovery.request();
+        count_browse_page(request, &mut browse_page_count)?;
+        let page = source_port
+            .discover(request)
+            .map_err(DailyCrawlError::Source)?;
+        let transition = select_daily_crawl_up_to(
+            discovery,
+            page.candidates()
+                .iter()
+                .map(DiscoveryCandidate::source_product_id),
+            page.next_browse_cursor(),
+            DAILY_CRAWL_SELECTION_LIMIT - selected.len(),
+        );
+        selected.extend(selected_candidates(&page, &transition));
+        let state = transition.next_state().clone();
 
-    Ok(DailyCrawlOutcome::Selected(DailyCrawlSelection {
-        request,
-        selected,
-        state,
-    }))
+        if let Some(next_discovery) = next_browse_discovery(&day, request, &state, selected.len()) {
+            discovery = next_discovery;
+            continue;
+        }
+
+        let commit =
+            DailyCrawlCommit::new(expected_previous_state, state.clone(), selected.clone())
+                .map_err(DailyCrawlError::InvalidCommit)?;
+        state_port.commit(commit).map_err(DailyCrawlError::Commit)?;
+
+        return Ok(DailyCrawlOutcome::Selected(DailyCrawlSelection {
+            request: initial_request,
+            selected,
+            state,
+        }));
+    }
 }
 
 /// Plan, asynchronously discover, select, and atomically publish one daily-crawl transition.
@@ -1463,34 +1504,48 @@ where
     D: AsyncDailyCrawlSourcePort,
 {
     let expected_previous_state = load_state(&day).map_err(DailyCrawlError::Load)?;
-    let discovery = match prepare_daily_crawl(day, expected_previous_state.clone()) {
+    let mut discovery = match prepare_daily_crawl(day.clone(), expected_previous_state.clone()) {
         DailyCrawlAction::Discover(discovery) => discovery,
         DailyCrawlAction::Exhausted(state) => return Ok(DailyCrawlOutcome::Exhausted(state)),
     };
-    let request = discovery.request();
-    let page = source_port
-        .discover(request)
-        .await
-        .map_err(DailyCrawlError::Source)?;
-    let transition = select_daily_crawl(
-        discovery,
-        page.candidates()
-            .iter()
-            .map(DiscoveryCandidate::source_product_id),
-        page.next_browse_cursor(),
-    );
-    let selected = selected_candidates(&page, &transition);
-    let state = transition.next_state().clone();
-    let commit = DailyCrawlCommit::new(expected_previous_state, state.clone(), selected.clone())
-        .map_err(DailyCrawlError::InvalidCommit)?;
+    let initial_request = discovery.request();
+    let mut selected = Vec::new();
+    let mut browse_page_count = 0;
 
-    commit_state(commit).map_err(DailyCrawlError::Commit)?;
+    loop {
+        let request = discovery.request();
+        count_browse_page(request, &mut browse_page_count)?;
+        let page = source_port
+            .discover(request)
+            .await
+            .map_err(DailyCrawlError::Source)?;
+        let transition = select_daily_crawl_up_to(
+            discovery,
+            page.candidates()
+                .iter()
+                .map(DiscoveryCandidate::source_product_id),
+            page.next_browse_cursor(),
+            DAILY_CRAWL_SELECTION_LIMIT - selected.len(),
+        );
+        selected.extend(selected_candidates(&page, &transition));
+        let state = transition.next_state().clone();
 
-    Ok(DailyCrawlOutcome::Selected(DailyCrawlSelection {
-        request,
-        selected,
-        state,
-    }))
+        if let Some(next_discovery) = next_browse_discovery(&day, request, &state, selected.len()) {
+            discovery = next_discovery;
+            continue;
+        }
+
+        let commit =
+            DailyCrawlCommit::new(expected_previous_state, state.clone(), selected.clone())
+                .map_err(DailyCrawlError::InvalidCommit)?;
+        commit_state(commit).map_err(DailyCrawlError::Commit)?;
+
+        return Ok(DailyCrawlOutcome::Selected(DailyCrawlSelection {
+            request: initial_request,
+            selected,
+            state,
+        }));
+    }
 }
 
 /// Plan, asynchronously discover, and atomically publish a daily transition with its derived
@@ -1513,36 +1568,82 @@ where
     D: AsyncDailyCrawlSourcePort,
 {
     let expected_previous_state = load_state(&day).map_err(DailyCrawlError::Load)?;
-    let discovery = match prepare_daily_crawl(day, expected_previous_state.clone()) {
+    let mut discovery = match prepare_daily_crawl(day.clone(), expected_previous_state.clone()) {
         DailyCrawlAction::Discover(discovery) => discovery,
         DailyCrawlAction::Exhausted(state) => return Ok(DailyCrawlOutcome::Exhausted(state)),
     };
-    let request = discovery.request();
-    let page = source_port
-        .discover(request)
-        .await
-        .map_err(DailyCrawlError::Source)?;
-    let transition = select_daily_crawl(
-        discovery,
-        page.candidates()
-            .iter()
-            .map(DiscoveryCandidate::source_product_id),
-        page.next_browse_cursor(),
-    );
-    let selected = selected_candidates(&page, &transition);
-    let state = transition.next_state().clone();
-    let commit = DailyCrawlCommit::new(expected_previous_state, state.clone(), selected.clone())
-        .map_err(DailyCrawlError::InvalidCommit)?
-        .with_source_ingestion_jobs(schedule, created_at)
-        .map_err(DailyCrawlError::JobSchedule)?;
+    let initial_request = discovery.request();
+    let mut selected = Vec::new();
+    let mut browse_page_count = 0;
 
-    commit_state(commit).map_err(DailyCrawlError::Commit)?;
+    loop {
+        let request = discovery.request();
+        count_browse_page(request, &mut browse_page_count)?;
+        let page = source_port
+            .discover(request)
+            .await
+            .map_err(DailyCrawlError::Source)?;
+        let transition = select_daily_crawl_up_to(
+            discovery,
+            page.candidates()
+                .iter()
+                .map(DiscoveryCandidate::source_product_id),
+            page.next_browse_cursor(),
+            DAILY_CRAWL_SELECTION_LIMIT - selected.len(),
+        );
+        selected.extend(selected_candidates(&page, &transition));
+        let state = transition.next_state().clone();
 
-    Ok(DailyCrawlOutcome::Selected(DailyCrawlSelection {
-        request,
-        selected,
-        state,
-    }))
+        if let Some(next_discovery) = next_browse_discovery(&day, request, &state, selected.len()) {
+            discovery = next_discovery;
+            continue;
+        }
+
+        let commit =
+            DailyCrawlCommit::new(expected_previous_state, state.clone(), selected.clone())
+                .map_err(DailyCrawlError::InvalidCommit)?
+                .with_source_ingestion_jobs(schedule, created_at)
+                .map_err(DailyCrawlError::JobSchedule)?;
+        commit_state(commit).map_err(DailyCrawlError::Commit)?;
+
+        return Ok(DailyCrawlOutcome::Selected(DailyCrawlSelection {
+            request: initial_request,
+            selected,
+            state,
+        }));
+    }
+}
+
+fn count_browse_page<StateError, SourceError>(
+    request: CrawlDiscoveryRequest,
+    browse_page_count: &mut usize,
+) -> Result<(), DailyCrawlError<StateError, SourceError>> {
+    if matches!(request, CrawlDiscoveryRequest::NewestBrowse { .. }) {
+        *browse_page_count += 1;
+        if *browse_page_count > MAX_BROWSE_PAGES_PER_HOURLY_SELECTION {
+            return Err(DailyCrawlError::BrowseContinuationLimit);
+        }
+    }
+    Ok(())
+}
+
+fn next_browse_discovery(
+    day: &CrawlDayKey,
+    request: CrawlDiscoveryRequest,
+    state: &DailyCrawlState,
+    selected_count: usize,
+) -> Option<gamepulse_domain::DailyCrawlDiscovery> {
+    if !matches!(request, CrawlDiscoveryRequest::NewestBrowse { .. })
+        || selected_count == DAILY_CRAWL_SELECTION_LIMIT
+        || matches!(state.browse_progress(), BrowseProgress::Exhausted)
+    {
+        return None;
+    }
+
+    match prepare_daily_crawl(day.clone(), Some(state.clone())) {
+        DailyCrawlAction::Discover(discovery) => Some(discovery),
+        DailyCrawlAction::Exhausted(_) => None,
+    }
 }
 
 fn selected_candidates(
@@ -1623,6 +1724,7 @@ impl std::error::Error for DailyCrawlCommitError {}
 pub enum DailyCrawlError<StateError, SourceError> {
     Load(StateError),
     Source(SourceError),
+    BrowseContinuationLimit,
     InvalidCommit(DailyCrawlCommitError),
     JobSchedule(SourceIngestionJobScheduleError),
     Commit(StateError),

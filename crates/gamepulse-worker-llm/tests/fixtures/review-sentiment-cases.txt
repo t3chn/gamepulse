@@ -1,0 +1,6 @@
+positive|like|Excellent controls and polished presentation.
+negative|dislike|Poor performance and boring missions.
+negated-positive|dislike|The combat is not good.
+negated-negative|like|The pacing is not bad.
+mixed|mixed|The combat is great but the progression is boring.
+unknown|unknown|The game launches on Tuesday.
