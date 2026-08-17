@@ -30,7 +30,8 @@ const JOB_QUEUE_SCHEMA_VERSION: i64 = 2;
 const GAME_SNAPSHOT_SCHEMA_VERSION: i64 = 3;
 const REVIEW_SUMMARY_SCHEMA_VERSION: i64 = 4;
 const PUBLIC_COVER_URL_SCHEMA_VERSION: i64 = 5;
-const SCHEMA_VERSION: i64 = 6;
+const REVIEW_EXCERPT_POLARITY_SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const DAILY_CRAWL_MIGRATION_0001: &str = include_str!("../migrations/0001_daily_crawl_state.sql");
 const JOB_QUEUE_MIGRATION_0002: &str = include_str!("../migrations/0002_job_queue.sql");
 const GAME_SNAPSHOT_MIGRATION_0003: &str = include_str!("../migrations/0003_game_snapshots.sql");
@@ -39,6 +40,8 @@ const PUBLIC_COVER_URL_MIGRATION_0005: &str =
     include_str!("../migrations/0005_public_cover_url.sql");
 const REVIEW_EXCERPT_POLARITY_MIGRATION_0006: &str =
     include_str!("../migrations/0006_review_excerpt_polarity.sql");
+const RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007: &str =
+    include_str!("../migrations/0007_retry_backoff_and_source_pacing.sql");
 
 /// Read-only SQLite readiness adapter for the configured persistent database.
 ///
@@ -359,6 +362,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(REVIEW_EXCERPT_POLARITY_MIGRATION_0006)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -386,6 +392,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(REVIEW_EXCERPT_POLARITY_MIGRATION_0006)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -394,7 +403,7 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
         }
         JOB_QUEUE_SCHEMA_VERSION => {
             validate_daily_crawl_schema(connection)?;
-            validate_job_queue_schema(connection)?;
+            validate_job_queue_schema_before_retry_pacing(connection)?;
             let transaction = connection
                 .transaction()
                 .map_err(DailyCrawlStateStoreError::database)?;
@@ -411,6 +420,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(REVIEW_EXCERPT_POLARITY_MIGRATION_0006)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -419,7 +431,7 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
         }
         GAME_SNAPSHOT_SCHEMA_VERSION => {
             validate_daily_crawl_schema(connection)?;
-            validate_job_queue_schema(connection)?;
+            validate_job_queue_schema_before_retry_pacing(connection)?;
             validate_game_snapshot_schema_before_public_cover(connection)?;
             let transaction = connection
                 .transaction()
@@ -434,6 +446,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(REVIEW_EXCERPT_POLARITY_MIGRATION_0006)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -442,7 +457,7 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
         }
         REVIEW_SUMMARY_SCHEMA_VERSION => {
             validate_daily_crawl_schema(connection)?;
-            validate_job_queue_schema(connection)?;
+            validate_job_queue_schema_before_retry_pacing(connection)?;
             validate_game_snapshot_schema_before_public_cover(connection)?;
             validate_review_summary_schema_before_polarity(connection)?;
             let transaction = connection
@@ -455,6 +470,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(REVIEW_EXCERPT_POLARITY_MIGRATION_0006)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -463,7 +481,7 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
         }
         PUBLIC_COVER_URL_SCHEMA_VERSION => {
             validate_daily_crawl_schema(connection)?;
-            validate_job_queue_schema(connection)?;
+            validate_job_queue_schema_before_retry_pacing(connection)?;
             validate_game_snapshot_schema(connection)?;
             validate_review_summary_schema_before_polarity(connection)?;
             let transaction = connection
@@ -471,6 +489,27 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .execute_batch(REVIEW_EXCERPT_POLARITY_MIGRATION_0006)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .commit()
+                .map_err(DailyCrawlStateStoreError::database)
+        }
+        REVIEW_EXCERPT_POLARITY_SCHEMA_VERSION => {
+            validate_daily_crawl_schema(connection)?;
+            validate_job_queue_schema_before_retry_pacing(connection)?;
+            validate_game_snapshot_schema(connection)?;
+            validate_review_summary_schema(connection)?;
+            let transaction = connection
+                .transaction()
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -596,8 +635,8 @@ fn validate_job_queue_schema(connection: &mut Connection) -> Result<(), DailyCra
     validate_job_queue_constraint_behavior(connection)
 }
 
-fn validate_job_queue_schema_structure(
-    connection: &Connection,
+fn validate_job_queue_schema_before_retry_pacing(
+    connection: &mut Connection,
 ) -> Result<(), DailyCrawlStateStoreError> {
     validate_table_columns(
         connection,
@@ -632,9 +671,74 @@ fn validate_job_queue_schema_structure(
             ("error", "TEXT", 0, 0),
         ],
     )?;
+    validate_table_layout(connection, "jobs", false)?;
+    validate_table_layout(connection, "job_attempts", true)?;
+    validate_foreign_key_groups(
+        connection,
+        "job_attempts",
+        &[(
+            0,
+            0,
+            "jobs",
+            "job_identity",
+            "job_identity",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE",
+        )],
+    )?;
+    validate_job_queue_constraint_behavior(connection)
+}
+
+fn validate_job_queue_schema_structure(
+    connection: &Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    validate_table_columns(
+        connection,
+        "jobs",
+        &[
+            ("job_identity", "TEXT", 1, 1),
+            ("job_type", "TEXT", 1, 0),
+            ("work_ref", "TEXT", 1, 0),
+            ("max_attempts", "INTEGER", 1, 0),
+            ("attempt_count", "INTEGER", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("updated_at", "INTEGER", 1, 0),
+            ("claimed_by", "TEXT", 0, 0),
+            ("lease_expires_at", "INTEGER", 0, 0),
+            ("claim_token", "INTEGER", 1, 0),
+            ("terminal_at", "INTEGER", 0, 0),
+            ("last_error", "TEXT", 0, 0),
+            ("retry_not_before", "INTEGER", 0, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "job_attempts",
+        &[
+            ("job_identity", "TEXT", 1, 1),
+            ("attempt_number", "INTEGER", 1, 0),
+            ("claim_token", "INTEGER", 1, 2),
+            ("worker_id", "TEXT", 1, 0),
+            ("started_at", "INTEGER", 1, 0),
+            ("finished_at", "INTEGER", 0, 0),
+            ("outcome", "TEXT", 1, 0),
+            ("error", "TEXT", 0, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "job_lane_pacing",
+        &[
+            ("lane_key", "TEXT", 1, 1),
+            ("next_claim_at", "INTEGER", 1, 0),
+        ],
+    )?;
 
     validate_table_layout(connection, "jobs", false)?;
     validate_table_layout(connection, "job_attempts", true)?;
+    validate_table_layout(connection, "job_lane_pacing", true)?;
     validate_foreign_key_groups(
         connection,
         "job_attempts",

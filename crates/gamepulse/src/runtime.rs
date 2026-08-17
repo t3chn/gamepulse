@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gamepulse_application::{
-    ClaimedJob, HourlyJobSchedule, JobClaimRequest, JobCompletion, JobEnqueueResult, JobFailure,
-    JobFailureResult, JobHandlerFailure, JobHandlerRegistry, JobHandlerResult, JobInputError,
-    JobStore, JobTimestamp, RuntimeJobTypeFilter, TypedJob,
+    ClaimedJob, HourlyJobSchedule, JobClaimPacing, JobClaimRequest, JobCompletion,
+    JobEnqueueResult, JobFailure, JobFailureResult, JobHandlerFailure, JobHandlerRegistry,
+    JobHandlerResult, JobInputError, JobStore, JobTimestamp, RuntimeJobTypeFilter, TypedJob,
 };
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
@@ -62,6 +62,7 @@ pub struct RuntimeConfig {
     concurrency_limit: usize,
     hourly_schedule: Option<HourlyJobSchedule>,
     claim_filter: Option<RuntimeJobTypeFilter>,
+    claim_pacing: Option<JobClaimPacing>,
 }
 
 impl RuntimeConfig {
@@ -87,6 +88,7 @@ impl RuntimeConfig {
             concurrency_limit,
             hourly_schedule: Some(hourly_schedule),
             claim_filter: None,
+            claim_pacing: None,
         })
     }
 
@@ -112,12 +114,19 @@ impl RuntimeConfig {
             concurrency_limit,
             hourly_schedule: None,
             claim_filter: None,
+            claim_pacing: None,
         })
     }
 
     /// Restrict this runtime instance to one worker lane's durable job types.
     pub fn with_claim_filter(mut self, claim_filter: RuntimeJobTypeFilter) -> Self {
         self.claim_filter = Some(claim_filter);
+        self
+    }
+
+    /// Persist a minimum interval between durable claims for this runtime lane.
+    pub fn with_claim_pacing(mut self, claim_pacing: JobClaimPacing) -> Self {
+        self.claim_pacing = Some(claim_pacing);
         self
     }
 }
@@ -250,12 +259,7 @@ where
         let claimed_at = self.clock.now().map_err(|_| RuntimeError::Clock)?;
 
         while self.accepting_work && self.tasks.len() < self.config.concurrency_limit {
-            let claim_request = JobClaimRequest::new(
-                self.config.worker_id.clone(),
-                claimed_at,
-                self.config.lease_seconds,
-            )
-            .map_err(|_| RuntimeError::InvalidJobInput)?;
+            let claim_request = self.claim_request(claimed_at)?;
             let claimed = if let Some(claim_filter) = &self.config.claim_filter {
                 self.store()?
                     .claim_next_matching(claim_request, claim_filter.job_types())
@@ -330,6 +334,8 @@ where
         tokio::pin!(shutdown_signal);
 
         loop {
+            let claim_wait = self.next_claim_wait()?;
+            let claim_sleep = claim_wait.unwrap_or(Duration::ZERO);
             tokio::select! {
                 biased;
                 _ = &mut shutdown_signal => {
@@ -343,6 +349,9 @@ where
                     if self.accepting_work {
                         self.dispatch_available()?;
                     }
+                }
+                _ = tokio::time::sleep(claim_sleep), if claim_wait.is_some() => {
+                    self.dispatch_available()?;
                 }
                 _ = interval.tick() => {
                     self.tick()?;
@@ -368,6 +377,8 @@ where
         tokio::pin!(shutdown_signal);
 
         loop {
+            let claim_wait = self.next_claim_wait()?;
+            let claim_sleep = claim_wait.unwrap_or(Duration::ZERO);
             tokio::select! {
                 biased;
                 _ = &mut shutdown_signal => {
@@ -386,6 +397,9 @@ where
                     if self.accepting_work {
                         self.dispatch_available()?;
                     }
+                }
+                _ = tokio::time::sleep(claim_sleep), if claim_wait.is_some() => {
+                    self.dispatch_available()?;
                 }
                 _ = interval.tick() => {
                     self.tick()?;
@@ -406,6 +420,40 @@ where
 
     fn store(&self) -> Result<MutexGuard<'_, S>, RuntimeError> {
         self.store.lock().map_err(|_| RuntimeError::StorePoisoned)
+    }
+
+    fn claim_request(&self, claimed_at: JobTimestamp) -> Result<JobClaimRequest, RuntimeError> {
+        let request = JobClaimRequest::new(
+            self.config.worker_id.clone(),
+            claimed_at,
+            self.config.lease_seconds,
+        )
+        .map_err(|_| RuntimeError::InvalidJobInput)?;
+        Ok(match &self.config.claim_pacing {
+            Some(pacing) => request.with_pacing(pacing.clone()),
+            None => request,
+        })
+    }
+
+    fn next_claim_wait(&self) -> Result<Option<Duration>, RuntimeError> {
+        if !self.accepting_work || self.tasks.len() >= self.config.concurrency_limit {
+            return Ok(None);
+        }
+        let now = self.clock.now().map_err(|_| RuntimeError::Clock)?;
+        let request = self.claim_request(now)?;
+        let accepted_types = self
+            .config
+            .claim_filter
+            .as_ref()
+            .map_or(&[][..], RuntimeJobTypeFilter::job_types);
+        let eligible_at = self
+            .store()?
+            .next_claim_eligible_at(request, accepted_types)
+            .map_err(|_| RuntimeError::StoreUnavailable)?;
+        Ok(eligible_at.map(|eligible_at| {
+            let seconds = eligible_at.value().saturating_sub(now.value()) as u64;
+            Duration::from_secs(seconds)
+        }))
     }
 }
 

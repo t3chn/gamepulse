@@ -285,6 +285,7 @@ fn summary_job(kind: ReviewKind) -> TypedJob {
         None,
         None,
         None,
+        None,
     ))
     .expect("test record must be a typed job")
 }

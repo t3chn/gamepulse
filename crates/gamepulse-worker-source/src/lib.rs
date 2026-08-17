@@ -23,9 +23,9 @@ use serde_json::Value;
 
 use gamepulse_application::{
     AsyncDailyCrawlSourcePort, AsyncReviewSourceIngestionPort, AsyncSourceIngestionPort,
-    CrawlDayKey, CrawlDiscoveryRequest, DailyCrawlStatePort, DiscoveryCandidate, DiscoveryPage,
-    GameReviewRefreshStore, GameSnapshotStore, JobHandler, JobHandlerFailure, JobHandlerFuture,
-    JobHandlerResult, ReviewInput, ReviewPolarity, ReviewSourceIngestion,
+    CrawlDayKey, CrawlDiscoveryRequest, DailyCrawlOutcome, DailyCrawlStatePort, DiscoveryCandidate,
+    DiscoveryPage, GameReviewRefreshStore, GameSnapshotStore, JobHandler, JobHandlerFailure,
+    JobHandlerFuture, JobHandlerResult, ReviewInput, ReviewPolarity, ReviewSourceIngestion,
     ReviewSourceIngestionError, ReviewSummaryJobSchedule, RuntimeJobType,
     SourceIngestionJobSchedule, SourceIngestionRequest, TypedJob,
     execute_async_daily_crawl_with_source_ingestion_jobs, execute_async_review_source_ingestion,
@@ -241,8 +241,8 @@ where
             .await;
 
             match outcome {
-                Ok(_) => JobHandlerResult::Succeeded,
-                Err(_) => {
+                Ok(DailyCrawlOutcome::Selected(_)) => JobHandlerResult::Succeeded,
+                Ok(DailyCrawlOutcome::Exhausted(_)) | Err(_) => {
                     JobHandlerResult::Failed(JobHandlerFailure::new(HOURLY_DISCOVERY_FAILURE))
                 }
             }

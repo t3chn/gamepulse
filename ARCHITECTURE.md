@@ -219,8 +219,8 @@ hourly source-discovery handler. M003 keeps day reset, numeric-ID uniqueness,
 source-order selection, the 20-item cap, replay of a partially consumed browse
 page, and explicit browse exhaustion in the domain. M021 makes a later browse
 selection follow at most eight validated continuation pages until it has exactly
-20 unique candidates or the source explicitly exhausts, then publish one atomic
-commit; a replayed 24-item page therefore cannot commit its remaining four alone.
+20 unique candidates; source exhaustion returns a fail-closed outcome with no
+commit, so a replayed 24-item page cannot commit its remaining four alone.
 The application owns the discovery and atomic state-commit ports. M004 durably commits the per-day state
 and selected candidate slugs through that port. M005 adds an application-owned
 `JobStore` port plus a SQLite adapter that durably deduplicates stable jobs,
@@ -438,6 +438,18 @@ continuation validation remain unchanged.
 
 M003 requires targeted mutation testing because it introduces daily
 deduplication, crawl progression, and selection policy.
+
+M023 extends the exact-20 rule to the first daily New Releases selection: a
+short page continues through at most eight newest-first browse pages, and only
+an atomic 20-candidate state/job commit is successful. Exhaustion leaves no
+partial selection committed. SQLite owns retry eligibility and a source-lane
+next-claim timestamp, so deterministic retry backoff and pacing survive a
+restart without a database transaction sleeping or an in-memory timer becoming
+queue truth. The source runtime composes the source-lane pace; the queue applies
+it atomically with a claim while preserving the existing 300-second leases and
+claim fencing. [`mise run mutation`](docs/mutation-testing.md) runs three declared temporary source-tree
+mutants against focused exact-20 regressions, classifies caught, noncompiling,
+and surviving mutants, has a hard three-mutant ceiling, and fails on a survivor.
 
 ## Revisit conditions
 

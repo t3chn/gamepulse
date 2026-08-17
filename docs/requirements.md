@@ -6,7 +6,11 @@ Status: captured from the received take-home assignment on 2026-08-14
 
 The service runs once per hour and visits the Metacritic Games section. Each run
 selects 20 games that have not been processed during the current day and inserts
-or updates their information in the service database.
+or updates their information in the service database. A successful daily selection
+is exactly 20 eligible, unique games. If the first New Releases page is short
+after deduplication, the run continues through the bounded newest-first browse
+sequence. If that sequence cannot supply 20 games, the run fails closed: it
+records no partial daily selection and no successful discovery result.
 
 Daily source sequence:
 
@@ -14,6 +18,10 @@ Daily source sequence:
 2. Later selections use SEE ALL sorted by newest and may advance through browse
    pages.
 3. Each new day starts the sequence again from New Releases.
+
+Transient source failures use durable, deterministic retry eligibility and
+source-lane pacing. A process restart must not make a retry or another
+source-lane claim eligible earlier than its persisted time.
 
 Required game information:
 

@@ -1474,6 +1474,10 @@ where
             continue;
         }
 
+        if selected.len() != DAILY_CRAWL_SELECTION_LIMIT {
+            return Ok(DailyCrawlOutcome::Exhausted(state));
+        }
+
         let commit =
             DailyCrawlCommit::new(expected_previous_state, state.clone(), selected.clone())
                 .map_err(DailyCrawlError::InvalidCommit)?;
@@ -1533,6 +1537,10 @@ where
         if let Some(next_discovery) = next_browse_discovery(&day, request, &state, selected.len()) {
             discovery = next_discovery;
             continue;
+        }
+
+        if selected.len() != DAILY_CRAWL_SELECTION_LIMIT {
+            return Ok(DailyCrawlOutcome::Exhausted(state));
         }
 
         let commit =
@@ -1599,6 +1607,10 @@ where
             continue;
         }
 
+        if selected.len() != DAILY_CRAWL_SELECTION_LIMIT {
+            return Ok(DailyCrawlOutcome::Exhausted(state));
+        }
+
         let commit =
             DailyCrawlCommit::new(expected_previous_state, state.clone(), selected.clone())
                 .map_err(DailyCrawlError::InvalidCommit)?
@@ -1633,10 +1645,17 @@ fn next_browse_discovery(
     state: &DailyCrawlState,
     selected_count: usize,
 ) -> Option<gamepulse_domain::DailyCrawlDiscovery> {
-    if !matches!(request, CrawlDiscoveryRequest::NewestBrowse { .. })
-        || selected_count == DAILY_CRAWL_SELECTION_LIMIT
+    if selected_count == DAILY_CRAWL_SELECTION_LIMIT
         || matches!(state.browse_progress(), BrowseProgress::Exhausted)
     {
+        return None;
+    }
+
+    let has_follow_up = match request {
+        CrawlDiscoveryRequest::NewReleases => state.new_releases_completed(),
+        CrawlDiscoveryRequest::NewestBrowse { .. } => true,
+    };
+    if !has_follow_up {
         return None;
     }
 
@@ -1754,6 +1773,33 @@ impl JobTimestamp {
     }
 }
 
+/// The deterministic retry schedule shared by every durable queue adapter.
+pub const RETRY_BACKOFF_BASE_SECONDS: i64 = 30;
+pub const RETRY_BACKOFF_MAX_SECONDS: i64 = 300;
+
+/// Return the bounded delay after a failed or expired attempt number.
+pub fn retry_backoff_seconds(attempt_number: u32) -> i64 {
+    let shift = attempt_number.saturating_sub(1).min(4);
+    let exponential = RETRY_BACKOFF_BASE_SECONDS << shift;
+    if exponential > RETRY_BACKOFF_MAX_SECONDS {
+        RETRY_BACKOFF_MAX_SECONDS
+    } else {
+        exponential
+    }
+}
+
+/// Compute the persisted eligibility time for a non-terminal retry.
+pub fn retry_not_before(
+    failed_at: JobTimestamp,
+    attempt_number: u32,
+) -> Result<JobTimestamp, JobInputError> {
+    failed_at
+        .value()
+        .checked_add(retry_backoff_seconds(attempt_number))
+        .map(JobTimestamp)
+        .ok_or(JobInputError::RetryEligibilityOverflow)
+}
+
 /// An immutable job description supplied when work first enters the queue.
 #[derive(Clone, Eq, PartialEq)]
 pub struct JobRequest {
@@ -1831,6 +1877,50 @@ pub struct JobClaimRequest {
     worker_id: String,
     claimed_at: JobTimestamp,
     lease_expires_at: JobTimestamp,
+    pacing: Option<JobClaimPacing>,
+}
+
+/// A durable minimum interval between claims for one logical worker lane.
+///
+/// The queue persists the lane's next eligible claim time. This value is a
+/// policy input, not an in-memory sleep instruction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobClaimPacing {
+    lane_key: String,
+    minimum_interval_seconds: i64,
+}
+
+impl JobClaimPacing {
+    pub fn new(
+        lane_key: impl Into<String>,
+        minimum_interval_seconds: i64,
+    ) -> Result<Self, JobInputError> {
+        let lane_key = lane_key.into();
+        validate_job_text("job lane key", &lane_key)?;
+        if minimum_interval_seconds <= 0 {
+            return Err(JobInputError::NonPositivePacingInterval);
+        }
+        Ok(Self {
+            lane_key,
+            minimum_interval_seconds,
+        })
+    }
+
+    pub fn lane_key(&self) -> &str {
+        &self.lane_key
+    }
+
+    pub const fn minimum_interval_seconds(&self) -> i64 {
+        self.minimum_interval_seconds
+    }
+
+    pub fn next_claim_at(&self, claimed_at: JobTimestamp) -> Result<JobTimestamp, JobInputError> {
+        claimed_at
+            .value()
+            .checked_add(self.minimum_interval_seconds)
+            .map(JobTimestamp)
+            .ok_or(JobInputError::PacingEligibilityOverflow)
+    }
 }
 
 impl JobClaimRequest {
@@ -1853,7 +1943,13 @@ impl JobClaimRequest {
             worker_id,
             claimed_at,
             lease_expires_at: JobTimestamp(lease_expires_at),
+            pacing: None,
         })
+    }
+
+    pub fn with_pacing(mut self, pacing: JobClaimPacing) -> Self {
+        self.pacing = Some(pacing);
+        self
     }
 
     pub fn worker_id(&self) -> &str {
@@ -1866,6 +1962,10 @@ impl JobClaimRequest {
 
     pub const fn lease_expires_at(&self) -> JobTimestamp {
         self.lease_expires_at
+    }
+
+    pub fn pacing(&self) -> Option<&JobClaimPacing> {
+        self.pacing.as_ref()
     }
 }
 
@@ -1895,6 +1995,7 @@ pub struct JobRecord {
     status: JobStatus,
     created_at: JobTimestamp,
     updated_at: JobTimestamp,
+    retry_not_before: Option<JobTimestamp>,
     claimed_by: Option<String>,
     lease_expires_at: Option<JobTimestamp>,
     terminal_at: Option<JobTimestamp>,
@@ -1912,6 +2013,7 @@ impl JobRecord {
         status: JobStatus,
         created_at: JobTimestamp,
         updated_at: JobTimestamp,
+        retry_not_before: Option<JobTimestamp>,
         claimed_by: Option<String>,
         lease_expires_at: Option<JobTimestamp>,
         terminal_at: Option<JobTimestamp>,
@@ -1926,6 +2028,7 @@ impl JobRecord {
             status,
             created_at,
             updated_at,
+            retry_not_before,
             claimed_by,
             lease_expires_at,
             terminal_at,
@@ -1965,6 +2068,10 @@ impl JobRecord {
         self.updated_at
     }
 
+    pub const fn retry_not_before(&self) -> Option<JobTimestamp> {
+        self.retry_not_before
+    }
+
     pub fn claimed_by(&self) -> Option<&str> {
         self.claimed_by.as_deref()
     }
@@ -1994,6 +2101,7 @@ impl fmt::Debug for JobRecord {
             .field("status", &self.status)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
+            .field("retry_not_before", &self.retry_not_before)
             .field("claimed", &self.claimed_by.is_some())
             .field("lease_expires_at", &self.lease_expires_at)
             .field("terminal_at", &self.terminal_at)
@@ -2277,6 +2385,15 @@ pub trait JobStore {
         accepted_types: &[RuntimeJobType],
     ) -> Result<Option<ClaimedJob>, Self::Error>;
 
+    /// Return the next durable time at which a matching claim or lease recovery
+    /// may make progress. This is advisory wake scheduling only; a later claim
+    /// remains the authoritative SQLite transition.
+    fn next_claim_eligible_at(
+        &mut self,
+        request: JobClaimRequest,
+        accepted_types: &[RuntimeJobType],
+    ) -> Result<Option<JobTimestamp>, Self::Error>;
+
     fn complete(&mut self, completion: JobCompletion) -> Result<(), Self::Error>;
 
     fn fail(&mut self, failure: JobFailure) -> Result<JobFailureResult, Self::Error>;
@@ -2295,6 +2412,9 @@ pub enum JobInputError {
     NegativeTimestamp,
     NonPositiveLeaseDuration,
     LeaseExpiryOverflow,
+    NonPositivePacingInterval,
+    PacingEligibilityOverflow,
+    RetryEligibilityOverflow,
     CompletionBeforeClaim,
     FailureBeforeClaim,
 }
@@ -2315,6 +2435,15 @@ impl fmt::Display for JobInputError {
                 formatter.write_str("job lease duration must be positive")
             }
             Self::LeaseExpiryOverflow => formatter.write_str("job lease expiry overflows"),
+            Self::NonPositivePacingInterval => {
+                formatter.write_str("job pacing interval must be positive")
+            }
+            Self::PacingEligibilityOverflow => {
+                formatter.write_str("job pacing eligibility overflows")
+            }
+            Self::RetryEligibilityOverflow => {
+                formatter.write_str("job retry eligibility overflows")
+            }
             Self::CompletionBeforeClaim => {
                 formatter.write_str("job completion must not predate its claim")
             }

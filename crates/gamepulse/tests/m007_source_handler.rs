@@ -24,9 +24,6 @@ use gamepulse_worker_source::{
 };
 use runtime::{Runtime, RuntimeClock, RuntimeClockError, RuntimeConfig, RuntimeTaskOutcome};
 
-const LISTING_FIXTURE: &str =
-    include_str!("../../gamepulse-worker-source/tests/fixtures/listing-page.json");
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FixtureTransportError {
     Unavailable,
@@ -221,18 +218,9 @@ fn typed_hourly_job(work_reference: &str) -> TypedJob {
         None,
         None,
         None,
+        None,
     ))
     .expect("test record must be a typed source job")
-}
-
-fn fixture_browse_page() -> String {
-    LISTING_FIXTURE
-        .replace("\"totalResults\": 42", "\"totalResults\": 72")
-        .replace("offset=20&limit=20", "offset=24&limit=24")
-}
-
-fn fixture_exhausted_browse_page() -> String {
-    fixture_browse_page().replace("\"next\": {", "\"later\": {")
 }
 
 fn source_ingestion_schedule() -> SourceIngestionJobSchedule {
@@ -263,11 +251,10 @@ async fn accepted_hourly_slot_commits_fixture_selection_settles_job_and_survives
     let daily_state = Arc::new(Mutex::new(
         SqliteDailyCrawlStateStore::open(&database.path).expect("daily state database must open"),
     ));
-    let transport = FixtureListingTransport::with_responses([Ok(LISTING_FIXTURE.to_owned())]);
-    let source = MetacriticDailyCrawlSource::new(transport.clone());
+    let source = DirectDailySource::with_responses([Ok(direct_page(1..=20, None))]);
     let handler: Arc<dyn JobHandler> = Arc::new(HourlyDiscoveryHandler::new(
         daily_state.clone(),
-        source,
+        source.clone(),
         source_ingestion_schedule(),
     ));
     let schedule = HourlyJobSchedule::new(RuntimeJobType::SourceHourlyDiscovery, 1)
@@ -311,26 +298,23 @@ async fn accepted_hourly_slot_commits_fixture_selection_settles_job_and_survives
             .iter()
             .map(|identity| identity.value())
             .collect::<Vec<_>>(),
-        [101, 102]
+        (1..=20).collect::<Vec<_>>()
     );
     assert!(state.new_releases_completed());
     assert_eq!(state.browse_progress(), BrowseProgress::Initial);
-    assert_eq!(transport.calls(), [(ListMode::NewReleases, 0, 20)]);
+    assert_eq!(source.calls(), [CrawlDiscoveryRequest::NewReleases]);
 }
 
 #[tokio::test]
 async fn same_utc_day_browses_and_a_new_utc_day_restarts_new_releases() {
     let state = Arc::new(Mutex::new(MemoryDailyCrawlState::default()));
-    let transport = FixtureListingTransport::with_responses([
-        Ok(LISTING_FIXTURE.to_owned()),
-        Ok(fixture_exhausted_browse_page()),
-        Ok(LISTING_FIXTURE.to_owned()),
+    let source = DirectDailySource::with_responses([
+        Ok(direct_page(1..=20, None)),
+        Ok(direct_page(21..=40, None)),
+        Ok(direct_page(1..=20, None)),
     ]);
-    let handler = HourlyDiscoveryHandler::new(
-        state.clone(),
-        MetacriticDailyCrawlSource::new(transport.clone()),
-        source_ingestion_schedule(),
-    );
+    let handler =
+        HourlyDiscoveryHandler::new(state.clone(), source.clone(), source_ingestion_schedule());
 
     assert!(matches!(
         handler.handle(typed_hourly_job("hour-slot:0")).await,
@@ -346,11 +330,11 @@ async fn same_utc_day_browses_and_a_new_utc_day_restarts_new_releases() {
     ));
 
     assert_eq!(
-        transport.calls(),
+        source.calls(),
         [
-            (ListMode::NewReleases, 0, 20),
-            (ListMode::NewestBrowse, 0, 24),
-            (ListMode::NewReleases, 0, 20),
+            CrawlDiscoveryRequest::NewReleases,
+            CrawlDiscoveryRequest::NewestBrowse { cursor: None },
+            CrawlDiscoveryRequest::NewReleases,
         ]
     );
     let state = state.lock().expect("memory state must not be poisoned");
@@ -409,6 +393,62 @@ async fn replayed_twenty_four_item_browse_page_continues_to_one_atomic_twenty_it
             .expect("updated state must persist")
             .browse_progress(),
         BrowseProgress::Continue(BrowseCursor::new(48))
+    );
+}
+
+#[tokio::test]
+async fn short_first_new_releases_page_browses_to_one_atomic_exact_twenty_commit() {
+    let state = Arc::new(Mutex::new(MemoryDailyCrawlState::default()));
+    let source = DirectDailySource::with_responses([
+        Ok(direct_page(1..=4, Some(4))),
+        Ok(direct_page(5..=20, Some(24))),
+    ]);
+    let handler =
+        HourlyDiscoveryHandler::new(state.clone(), source.clone(), source_ingestion_schedule());
+
+    assert!(matches!(
+        handler.handle(typed_hourly_job("hour-slot:0")).await,
+        JobHandlerResult::Succeeded
+    ));
+    assert_eq!(
+        source.calls(),
+        [
+            CrawlDiscoveryRequest::NewReleases,
+            CrawlDiscoveryRequest::NewestBrowse { cursor: None },
+        ]
+    );
+    let state = state.lock().expect("memory state must not be poisoned");
+    assert_eq!(state.commits.len(), 1);
+    assert_eq!(state.commits[0].selected().len(), 20);
+    assert_eq!(state.commits[0].jobs().len(), 20);
+}
+
+#[tokio::test]
+async fn exhausted_first_new_releases_sequence_fails_without_a_partial_handler_commit() {
+    let state = Arc::new(Mutex::new(MemoryDailyCrawlState::default()));
+    let source = DirectDailySource::with_responses([
+        Ok(direct_page(1..=2, Some(2))),
+        Ok(direct_page(3..=19, None)),
+    ]);
+    let handler =
+        HourlyDiscoveryHandler::new(state.clone(), source.clone(), source_ingestion_schedule());
+
+    assert!(result_is_failure(
+        handler.handle(typed_hourly_job("hour-slot:0")).await
+    ));
+    assert_eq!(
+        source.calls(),
+        [
+            CrawlDiscoveryRequest::NewReleases,
+            CrawlDiscoveryRequest::NewestBrowse { cursor: None },
+        ]
+    );
+    assert!(
+        state
+            .lock()
+            .expect("memory state must not be poisoned")
+            .commits
+            .is_empty()
     );
 }
 
@@ -474,10 +514,10 @@ async fn source_or_commit_failure_returns_handler_failure_without_publishing_sta
         ..Default::default()
     }));
     let commit_failure_transport =
-        FixtureListingTransport::with_responses([Ok(LISTING_FIXTURE.to_owned())]);
+        DirectDailySource::with_responses([Ok(direct_page(1..=20, None))]);
     let commit_failure_handler = HourlyDiscoveryHandler::new(
         commit_failure_state.clone(),
-        MetacriticDailyCrawlSource::new(commit_failure_transport.clone()),
+        commit_failure_transport.clone(),
         source_ingestion_schedule(),
     );
     assert!(result_is_failure(
@@ -487,7 +527,7 @@ async fn source_or_commit_failure_returns_handler_failure_without_publishing_sta
     ));
     assert_eq!(
         commit_failure_transport.calls(),
-        [(ListMode::NewReleases, 0, 20)]
+        [CrawlDiscoveryRequest::NewReleases]
     );
     assert!(
         commit_failure_state

@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use gamepulse_application::{
-    HourlyJobSchedule, JobHandler, JobHandlerRegistry, ReviewSummaryJobSchedule, RuntimeJobType,
-    RuntimeJobTypeFilter, SourceIngestionJobSchedule,
+    HourlyJobSchedule, JobClaimPacing, JobHandler, JobHandlerRegistry, ReviewSummaryJobSchedule,
+    RuntimeJobType, RuntimeJobTypeFilter, SourceIngestionJobSchedule,
 };
 use gamepulse_storage_sqlite::{
     SqliteDailyCrawlStateStore, SqliteGameCatalogueReadStore, SqliteJobStore, SqliteReadinessProbe,
@@ -29,6 +29,7 @@ const DATABASE_PATH_ENV: &str = "GAMEPULSE_DATABASE_PATH";
 const HTTP_ADDRESS_ENV: &str = "GAMEPULSE_HTTP_ADDRESS";
 const LOG_FORMAT_ENV: &str = "GAMEPULSE_LOG_FORMAT";
 const SOURCE_WORK_ENABLED_ENV: &str = "GAMEPULSE_SOURCE_WORK_ENABLED";
+const SOURCE_LANE_MINIMUM_CLAIM_INTERVAL_SECONDS: i64 = 2;
 
 struct RuntimeEnvironment {
     database_path: PathBuf,
@@ -140,7 +141,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let schedule = HourlyJobSchedule::new(RuntimeJobType::SourceHourlyDiscovery, 3)?;
         let source_ingestion_schedule = SourceIngestionJobSchedule::new(3)?;
         let source_config = RuntimeConfig::new("gamepulse-source-runtime", 300, 2, schedule)?
-            .with_claim_filter(RuntimeJobTypeFilter::source_lane());
+            .with_claim_filter(RuntimeJobTypeFilter::source_lane())
+            .with_claim_pacing(JobClaimPacing::new(
+                "source",
+                SOURCE_LANE_MINIMUM_CLAIM_INTERVAL_SECONDS,
+            )?);
         let source_handler: Arc<dyn JobHandler> =
             Arc::new(ObservedJobHandler::new(HourlyDiscoveryHandler::new(
                 storage.daily_crawl_state,

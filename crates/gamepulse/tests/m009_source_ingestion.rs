@@ -278,10 +278,23 @@ fn runtime_config() -> RuntimeConfig {
     .expect("runtime configuration must be valid")
 }
 
-fn single_candidate_listing() -> String {
+fn exact_twenty_candidate_listing() -> String {
     let mut listing: Value = serde_json::from_str(LISTING_FIXTURE).expect("listing fixture JSON");
-    listing["data"]["items"] = Value::Array(vec![listing["data"]["items"][0].clone()]);
-    listing["data"]["totalResults"] = json!(1);
+    let exemplar = listing["data"]["items"][0].clone();
+    listing["data"]["items"] = Value::Array(
+        (101..=120)
+            .map(|product_id| {
+                let mut candidate = exemplar.clone();
+                candidate["id"] = json!(product_id);
+                if product_id != 101 {
+                    candidate["slug"] = json!(format!("example-game-{product_id}"));
+                    candidate["title"] = json!(format!("Example Game {product_id}"));
+                }
+                candidate
+            })
+            .collect(),
+    );
+    listing["data"]["totalResults"] = json!(20);
     listing["links"]
         .as_object_mut()
         .expect("listing fixture links must be an object")
@@ -339,7 +352,8 @@ async fn settle_ingestion_job(
 }
 
 #[tokio::test]
-async fn fixture_discovery_enqueues_then_ingests_one_game_and_survives_sqlite_reopen() {
+async fn fixture_discovery_enqueues_exact_twenty_then_ingests_first_game_and_survives_sqlite_reopen()
+ {
     let database = TemporaryDatabase::new();
     let queue = Arc::new(Mutex::new(
         SqliteJobStore::open(&database.path).expect("queue database must open"),
@@ -351,7 +365,7 @@ async fn fixture_discovery_enqueues_then_ingests_one_game_and_survives_sqlite_re
         SqliteGameSnapshotStore::open(&database.path).expect("snapshot database must open"),
     ));
     let listing_transport =
-        FixtureListingTransport::with_responses([Ok(single_candidate_listing())]);
+        FixtureListingTransport::with_responses([Ok(exact_twenty_candidate_listing())]);
     let ingestion_transport = FixtureGameIngestionTransport::new(IngestionFixtureMode::Valid);
     let discovery_handler: Arc<dyn JobHandler> = Arc::new(HourlyDiscoveryHandler::new(
         daily_state.clone(),

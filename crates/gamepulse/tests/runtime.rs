@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gamepulse_application::{
-    HourlyJobSchedule, JobAttemptOutcome, JobEnqueueResult, JobFailureResult, JobHandler,
-    JobHandlerFuture, JobHandlerRegistry, JobHandlerResult, JobRequest, JobStatus, JobStore,
-    JobTimestamp, RuntimeJobType, TypedJob,
+    HourlyJobSchedule, JobAttemptOutcome, JobClaimPacing, JobEnqueueResult, JobFailureResult,
+    JobHandler, JobHandlerFuture, JobHandlerRegistry, JobHandlerResult, JobRequest, JobStatus,
+    JobStore, JobTimestamp, RuntimeJobType, TypedJob,
 };
 use gamepulse_storage_sqlite::SqliteJobStore;
 use runtime::{
@@ -226,7 +226,12 @@ async fn typed_handler_success_completes_the_claimed_durable_job() {
     let store = store();
     let clock = Arc::new(ManualClock::new(7_200));
     let handler: Arc<dyn JobHandler> = Arc::new(ImmediateHandler::succeeds());
-    let mut runtime = Runtime::new(store.clone(), clock, config(2, 1, 30), registry(handler));
+    let mut runtime = Runtime::new(
+        store.clone(),
+        clock.clone(),
+        config(2, 1, 30),
+        registry(handler),
+    );
     runtime.schedule_hourly().expect("job must schedule");
 
     assert_eq!(
@@ -258,7 +263,12 @@ async fn handler_failure_uses_the_existing_retry_and_terminal_path() {
     let store = store();
     let clock = Arc::new(ManualClock::new(7_200));
     let handler: Arc<dyn JobHandler> = Arc::new(ImmediateHandler::fails());
-    let mut runtime = Runtime::new(store.clone(), clock, config(2, 1, 30), registry(handler));
+    let mut runtime = Runtime::new(
+        store.clone(),
+        clock.clone(),
+        config(2, 1, 30),
+        registry(handler),
+    );
     runtime.schedule_hourly().expect("job must schedule");
 
     runtime
@@ -270,9 +280,17 @@ async fn handler_failure_uses_the_existing_retry_and_terminal_path() {
         [RuntimeTaskOutcome::Failed(JobFailureResult::ReadyForRetry)]
     );
 
+    assert_eq!(
+        runtime
+            .dispatch_available()
+            .expect("early retry dispatch must succeed")
+            .claimed,
+        0
+    );
+    clock.set(7_230);
     runtime
         .dispatch_available()
-        .expect("retry dispatch must succeed");
+        .expect("due retry dispatch must succeed");
     let second = runtime.join_all().await.expect("second task must join");
     assert_eq!(
         second.settled,
@@ -291,6 +309,48 @@ async fn handler_failure_uses_the_existing_retry_and_terminal_path() {
         .expect("attempt lookup must succeed");
     assert_eq!(attempts[0].outcome(), JobAttemptOutcome::RetryableFailure);
     assert_eq!(attempts[1].outcome(), JobAttemptOutcome::TerminalFailure);
+}
+
+#[tokio::test]
+async fn paced_source_lane_claims_one_job_per_persisted_interval_without_sleeping() {
+    let store = store();
+    enqueue(&store, "paced-source-a", "source.hourly-discovery", 1);
+    enqueue(&store, "paced-source-b", "source.hourly-discovery", 1);
+    let clock = Arc::new(ManualClock::new(7_200));
+    let handler: Arc<dyn JobHandler> = Arc::new(ImmediateHandler::succeeds());
+    let pacing = JobClaimPacing::new("source", 2).expect("pacing must be valid");
+    let mut runtime = Runtime::new(
+        store,
+        clock.clone(),
+        config(1, 2, 30).with_claim_pacing(pacing),
+        registry(handler),
+    );
+
+    assert_eq!(
+        runtime
+            .dispatch_available()
+            .expect("first paced dispatch must succeed")
+            .claimed,
+        1
+    );
+    runtime.join_all().await.expect("first task must join");
+    assert_eq!(
+        runtime
+            .dispatch_available()
+            .expect("early paced dispatch must succeed")
+            .claimed,
+        0
+    );
+
+    clock.set(7_202);
+    assert_eq!(
+        runtime
+            .dispatch_available()
+            .expect("due paced dispatch must succeed")
+            .claimed,
+        1
+    );
+    runtime.join_all().await.expect("second task must join");
 }
 
 #[tokio::test]
@@ -321,9 +381,17 @@ async fn expired_claim_recovery_cannot_let_stale_completion_win() {
         config(2, 1, 1),
         registry(second_handler),
     );
+    assert_eq!(
+        recovering_runtime
+            .dispatch_available()
+            .expect("recovery dispatch must settle the expired claim")
+            .claimed,
+        0
+    );
+    clock.set(32);
     recovering_runtime
         .dispatch_available()
-        .expect("recovery dispatch must claim the recovered job");
+        .expect("due recovery dispatch must claim the recovered job");
     assert_eq!(
         recovering_runtime
             .join_all()

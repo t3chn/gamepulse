@@ -4,10 +4,11 @@ use std::path::Path;
 use gamepulse_application::{
     ClaimedJob, JOB_TEXT_MAX_BYTES, JobAttempt, JobAttemptOutcome, JobClaim, JobClaimRequest,
     JobCompletion, JobEnqueueResult, JobFailure, JobFailureResult, JobInputError, JobRecord,
-    JobRequest, JobStatus, JobStore, JobTimestamp, RuntimeJobType,
+    JobRequest, JobStatus, JobStore, JobTimestamp, RuntimeJobType, retry_not_before,
 };
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+    types::Value,
 };
 
 const EXPIRED_LEASE_ERROR: &str = "lease expired";
@@ -21,6 +22,7 @@ type StoredJobRow = (
     String,
     i64,
     i64,
+    Option<i64>,
     Option<String>,
     Option<i64>,
     i64,
@@ -112,21 +114,83 @@ impl JobStore for SqliteJobStore {
             .map_err(JobStoreError::database)?;
         recover_expired_claims(&transaction, request.claimed_at())?;
 
+        let clock_regressed = if accepted_types.is_empty() {
+            transaction
+                .query_row(
+                    "SELECT 1 FROM jobs
+                     WHERE state = 'ready' AND updated_at > ?1
+                     LIMIT 1",
+                    params![request.claimed_at().value()],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(JobStoreError::database)?
+                .is_some()
+        } else {
+            let placeholders = (2..=accepted_types.len() + 1)
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let selection = format!(
+                "SELECT 1 FROM jobs
+                 WHERE state = 'ready' AND updated_at > ?1
+                   AND job_type IN ({placeholders})
+                 LIMIT 1"
+            );
+            transaction
+                .query_row(
+                    &selection,
+                    params_from_iter(
+                        std::iter::once(Value::Integer(request.claimed_at().value())).chain(
+                            accepted_types
+                                .iter()
+                                .map(|job_type| Value::Text(job_type.as_str().to_owned())),
+                        ),
+                    ),
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(JobStoreError::database)?
+                .is_some()
+        };
+        if clock_regressed {
+            return Err(JobStoreError::clock_regression());
+        }
+
+        if let Some(pacing) = request.pacing() {
+            let next_claim_at = transaction
+                .query_row(
+                    "SELECT next_claim_at FROM job_lane_pacing WHERE lane_key = ?1",
+                    params![pacing.lane_key()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(JobStoreError::database)?
+                .map(parse_timestamp)
+                .transpose()?;
+            if matches!(next_claim_at, Some(next_claim_at) if next_claim_at > request.claimed_at())
+            {
+                transaction.commit().map_err(JobStoreError::database)?;
+                return Ok(None);
+            }
+        }
+
         let job_identity = if accepted_types.is_empty() {
             transaction
                 .query_row(
                     "SELECT job_identity
                      FROM jobs
                      WHERE state = 'ready' AND attempt_count < max_attempts
+                       AND COALESCE(retry_not_before, updated_at) <= ?1
                      ORDER BY created_at, job_identity
                      LIMIT 1",
-                    [],
+                    params![request.claimed_at().value()],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()
                 .map_err(JobStoreError::database)?
         } else {
-            let placeholders = (1..=accepted_types.len())
+            let placeholders = (2..=accepted_types.len() + 1)
                 .map(|index| format!("?{index}"))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -134,6 +198,7 @@ impl JobStore for SqliteJobStore {
                 "SELECT job_identity
                  FROM jobs
                  WHERE state = 'ready' AND attempt_count < max_attempts
+                   AND COALESCE(retry_not_before, updated_at) <= ?1
                    AND job_type IN ({placeholders})
                  ORDER BY created_at, job_identity
                  LIMIT 1"
@@ -141,7 +206,13 @@ impl JobStore for SqliteJobStore {
             transaction
                 .query_row(
                     &selection,
-                    params_from_iter(accepted_types.iter().map(|job_type| job_type.as_str())),
+                    params_from_iter(
+                        std::iter::once(Value::Integer(request.claimed_at().value())).chain(
+                            accepted_types
+                                .iter()
+                                .map(|job_type| Value::Text(job_type.as_str().to_owned())),
+                        ),
+                    ),
                     |row| row.get::<_, String>(0),
                 )
                 .optional()
@@ -176,6 +247,7 @@ impl JobStore for SqliteJobStore {
                  SET state = 'claimed',
                      attempt_count = ?1,
                      updated_at = ?2,
+                     retry_not_before = NULL,
                      claimed_by = ?3,
                      lease_expires_at = ?4,
                      claim_token = ?5,
@@ -186,7 +258,8 @@ impl JobStore for SqliteJobStore {
                    AND attempt_count = ?7
                    AND claim_token = ?8
                    AND claim_token = attempt_count
-                   AND updated_at <= ?9",
+                   AND updated_at <= ?9
+                   AND COALESCE(retry_not_before, updated_at) <= ?9",
                 params![
                     i64::from(attempt_number),
                     request.claimed_at().value(),
@@ -218,6 +291,19 @@ impl JobStore for SqliteJobStore {
                 ],
             )
             .map_err(JobStoreError::database)?;
+        if let Some(pacing) = request.pacing() {
+            let next_claim_at = pacing
+                .next_claim_at(request.claimed_at())
+                .map_err(JobStoreError::invalid_input)?;
+            transaction
+                .execute(
+                    "INSERT INTO job_lane_pacing (lane_key, next_claim_at)
+                     VALUES (?1, ?2)
+                     ON CONFLICT(lane_key) DO UPDATE SET next_claim_at = excluded.next_claim_at",
+                    params![pacing.lane_key(), next_claim_at.value()],
+                )
+                .map_err(JobStoreError::database)?;
+        }
         let claimed =
             load_job(&transaction, &job_identity)?.ok_or_else(JobStoreError::missing_job)?;
         let claim = claim_from_stored_job(&claimed)?;
@@ -242,6 +328,7 @@ impl JobStore for SqliteJobStore {
                 "UPDATE jobs
                  SET state = 'succeeded',
                      updated_at = ?1,
+                     retry_not_before = NULL,
                      claimed_by = NULL,
                      lease_expires_at = NULL,
                      terminal_at = ?1,
@@ -272,6 +359,49 @@ impl JobStore for SqliteJobStore {
         transaction.commit().map_err(JobStoreError::database)
     }
 
+    fn next_claim_eligible_at(
+        &mut self,
+        request: JobClaimRequest,
+        accepted_types: &[RuntimeJobType],
+    ) -> Result<Option<JobTimestamp>, JobStoreError> {
+        let ready_at = earliest_job_timestamp(
+            &self.connection,
+            "ready",
+            "COALESCE(retry_not_before, updated_at)",
+            accepted_types,
+        )?;
+        let ready_at = match (ready_at, request.pacing()) {
+            (Some(ready_at), Some(pacing)) => {
+                let lane_next_claim_at = self
+                    .connection
+                    .query_row(
+                        "SELECT next_claim_at FROM job_lane_pacing WHERE lane_key = ?1",
+                        params![pacing.lane_key()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(JobStoreError::database)?
+                    .map(parse_timestamp)
+                    .transpose()?;
+                Some(lane_next_claim_at.map_or(ready_at, |lane_at| ready_at.max(lane_at)))
+            }
+            (ready_at, None) => ready_at,
+            (None, Some(_)) => None,
+        };
+        let lease_expiry_at = earliest_job_timestamp(
+            &self.connection,
+            "claimed",
+            "lease_expires_at",
+            accepted_types,
+        )?;
+        Ok(match (ready_at, lease_expiry_at) {
+            (Some(ready_at), Some(lease_expiry_at)) => Some(ready_at.min(lease_expiry_at)),
+            (Some(ready_at), None) => Some(ready_at),
+            (None, Some(lease_expiry_at)) => Some(lease_expiry_at),
+            (None, None) => None,
+        })
+    }
+
     fn fail(&mut self, failure: JobFailure) -> Result<JobFailureResult, JobStoreError> {
         let transaction = self
             .connection
@@ -287,23 +417,34 @@ impl JobStore for SqliteJobStore {
             "retryable_failure"
         };
         let terminal_at = terminal.then_some(failure.failed_at().value());
+        let retry_not_before = if terminal {
+            None
+        } else {
+            Some(
+                retry_not_before(failure.failed_at(), stored.record.attempt_count())
+                    .map_err(JobStoreError::invalid_input)?
+                    .value(),
+            )
+        };
         let changed = transaction
             .execute(
                 "UPDATE jobs
                  SET state = ?1,
                      updated_at = ?2,
+                     retry_not_before = ?3,
                      claimed_by = NULL,
                      lease_expires_at = NULL,
-                     terminal_at = ?3,
-                     last_error = ?4
-                 WHERE job_identity = ?5
+                     terminal_at = ?4,
+                     last_error = ?5
+                 WHERE job_identity = ?6
                    AND state = 'claimed'
-                   AND claim_token = ?6
-                   AND claimed_by = ?7
+                   AND claim_token = ?7
+                   AND claimed_by = ?8
                    AND lease_expires_at > ?2",
                 params![
                     state,
                     failure.failed_at().value(),
+                    retry_not_before,
                     terminal_at,
                     failure.error(),
                     failure.claim().identity(),
@@ -344,6 +485,48 @@ impl JobStore for SqliteJobStore {
     }
 }
 
+fn earliest_job_timestamp(
+    connection: &Connection,
+    state: &str,
+    timestamp_expression: &str,
+    accepted_types: &[RuntimeJobType],
+) -> Result<Option<JobTimestamp>, JobStoreError> {
+    let type_clause = if accepted_types.is_empty() {
+        String::new()
+    } else {
+        let placeholders = (2..=accepted_types.len() + 1)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" AND job_type IN ({placeholders})")
+    };
+    let attempt_clause = if state == "ready" {
+        " AND attempt_count < max_attempts"
+    } else {
+        ""
+    };
+    let query = format!(
+        "SELECT MIN({timestamp_expression})
+         FROM jobs
+         WHERE state = ?1{attempt_clause}{type_clause}"
+    );
+    connection
+        .query_row(
+            &query,
+            params_from_iter(
+                std::iter::once(Value::Text(state.to_owned())).chain(
+                    accepted_types
+                        .iter()
+                        .map(|job_type| Value::Text(job_type.as_str().to_owned())),
+                ),
+            ),
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(JobStoreError::database)?
+        .map(parse_timestamp)
+        .transpose()
+}
+
 /// Insert one request through an existing transaction so another durable state transition can
 /// share the queue's identity/deduplication semantics without creating a nested transaction.
 pub(crate) fn enqueue_request(
@@ -374,9 +557,9 @@ fn enqueue_request_with_duplicate_validation(
         .execute(
             "INSERT INTO jobs (
                 job_identity, job_type, work_ref, max_attempts, attempt_count, state,
-                created_at, updated_at, claimed_by, lease_expires_at, claim_token, terminal_at,
-                last_error
-             ) VALUES (?1, ?2, ?3, ?4, 0, 'ready', ?5, ?5, NULL, NULL, 0, NULL, NULL)
+                created_at, updated_at, retry_not_before, claimed_by, lease_expires_at,
+                claim_token, terminal_at, last_error
+             ) VALUES (?1, ?2, ?3, ?4, 0, 'ready', ?5, ?5, ?5, NULL, NULL, 0, NULL, NULL)
              ON CONFLICT(job_identity) DO NOTHING",
             params![
                 request.identity(),
@@ -497,22 +680,33 @@ fn recover_expired_claims(
         let terminal = stored.record.attempt_count() >= stored.record.max_attempts();
         let state = if terminal { "failed" } else { "ready" };
         let terminal_at = terminal.then_some(recovered_at.value());
+        let retry_not_before = if terminal {
+            None
+        } else {
+            Some(
+                retry_not_before(recovered_at, stored.record.attempt_count())
+                    .map_err(JobStoreError::invalid_input)?
+                    .value(),
+            )
+        };
         let changed = transaction
             .execute(
                 "UPDATE jobs
                  SET state = ?1,
                      updated_at = ?2,
+                     retry_not_before = ?3,
                      claimed_by = NULL,
                      lease_expires_at = NULL,
-                     terminal_at = ?3,
-                     last_error = ?4
-                 WHERE job_identity = ?5
+                     terminal_at = ?4,
+                     last_error = ?5
+                 WHERE job_identity = ?6
                    AND state = 'claimed'
-                   AND claim_token = ?6
+                   AND claim_token = ?7
                    AND lease_expires_at <= ?2",
                 params![
                     state,
                     recovered_at.value(),
+                    retry_not_before,
                     terminal_at,
                     EXPIRED_LEASE_ERROR,
                     &identity,
@@ -597,8 +791,8 @@ fn load_job(connection: &Connection, identity: &str) -> Result<Option<StoredJob>
     let row = connection
         .query_row(
             "SELECT job_identity, job_type, work_ref, max_attempts, attempt_count, state,
-                    created_at, updated_at, claimed_by, lease_expires_at, claim_token, terminal_at,
-                    last_error
+                    created_at, updated_at, retry_not_before, claimed_by, lease_expires_at,
+                    claim_token, terminal_at, last_error
              FROM jobs
              WHERE job_identity = ?1",
             params![identity],
@@ -612,11 +806,12 @@ fn load_job(connection: &Connection, identity: &str) -> Result<Option<StoredJob>
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, i64>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
-                    row.get::<_, i64>(10)?,
-                    row.get::<_, Option<i64>>(11)?,
-                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             },
         )
@@ -728,6 +923,7 @@ fn decode_job(row: StoredJobRow) -> Result<StoredJob, JobStoreError> {
         raw_status,
         created_at,
         updated_at,
+        retry_not_before,
         claimed_by,
         lease_expires_at,
         claim_token,
@@ -752,6 +948,7 @@ fn decode_job(row: StoredJobRow) -> Result<StoredJob, JobStoreError> {
     if created_at > updated_at {
         return Err(JobStoreError::malformed("job timestamps regress"));
     }
+    let retry_not_before = retry_not_before.map(parse_timestamp).transpose()?;
     let lease_expires_at = lease_expires_at.map(parse_timestamp).transpose()?;
     let terminal_at = terminal_at.map(parse_timestamp).transpose()?;
     if let Some(worker_id) = &claimed_by {
@@ -762,14 +959,19 @@ fn decode_job(row: StoredJobRow) -> Result<StoredJob, JobStoreError> {
     }
     match status {
         JobStatus::Ready => {
-            if claimed_by.is_some() || lease_expires_at.is_some() || terminal_at.is_some() {
+            if retry_not_before.is_none()
+                || claimed_by.is_some()
+                || lease_expires_at.is_some()
+                || terminal_at.is_some()
+            {
                 return Err(JobStoreError::malformed(
                     "ready job has claim or terminal fields",
                 ));
             }
         }
         JobStatus::Claimed => {
-            if claimed_by.is_none()
+            if retry_not_before.is_some()
+                || claimed_by.is_none()
                 || lease_expires_at.is_none()
                 || terminal_at.is_some()
                 || lease_expires_at <= Some(updated_at)
@@ -780,7 +982,8 @@ fn decode_job(row: StoredJobRow) -> Result<StoredJob, JobStoreError> {
             }
         }
         JobStatus::Succeeded => {
-            if claimed_by.is_some()
+            if retry_not_before.is_some()
+                || claimed_by.is_some()
                 || lease_expires_at.is_some()
                 || terminal_at < Some(updated_at)
                 || last_error.is_some()
@@ -791,7 +994,8 @@ fn decode_job(row: StoredJobRow) -> Result<StoredJob, JobStoreError> {
             }
         }
         JobStatus::Failed => {
-            if claimed_by.is_some()
+            if retry_not_before.is_some()
+                || claimed_by.is_some()
                 || lease_expires_at.is_some()
                 || terminal_at < Some(updated_at)
                 || last_error.is_none()
@@ -812,6 +1016,7 @@ fn decode_job(row: StoredJobRow) -> Result<StoredJob, JobStoreError> {
             status,
             created_at,
             updated_at,
+            retry_not_before,
             claimed_by,
             lease_expires_at,
             terminal_at,
@@ -1252,7 +1457,15 @@ mod tests {
             .enqueue(job("game:101", 3, 1))
             .expect("enqueue must succeed");
         let first = claim(&mut store, "worker-a", 10, 5);
-        let second = claim(&mut store, "worker-b", 15, 5);
+        assert!(
+            store
+                .claim_next(
+                    JobClaimRequest::new("worker-b", time(45), 5).expect("claim must be valid")
+                )
+                .expect("expired claim recovery must query")
+                .is_none()
+        );
+        let second = claim(&mut store, "worker-b", 75, 5);
 
         assert_eq!(first.claim().claim_token(), 1);
         assert_eq!(second.claim().claim_token(), 2);
@@ -1266,7 +1479,7 @@ mod tests {
         );
         store
             .complete(
-                JobCompletion::new(second.into_claim(), time(16))
+                JobCompletion::new(second.into_claim(), time(76))
                     .expect("completion must be valid"),
             )
             .expect("current claim must complete");
@@ -1302,11 +1515,11 @@ mod tests {
                 .expect("retryable failure must persist"),
             JobFailureResult::ReadyForRetry
         );
-        let second = claim(&mut store, "worker", 12, 5);
+        let second = claim(&mut store, "worker", 41, 5);
         assert_eq!(
             store
                 .fail(
-                    JobFailure::new(second.into_claim(), time(13), "permanent source error")
+                    JobFailure::new(second.into_claim(), time(42), "permanent source error")
                         .expect("failure must be valid"),
                 )
                 .expect("terminal failure must persist"),
@@ -1315,7 +1528,7 @@ mod tests {
         assert!(
             store
                 .claim_next(
-                    JobClaimRequest::new("worker", time(14), 5).expect("claim must be valid")
+                    JobClaimRequest::new("worker", time(43), 5).expect("claim must be valid")
                 )
                 .expect("empty claim must succeed")
                 .is_none()
@@ -1341,6 +1554,160 @@ mod tests {
                 JobAttemptOutcome::RetryableFailure,
                 JobAttemptOutcome::TerminalFailure,
             ]
+        );
+    }
+
+    #[test]
+    fn retry_backoff_persists_across_reopen_and_success_clears_retry_eligibility() {
+        let database = TemporaryDatabase::new("retry-backoff-reopen");
+        {
+            let mut store = database.open();
+            store
+                .enqueue(job("game:101", 3, 10))
+                .expect("enqueue must succeed");
+            let first = claim(&mut store, "worker", 10, 5);
+            assert_eq!(
+                store
+                    .fail(
+                        JobFailure::new(first.into_claim(), time(11), "timeout")
+                            .expect("failure must be valid"),
+                    )
+                    .expect("failure must persist"),
+                JobFailureResult::ReadyForRetry
+            );
+            let record = store
+                .job("game:101")
+                .expect("job must load")
+                .expect("job must exist");
+            assert_eq!(record.retry_not_before(), Some(time(41)));
+            assert!(
+                store
+                    .claim_next(
+                        JobClaimRequest::new("worker", time(40), 5).expect("claim must be valid")
+                    )
+                    .expect("early claim must query")
+                    .is_none()
+            );
+        }
+
+        let mut reopened = database.open();
+        assert!(
+            reopened
+                .claim_next(
+                    JobClaimRequest::new("worker", time(40), 5).expect("claim must be valid")
+                )
+                .expect("reopened early claim must query")
+                .is_none()
+        );
+        let retry = claim(&mut reopened, "worker", 41, 5);
+        reopened
+            .complete(
+                JobCompletion::new(retry.into_claim(), time(42)).expect("completion must be valid"),
+            )
+            .expect("retry success must persist");
+        assert_eq!(
+            reopened
+                .job("game:101")
+                .expect("job must load")
+                .expect("job must exist")
+                .retry_not_before(),
+            None
+        );
+    }
+
+    #[test]
+    fn transient_timeout_rate_limit_and_provider_failures_share_the_durable_schedule() {
+        for (identity, error) in [
+            ("timeout", "timeout"),
+            ("rate-limit", "source returned 429"),
+            ("provider", "provider unavailable"),
+        ] {
+            let mut store = SqliteJobStore::open_in_memory().expect("queue must open");
+            store
+                .enqueue(job(identity, 2, 100))
+                .expect("enqueue must succeed");
+            let claimed = claim(&mut store, "worker", 100, 5);
+            assert_eq!(
+                store
+                    .fail(
+                        JobFailure::new(claimed.into_claim(), time(101), error)
+                            .expect("failure must be valid"),
+                    )
+                    .expect("failure must persist"),
+                JobFailureResult::ReadyForRetry
+            );
+            let record = store
+                .job(identity)
+                .expect("job must load")
+                .expect("job must exist");
+            assert_eq!(record.retry_not_before(), Some(time(131)));
+            assert!(
+                store
+                    .claim_next(
+                        JobClaimRequest::new("worker", time(130), 5).expect("claim must be valid")
+                    )
+                    .expect("early claim must query")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn source_lane_pacing_survives_reopen_without_delaying_other_queue_state() {
+        let database = TemporaryDatabase::new("source-lane-pacing");
+        let pacing =
+            gamepulse_application::JobClaimPacing::new("source", 2).expect("pacing must be valid");
+        {
+            let mut store = database.open();
+            for identity in ["source-a", "source-b"] {
+                store
+                    .enqueue(
+                        JobRequest::new(
+                            identity,
+                            RuntimeJobType::SourceHourlyDiscovery.as_str(),
+                            "hour-slot:0",
+                            2,
+                            time(1),
+                        )
+                        .expect("source job must be valid"),
+                    )
+                    .expect("source job must enqueue");
+            }
+            assert!(
+                store
+                    .claim_next_matching(
+                        JobClaimRequest::new("source-worker", time(10), 5)
+                            .expect("claim must be valid")
+                            .with_pacing(pacing.clone()),
+                        &[RuntimeJobType::SourceHourlyDiscovery],
+                    )
+                    .expect("first paced claim must succeed")
+                    .is_some()
+            );
+        }
+
+        let mut reopened = database.open();
+        assert!(
+            reopened
+                .claim_next_matching(
+                    JobClaimRequest::new("source-worker", time(11), 5)
+                        .expect("claim must be valid")
+                        .with_pacing(pacing.clone()),
+                    &[RuntimeJobType::SourceHourlyDiscovery],
+                )
+                .expect("paced early claim must query")
+                .is_none()
+        );
+        assert!(
+            reopened
+                .claim_next_matching(
+                    JobClaimRequest::new("source-worker", time(12), 5)
+                        .expect("claim must be valid")
+                        .with_pacing(pacing),
+                    &[RuntimeJobType::SourceHourlyDiscovery],
+                )
+                .expect("paced later claim must query")
+                .is_some()
         );
     }
 
@@ -1470,7 +1837,15 @@ mod tests {
             .enqueue(job("game:101", 3, 1))
             .expect("enqueue must succeed");
         let first = claim(&mut first_store, "worker-a", 10, 5);
-        let second = claim(&mut second_store, "worker-b", 15, 5);
+        assert!(
+            second_store
+                .claim_next(
+                    JobClaimRequest::new("worker-b", time(45), 5).expect("claim must be valid")
+                )
+                .expect("expired claim recovery must query")
+                .is_none()
+        );
+        let second = claim(&mut second_store, "worker-b", 75, 5);
 
         assert!(
             first_store
@@ -1482,7 +1857,7 @@ mod tests {
         );
         second_store
             .complete(
-                JobCompletion::new(second.into_claim(), time(16))
+                JobCompletion::new(second.into_claim(), time(76))
                     .expect("completion must be valid"),
             )
             .expect("new owner must complete");
