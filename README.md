@@ -196,6 +196,11 @@ oversized response, bypass cookies/authentication/browser/proxy state, and
 print a structured aggregate report only. They never log or persist payloads,
 identities, URLs, headers, or response bodies.
 
+For either live wrapper mode, the wrapper explicitly runs its designated
+ignored test entrypoint. Without the exact opt-in it reaches the pre-request
+`blocked_environment` path instead: no wire attempt is made, the validated
+zero-count aggregate remains on stdout, and the wrapper exits `3`.
+
 Finder mode permits one New Releases request:
 
 ```bash
@@ -211,10 +216,13 @@ GAMEPULSE_M028_LIVE_DIAGNOSTIC=1 bash scripts/diagnostic_canary.sh review-contin
 ```
 
 Terminal verdicts are `fixture_validated`, `contract_ready`, `access_denied`,
-`rate_limited`, `source_rejected`, `no_candidate`, and
-`request_budget_exhausted`. Only the first two are positive structural evidence;
-the others are fail-closed diagnostic results. Full behavior and boundaries are
-recorded in
+`rate_limited`, `source_rejected`, `no_candidate`,
+`request_budget_exhausted`, and `blocked_environment`. Only the first two are
+positive structural evidence; the others are fail-closed diagnostic results.
+`blocked_environment` is the only zero-count report: its exchanges are empty
+and it means that the live diagnostic could not safely create or validate its
+environment, client, transport, or first request before any wire attempt. It
+authorizes no automatic retry. Full behavior and boundaries are recorded in
 [`docs/source-contracts/metacritic-direct-http.md`](docs/source-contracts/metacritic-direct-http.md).
 
 M031 makes the output a single validated `gamepulse.diagnostic.v1` aggregate
@@ -222,11 +230,12 @@ report. The wrapper accepts only the exact controlled Cargo transcript with one
 report: no extra fields, duplicate JSON, noise, reordered or repeated framing,
 or inconsistent count, ceiling, exchange order, parser, category, or verdict
 combination. Positive reports exit `0`; every schema-valid fail-closed verdict
-is still printed as evidence and exits `3`. Invalid output or an internal
+is still printed as evidence and exits `3`; this includes a valid
+zero-count `blocked_environment` report. Invalid output or an internal
 wrapper failure prints only `diagnostic command failed` to stderr and exits
 `1`. Invalid mode exits `2` with no report. `request_count` is the exact
-budget-reserved diagnostic attempt count, not a reconstruction of a historical
-wire count.
+budget-reserved diagnostic attempt count, is zero only for
+`blocked_environment`, and is not a reconstruction of a historical wire count.
 
 ## Repository boundary
 

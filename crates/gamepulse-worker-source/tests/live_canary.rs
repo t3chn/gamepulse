@@ -52,6 +52,7 @@ enum TerminalVerdict {
     SourceRejected,
     NoCandidate,
     RequestBudgetExhausted,
+    BlockedEnvironment,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -178,12 +179,21 @@ struct DiagnosticReport {
 }
 
 impl DiagnosticReport {
-    fn render(&self) -> String {
-        assert!(
-            self.is_schema_valid(),
-            "aggregate diagnostic report must satisfy schema v1"
-        );
-        serde_json::to_string(self).expect("aggregate diagnostic report must serialize")
+    fn blocked_environment(mode: DiagnosticMode) -> Self {
+        Self {
+            schema_version: DIAGNOSTIC_SCHEMA_VERSION,
+            mode,
+            request_count: 0,
+            request_ceiling: mode.ceiling(),
+            terminal_verdict: TerminalVerdict::BlockedEnvironment,
+            exchanges: Vec::new(),
+        }
+    }
+
+    fn render(&self) -> Option<String> {
+        self.is_schema_valid()
+            .then(|| serde_json::to_string(self).ok())
+            .flatten()
     }
 
     fn is_schema_valid(&self) -> bool {
@@ -251,11 +261,17 @@ impl DiagnosticReport {
             TerminalVerdict::RequestBudgetExhausted => {
                 self.request_count == self.request_ceiling && accepted
             }
+            TerminalVerdict::BlockedEnvironment => {
+                self.request_count == 0 && self.exchanges.is_empty()
+            }
         };
 
         self.schema_version == DIAGNOSTIC_SCHEMA_VERSION
             && self.request_ceiling == self.mode.ceiling()
-            && self.request_count > 0
+            && ((self.terminal_verdict == TerminalVerdict::BlockedEnvironment
+                && self.request_count == 0)
+                || (self.terminal_verdict != TerminalVerdict::BlockedEnvironment
+                    && self.request_count > 0))
             && self.request_count <= self.request_ceiling
             && usize::from(self.request_count) == self.exchanges.len()
             && self
@@ -415,6 +431,12 @@ enum DiagnosticTransport {
     Live {
         client: Client,
     },
+    PreRequestFailure,
+}
+
+enum PreparedDiagnosticRequest {
+    Fixture,
+    Live(Box<reqwest::Request>),
 }
 
 impl DiagnosticTransport {
@@ -439,20 +461,44 @@ impl DiagnosticTransport {
         Ok(Self::Live { client })
     }
 
-    async fn fetch(&mut self, request: ProbeRequest<'_>) -> Result<DiagnosticResponse, ()> {
+    fn prepare(&self, request: ProbeRequest<'_>) -> Result<PreparedDiagnosticRequest, ()> {
         match self {
-            Self::Fixture { responses, calls } => {
+            Self::Fixture { .. } => Ok(PreparedDiagnosticRequest::Fixture),
+            Self::Live { client } => {
+                let url = diagnostic_url(request)?;
+                if !is_exact_allowed_request(&url, request) {
+                    return Err(());
+                }
+                client
+                    .get(url)
+                    .build()
+                    .map(|request| PreparedDiagnosticRequest::Live(Box::new(request)))
+                    .map_err(|_| ())
+            }
+            Self::PreRequestFailure => Err(()),
+        }
+    }
+
+    async fn fetch(
+        &mut self,
+        prepared: PreparedDiagnosticRequest,
+    ) -> Result<DiagnosticResponse, ()> {
+        match (self, prepared) {
+            (Self::Fixture { responses, calls }, PreparedDiagnosticRequest::Fixture) => {
                 *calls = calls.checked_add(1).ok_or(())?;
                 responses.pop_front().ok_or(())?
             }
-            Self::Live { client } => fetch_live_response(client, request).await,
+            (Self::Live { client }, PreparedDiagnosticRequest::Live(request)) => {
+                fetch_live_response(client, *request).await
+            }
+            _ => Err(()),
         }
     }
 
     fn fixture_calls(&self) -> u8 {
         match self {
             Self::Fixture { calls, .. } => *calls,
-            Self::Live { .. } => 0,
+            Self::Live { .. } | Self::PreRequestFailure => 0,
         }
     }
 }
@@ -492,27 +538,26 @@ struct Execution {
 }
 
 impl DiagnosticCanary {
+    fn with_transport(mode: DiagnosticMode, transport: DiagnosticTransport) -> Self {
+        Self {
+            mode,
+            budget: AttemptBudget::new(mode.ceiling()),
+            transport,
+        }
+    }
+
     fn fixture(
         mode: DiagnosticMode,
         responses: impl IntoIterator<Item = Result<DiagnosticResponse, ()>>,
     ) -> Self {
-        Self {
-            mode,
-            budget: AttemptBudget::new(mode.ceiling()),
-            transport: DiagnosticTransport::fixture(responses),
-        }
-    }
-
-    fn live(mode: DiagnosticMode) -> Result<Self, ()> {
-        Ok(Self {
-            mode,
-            budget: AttemptBudget::new(mode.ceiling()),
-            transport: DiagnosticTransport::live()?,
-        })
+        Self::with_transport(mode, DiagnosticTransport::fixture(responses))
     }
 
     async fn run(mut self) -> DiagnosticReport {
-        let finder = self.execute(ProbeRequest::Finder).await;
+        let finder = match self.transport.prepare(ProbeRequest::Finder) {
+            Ok(prepared) => self.execute_prepared(ProbeRequest::Finder, prepared).await,
+            Err(()) => return DiagnosticReport::blocked_environment(self.mode),
+        };
         let mut exchanges = vec![finder.report];
         let mut budget_exhausted = finder.budget_exhausted;
         let candidate_slug = finder.candidate_slug;
@@ -542,6 +587,22 @@ impl DiagnosticCanary {
         self.finish(exchanges, true, budget_exhausted)
     }
 
+    async fn execute_prepared(
+        &mut self,
+        request: ProbeRequest<'_>,
+        prepared: PreparedDiagnosticRequest,
+    ) -> Execution {
+        if !self.budget.reserve() {
+            return Execution {
+                report: skipped_report(request),
+                candidate_slug: None,
+                budget_exhausted: true,
+            };
+        }
+
+        self.fetch_reserved(request, prepared).await
+    }
+
     async fn execute(&mut self, request: ProbeRequest<'_>) -> Execution {
         if !self.budget.reserve() {
             return Execution {
@@ -551,7 +612,25 @@ impl DiagnosticCanary {
             };
         }
 
-        let response = match self.transport.fetch(request).await {
+        let prepared = match self.transport.prepare(request) {
+            Ok(prepared) => prepared,
+            Err(()) => {
+                return Execution {
+                    report: rejected_transport_report(request),
+                    candidate_slug: None,
+                    budget_exhausted: false,
+                };
+            }
+        };
+        self.fetch_reserved(request, prepared).await
+    }
+
+    async fn fetch_reserved(
+        &mut self,
+        request: ProbeRequest<'_>,
+        prepared: PreparedDiagnosticRequest,
+    ) -> Execution {
+        let response = match self.transport.fetch(prepared).await {
             Ok(response) => response,
             Err(()) => {
                 return Execution {
@@ -920,13 +999,9 @@ fn continuation_query(url: &Url) -> (Option<u32>, Option<u32>, bool) {
 
 async fn fetch_live_response(
     client: &Client,
-    request: ProbeRequest<'_>,
+    request: reqwest::Request,
 ) -> Result<DiagnosticResponse, ()> {
-    let url = diagnostic_url(request)?;
-    if !is_exact_allowed_request(&url, request) {
-        return Err(());
-    }
-    let mut response = client.get(url).send().await.map_err(|_| ())?;
+    let mut response = client.execute(request).await.map_err(|_| ())?;
     let status = response.status();
     let content_type_is_json = response
         .headers()
@@ -1118,6 +1193,7 @@ fn report_with_terminal(
         TerminalVerdict::FixtureValidated
         | TerminalVerdict::ContractReady
         | TerminalVerdict::RequestBudgetExhausted => mode.ceiling(),
+        TerminalVerdict::BlockedEnvironment => 0,
     };
     let mut exchanges = [
         valid_exchange(ExchangeKind::Finder, 1),
@@ -1162,7 +1238,8 @@ fn report_with_terminal(
         TerminalVerdict::NoCandidate => exchanges[0].item_count = 0,
         TerminalVerdict::FixtureValidated
         | TerminalVerdict::ContractReady
-        | TerminalVerdict::RequestBudgetExhausted => {}
+        | TerminalVerdict::RequestBudgetExhausted
+        | TerminalVerdict::BlockedEnvironment => {}
     }
 
     DiagnosticReport {
@@ -1319,14 +1396,40 @@ fn run_mutation_harness_with_failing_cargo() -> std::process::Output {
     output
 }
 
-fn print_report(report: &DiagnosticReport) {
-    println!("{}", report.render());
+async fn live_diagnostic_report_from(
+    mode: DiagnosticMode,
+    environment_ready: bool,
+    transport: Result<DiagnosticTransport, ()>,
+) -> DiagnosticReport {
+    if !environment_ready {
+        return DiagnosticReport::blocked_environment(mode);
+    }
+    let Ok(transport) = transport else {
+        return DiagnosticReport::blocked_environment(mode);
+    };
+    DiagnosticCanary::with_transport(mode, transport)
+        .run()
+        .await
 }
 
-fn live_opted_in() {
-    if std::env::var(LIVE_OPT_IN).ok().as_deref() != Some("1") {
-        panic!("set GAMEPULSE_M028_LIVE_DIAGNOSTIC=1 after separate owner authorization");
+async fn live_diagnostic_report(mode: DiagnosticMode) -> DiagnosticReport {
+    if !live_opted_in() {
+        return DiagnosticReport::blocked_environment(mode);
     }
+    live_diagnostic_report_from(mode, true, DiagnosticTransport::live()).await
+}
+
+fn print_report(report: &DiagnosticReport) {
+    use std::io::Write;
+
+    let Some(rendered) = report.render() else {
+        return;
+    };
+    let _ = writeln!(std::io::stdout().lock(), "{rendered}");
+}
+
+fn live_opted_in() -> bool {
+    std::env::var(LIVE_OPT_IN).ok().as_deref() == Some("1")
 }
 
 #[tokio::test]
@@ -1383,6 +1486,44 @@ async fn diagnostic_fixture_validates_positive_finder_and_review_continuation_mo
 }
 
 #[tokio::test]
+async fn diagnostic_pre_request_failures_emit_zero_count_blocked_environment_reports() {
+    for mode in [DiagnosticMode::Finder, DiagnosticMode::ReviewContinuation] {
+        let reports = [
+            live_diagnostic_report_from(mode, false, Err(())).await,
+            live_diagnostic_report_from(mode, true, Err(())).await,
+            live_diagnostic_report_from(mode, true, Ok(DiagnosticTransport::PreRequestFailure))
+                .await,
+        ];
+
+        for report in reports {
+            assert_eq!(report.terminal_verdict, TerminalVerdict::BlockedEnvironment);
+            assert_eq!(report.request_count, 0);
+            assert_eq!(report.request_ceiling, mode.ceiling());
+            assert!(report.exchanges.is_empty());
+            assert!(report.is_schema_valid());
+
+            let rendered = report
+                .render()
+                .expect("blocked-environment report must be safe to render");
+            for forbidden in [
+                "M033_PRIVATE_CONFIGURATION_MARKER_DO_NOT_EMIT",
+                "backend.metacritic.com",
+                "http://",
+                "https://",
+                "body",
+                "slug",
+                "path",
+            ] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "blocked-environment report must not disclose diagnostic inputs"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn diagnostic_fixture_status_and_body_failures_stop_before_a_follow_up() {
     for (status, expected_verdict) in [
         (403, TerminalVerdict::AccessDenied),
@@ -1419,6 +1560,18 @@ async fn diagnostic_fixture_status_and_body_failures_stop_before_a_follow_up() {
         assert_eq!(report.exchanges[0].parser, ParserOutcome::Rejected);
         assert!(report.is_schema_valid());
     }
+}
+
+#[tokio::test]
+async fn diagnostic_first_attempt_transport_failure_remains_a_nonzero_aggregate() {
+    let report = DiagnosticCanary::fixture(DiagnosticMode::Finder, [Err(())])
+        .run()
+        .await;
+
+    assert_eq!(report.request_count, 1);
+    assert_eq!(report.exchanges.len(), 1);
+    assert_eq!(report.terminal_verdict, TerminalVerdict::SourceRejected);
+    assert!(report.is_schema_valid());
 }
 
 #[tokio::test]
@@ -1723,7 +1876,9 @@ async fn diagnostic_privacy_output_never_contains_fixture_source_data() {
     )
     .run()
     .await;
-    let rendered = report.render();
+    let rendered = report
+        .render()
+        .expect("valid aggregate report must render for privacy coverage");
 
     for forbidden in [
         private_fixture_marker,
@@ -1756,6 +1911,22 @@ fn diagnostic_report_schema_rejects_inconsistent_terminal_evidence() {
         report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady);
     invalid_link.exchanges[0].href_presence = HrefPresence::String;
     assert!(!invalid_link.is_schema_valid());
+
+    let blocked = report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::BlockedEnvironment);
+    assert!(blocked.is_schema_valid());
+
+    let mut blocked_with_exchange = blocked.clone();
+    blocked_with_exchange.request_count = 1;
+    blocked_with_exchange
+        .exchanges
+        .push(valid_exchange(ExchangeKind::Finder, 1));
+    assert!(!blocked_with_exchange.is_schema_valid());
+
+    let mut zero_count_source_rejected =
+        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::SourceRejected);
+    zero_count_source_rejected.request_count = 0;
+    zero_count_source_rejected.exchanges.clear();
+    assert!(!zero_count_source_rejected.is_schema_valid());
 }
 
 #[test]
@@ -1846,7 +2017,9 @@ fn diagnostic_wrapper_accepts_positive_finder_and_review_reports() {
         ),
     ] {
         assert!(report.is_schema_valid());
-        let rendered = report.render();
+        let rendered = report
+            .render()
+            .expect("valid aggregate report must render for wrapper coverage");
         let output =
             run_wrapper_with_cargo_output(mode, &cargo_harness_output(test_name, &rendered));
         assert!(output.status.success());
@@ -1863,10 +2036,13 @@ fn diagnostic_wrapper_preserves_every_fail_closed_verdict_with_exit_three() {
         TerminalVerdict::SourceRejected,
         TerminalVerdict::NoCandidate,
         TerminalVerdict::RequestBudgetExhausted,
+        TerminalVerdict::BlockedEnvironment,
     ] {
         let report = report_with_terminal(DiagnosticMode::ReviewContinuation, terminal_verdict);
         assert!(report.is_schema_valid());
-        let rendered = report.render();
+        let rendered = report
+            .render()
+            .expect("valid fail-closed aggregate report must render");
         let output = run_wrapper_with_cargo_output(
             "review-continuation",
             &cargo_harness_output("diagnostic_live_review_continuation", &rendered),
@@ -1879,8 +2055,9 @@ fn diagnostic_wrapper_preserves_every_fail_closed_verdict_with_exit_three() {
 
 #[test]
 fn diagnostic_wrapper_fails_closed_on_invalid_or_noisy_zero_exit_output() {
-    let valid =
-        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady).render();
+    let valid = report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady)
+        .render()
+        .expect("valid aggregate report must render for wrapper rejection coverage");
     let harness = |report: &str| cargo_harness_output("diagnostic_live_finder", report);
     let extra_sensitive_field = format!(
         "{},\"source_path\":\"marker\"}}",
@@ -1912,6 +2089,26 @@ fn diagnostic_wrapper_fails_closed_on_invalid_or_noisy_zero_exit_output() {
         harness(&extra_sensitive_field),
         format!("source noise\n{}", harness(&valid)),
     ];
+
+    let mut blocked_with_attempt =
+        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::BlockedEnvironment);
+    blocked_with_attempt.request_count = 1;
+    blocked_with_attempt
+        .exchanges
+        .push(valid_exchange(ExchangeKind::Finder, 1));
+    invalid_cases.push(harness(
+        &serde_json::to_string(&blocked_with_attempt)
+            .expect("invalid blocked report must serialize for wrapper validation"),
+    ));
+
+    let mut zero_count_source_rejected =
+        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::SourceRejected);
+    zero_count_source_rejected.request_count = 0;
+    zero_count_source_rejected.exchanges.clear();
+    invalid_cases.push(harness(
+        &serde_json::to_string(&zero_count_source_rejected)
+            .expect("invalid zero-count report must serialize for wrapper validation"),
+    ));
 
     let mut accepted_not_checked =
         report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady);
@@ -2014,8 +2211,9 @@ fn diagnostic_wrapper_fails_closed_on_invalid_or_noisy_zero_exit_output() {
 
 #[test]
 fn diagnostic_wrapper_rejects_every_noncanonical_controlled_transcript() {
-    let valid =
-        report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady).render();
+    let valid = report_with_terminal(DiagnosticMode::Finder, TerminalVerdict::ContractReady)
+        .render()
+        .expect("valid aggregate report must render for transcript coverage");
     let summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s";
     let canonical = cargo_harness_output("diagnostic_live_finder", &valid);
     let invalid_cases = [
@@ -2053,7 +2251,7 @@ fn diagnostic_mutation_harness_rejects_infrastructure_failures() {
 }
 
 #[test]
-fn diagnostic_quiet_cli_redacts_opt_in_marker_and_local_paths() {
+fn diagnostic_live_wrapper_reports_blocked_environment_without_opt_in() {
     let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
@@ -2069,9 +2267,17 @@ fn diagnostic_quiet_cli_redacts_opt_in_marker_and_local_paths() {
     let stdout = String::from_utf8(output.stdout).expect("wrapper stdout must be UTF-8");
     let stderr = String::from_utf8(output.stderr).expect("wrapper stderr must be UTF-8");
 
-    assert!(!output.status.success());
-    assert_eq!(stdout, "");
-    assert_eq!(stderr, "diagnostic command failed\n");
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(stdout.lines().count(), 1);
+    assert_eq!(stderr, "");
+    let report: Value =
+        serde_json::from_str(&stdout).expect("wrapper report must be valid JSON evidence");
+    assert_eq!(report["schema_version"], "gamepulse.diagnostic.v1");
+    assert_eq!(report["mode"], "finder");
+    assert_eq!(report["request_count"], 0);
+    assert_eq!(report["request_ceiling"], 1);
+    assert_eq!(report["terminal_verdict"], "blocked_environment");
+    assert_eq!(report["exchanges"], serde_json::json!([]));
     for forbidden in [
         marker,
         repository_root.to_str().expect("UTF-8 root"),
@@ -2085,23 +2291,13 @@ fn diagnostic_quiet_cli_redacts_opt_in_marker_and_local_paths() {
 #[tokio::test]
 #[ignore = "requires separate owner authorization and one anonymous public finder request"]
 async fn diagnostic_live_finder() {
-    live_opted_in();
-    let report = DiagnosticCanary::live(DiagnosticMode::Finder)
-        .expect("safe live transport configuration must be available")
-        .run()
-        .await;
-    assert!(report.request_count <= 1);
+    let report = live_diagnostic_report(DiagnosticMode::Finder).await;
     print_report(&report);
 }
 
 #[tokio::test]
 #[ignore = "requires separate owner authorization and at most three anonymous public requests"]
 async fn diagnostic_live_review_continuation() {
-    live_opted_in();
-    let report = DiagnosticCanary::live(DiagnosticMode::ReviewContinuation)
-        .expect("safe live transport configuration must be available")
-        .run()
-        .await;
-    assert!(report.request_count <= 3);
+    let report = live_diagnostic_report(DiagnosticMode::ReviewContinuation).await;
     print_report(&report);
 }

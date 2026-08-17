@@ -19,7 +19,7 @@ then classifies the result as `caught`, `noncompiling`, or `surviving`. A
 surviving mutant makes the command fail. Mutation output is terminal-only and
 must not be committed.
 
-## M028 safe diagnostic mutations
+## M033 safe diagnostic mutations
 
 Run the repository-owned diagnostic harness from the repository root:
 
@@ -29,13 +29,14 @@ mise run diagnostic-mutation
 
 The command copies only the current Git-tracked file set to a temporary
 directory outside the repository, runs offline, and removes the temporary
-directory on exit. It has a hard ceiling of three
+directory on exit. It has a hard ceiling of four
 mutants:
 
 1. allow a fourth request after the diagnostic ceiling;
 2. turn a parser rejection into acceptance in the aggregate-only diagnostic
    path.
 3. turn a schema-valid fail-closed diagnostic exit into a success exit.
+4. turn a pre-request blocked-environment report from zero attempts into one.
 
 For each named mutant, the harness first proves that exact baseline test passes,
 then verifies one and only one literal mutation was applied. It counts a mutant

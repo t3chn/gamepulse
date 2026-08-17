@@ -230,7 +230,7 @@ The v1 top-level object has exactly these fields and no others:
 | --- | --- |
 | `schema_version` | Exact string `gamepulse.diagnostic.v1`. |
 | `mode` | `fixture`, `finder`, or `review_continuation`; it must exactly match the wrapper mode. |
-| `request_count` | Exact positive integer count of budget-reserved diagnostic request attempts. It equals the number of exchange records and cannot exceed `request_ceiling`. It does not retroactively assert an exact wire count. |
+| `request_count` | Exact count of budget-reserved diagnostic request attempts. It equals the number of exchange records and cannot exceed `request_ceiling`. It is zero only for `blocked_environment`; every other verdict has a positive count. It does not retroactively assert an exact wire count. |
 | `request_ceiling` | Exact integer `1` for finder and `3` for fixture or review-continuation. |
 | `terminal_verdict` | One allowed verdict listed below. |
 | `exchanges` | An ordered array with exactly `request_count` aggregate-only records. |
@@ -274,6 +274,14 @@ exchange, respectively with `forbidden` and `rate_limited` status.
 `source_rejected` ends at its first rejected exchange with only `ok` or
 `other` status. `no_candidate` is one accepted empty finder exchange; and
 `request_budget_exhausted` has a full ceiling-sized accepted prefix.
+`blocked_environment` is the sole zero-attempt terminal verdict: it has exactly
+`request_count: 0`, an empty `exchanges` array, and the exact mode ceiling. It
+means that the live diagnostic could not create or validate its isolated
+environment, client, transport, or first request before any wire attempt. It
+contains no status, content, parser, source, or exchange evidence and never
+authorizes an automatic retry. After a counted first attempt, transport, status,
+body, and parser failures remain ordinary nonzero aggregate outcomes and must
+not become `blocked_environment`.
 `not_attempted` is never emitted in a report. This makes a fail-closed result
 parseable evidence without making it positive evidence.
 
@@ -282,7 +290,7 @@ Wrapper exit codes are deliberately separate from the underlying test process:
 | Exit | Meaning | stdout |
 | --- | --- | --- |
 | `0` | Valid `fixture_validated` or `contract_ready` report. | The one validated report. |
-| `3` | Valid fail-closed `access_denied`, `rate_limited`, `source_rejected`, `no_candidate`, or `request_budget_exhausted` report. | The one validated report. |
+| `3` | Valid fail-closed `access_denied`, `rate_limited`, `source_rejected`, `no_candidate`, `request_budget_exhausted`, or `blocked_environment` report. | The one validated report. |
 | `1` | Internal/validation failure, including non-zero underlying process status, unavailable validator, invalid report, duplicate JSON, or noise. | Empty; stderr is exactly `diagnostic command failed`. |
 | `2` | Invalid wrapper mode. | No report. |
 
@@ -294,6 +302,26 @@ framing; source noise; duplicate JSON keys; and every bad report shape are
 invalid. Wrapper setup, redirection, and cleanup errors use the same
 report-free safe failure path; cleanup is quiet and best-effort.
 
+## M033 pre-request blocked-environment reporting
+
+The two opt-in live test entrypoints never panic or expose configuration details
+when the opt-in environment is absent or invalid, isolated client/transport
+creation fails, or the first request cannot be constructed and validated. They
+emit exactly one schema-valid `blocked_environment` aggregate instead. The
+wrapper passes the test-harness `--ignored` flag only for its two live modes,
+so those designated entrypoints actually run; fixture mode is unchanged. It
+validates and leaves the aggregate unchanged on stdout, then exits `3`. A
+missing, duplicate, malformed, noisy, privacy-unsafe, schema-invalid,
+or semantically impossible report — including a zero-count report with any
+other verdict or exchanges — remains report-free, fixed-safe-stderr-only exit
+`1` behavior. Build or test-harness failure before the live entrypoint likewise
+has no trusted report.
+
+`blocked_environment` is evidence of a local diagnostic precondition failure,
+not source evidence and not retry authority. Operators must investigate or
+explicitly rerun under a separate owner authorization; the wrapper and
+diagnostic perform no automatic retry.
+
 M030 evidence is preserved without reinterpretation: exactly one
 review-continuation command invocation occurred, with no retry; its process
 exit status was `0`; no valid aggregate report supplied a numeric request count
@@ -301,6 +329,13 @@ and trustworthy parser/structural fields; the exact wire count remains UNKNOWN
 within `0..3`; no narrow source/parser mismatch was proven; and repository and
 temporary-state cleanup remained clean. M031 does not recreate or fill in that
 missing live evidence.
+
+The direct M032 fallback evidence is also preserved without reinterpretation:
+the review-continuation command was invoked exactly once, exited `1`, produced
+no stdout, and emitted only the fixed safe wrapper stderr. Its exact wire count
+remains UNKNOWN within `0..3`; no parser/source mismatch is proven; repository
+and temporary cleanup remained clean. M033 does not recreate, refine, or
+fabricate any part of that evidence.
 
 ## Remaining risks
 

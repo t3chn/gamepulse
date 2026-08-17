@@ -28,7 +28,7 @@ description = "Run the bounded exact-20 selection mutation harness"
 run = "bash scripts/mutation.sh"
 
 [tasks.diagnostic-mutation]
-description = "Run bounded M028 diagnostic safety mutations"
+description = "Run bounded M033 diagnostic safety mutations"
 run = "bash scripts/diagnostic_mutation.sh"
 
 [tasks.demo]

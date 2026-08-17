@@ -55,6 +55,9 @@ if [ "$offline_fixture" = 'true' ]; then
   cargo_arguments+=(--offline)
 fi
 cargo_arguments+=("$test_name" -- --exact --nocapture)
+if [ "$offline_fixture" != 'true' ]; then
+  cargo_arguments+=(--ignored)
+fi
 if ! (cargo "${cargo_arguments[@]}" >"$stdout_path" 2>"$stderr_path") 2>/dev/null; then
   safe_failure
 fi
@@ -212,7 +215,7 @@ if ! terminal_verdict="$(jq -er --arg expected_mode "$expected_mode" '
   and (.request_ceiling | integer)
   and (.request_count | integer)
   and (.request_ceiling == (if .mode == "finder" then 1 else 3 end))
-  and (.request_count > 0 and .request_count <= .request_ceiling)
+  and (.request_count >= 0 and .request_count <= .request_ceiling)
   and (.exchanges | type == "array" and length == $report.request_count)
   and (($report.exchanges | all(exchange_valid)))
   and (["finder", "critic_review", "user_review"][0:$report.request_count]
@@ -220,9 +223,12 @@ if ! terminal_verdict="$(jq -er --arg expected_mode "$expected_mode" '
   and (.terminal_verdict == "fixture_validated" or .terminal_verdict == "contract_ready"
        or .terminal_verdict == "access_denied" or .terminal_verdict == "rate_limited"
        or .terminal_verdict == "source_rejected" or .terminal_verdict == "no_candidate"
-       or .terminal_verdict == "request_budget_exhausted")
+       or .terminal_verdict == "request_budget_exhausted"
+       or .terminal_verdict == "blocked_environment")
   and (
-    if .terminal_verdict == "fixture_validated" then
+    if .terminal_verdict == "blocked_environment" then
+      .request_count == 0 and (.exchanges | length == 0)
+    elif .terminal_verdict == "fixture_validated" then
       .mode == "fixture" and .request_count == 3 and all_accepted($report)
       and .exchanges[0].item_count > 0
     elif .terminal_verdict == "contract_ready" then
@@ -257,7 +263,7 @@ case "$terminal_verdict" in
   fixture_validated|contract_ready)
     exit 0
     ;;
-  access_denied|rate_limited|source_rejected|no_candidate|request_budget_exhausted)
+  access_denied|rate_limited|source_rejected|no_candidate|request_budget_exhausted|blocked_environment)
     exit 3
     ;;
   *)

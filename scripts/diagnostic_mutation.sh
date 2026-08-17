@@ -137,3 +137,9 @@ run_mutant \
   '    exit 3' \
   '    exit 0' \
   diagnostic_wrapper_preserves_every_fail_closed_verdict_with_exit_three
+run_mutant \
+  blocked-environment-zero-count \
+  crates/gamepulse-worker-source/tests/live_canary.rs \
+  'request_count: 0,' \
+  'request_count: 1,' \
+  diagnostic_pre_request_failures_emit_zero_count_blocked_environment_reports
