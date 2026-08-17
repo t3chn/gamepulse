@@ -178,6 +178,38 @@ and the eight-target production shape (seven normal libraries plus the sole
 binary) against metadata-shaped sabotage rules. Coverage is deferred; targeted
 mutation testing begins when meaningful critical behavior exists.
 
+### M038 one-shot evaluator acceptance
+
+The explicit acceptance command is separate from ordinary service startup. It
+expects a fresh absolute database path and never deletes a caller file or its
+SQLite sidecars. Create and remove the temporary directory yourself:
+
+```bash
+acceptance_dir="$(mktemp -d /tmp/gamepulse-acceptance.XXXXXX)"
+cargo run --locked -p gamepulse -- acceptance-once \
+  --database "$acceptance_dir/gamepulse.sqlite3" \
+  --deadline-seconds 180
+rm -rf -- "$acceptance_dir"
+```
+
+The command defaults to the current mandatory target of 20 only when `--target`
+is omitted. `--target 20` is accepted for an explicit template; a missing or
+non-numeric explicit value, and any target other than 20, are rejected before
+SQLite opens because the domain's atomic daily-selection invariant is exactly
+20. It performs exactly one hourly-discovery enqueue, then drains only the mandatory source-ingestion
+and local review-summary jobs derived in that fresh database. It starts no
+listener, daemon, or repeat scheduler, and it does not retry a failed job.
+The deadline is hard and required.
+
+Its stdout is exactly one compact `gamepulse.acceptance.v1` aggregate JSON
+report. It includes the terminal outcome, target, selected, attempted,
+persisted, complete-video, summary-readiness, safe fixed failure-category
+counts, and runtime milliseconds. It intentionally omits a request count:
+the normal source port does not expose an exact wire-attempt count. The report
+never includes titles, source IDs, review text, payloads, credentials, URLs,
+or local paths. Fail-closed operational reports exit `3`; invalid command
+arguments exit `2`, and an internal `runtime_failure` report exits `1`.
+
 ### M028 opt-in source diagnostic
 
 The repository-owned diagnostic is an integration-test tool, not a second

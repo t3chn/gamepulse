@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod acceptance;
 mod observability;
 mod runtime;
 
@@ -12,8 +13,8 @@ use gamepulse_application::{
     RuntimeJobType, RuntimeJobTypeFilter, SourceIngestionJobSchedule,
 };
 use gamepulse_storage_sqlite::{
-    SqliteDailyCrawlStateStore, SqliteGameCatalogueReadStore, SqliteJobStore, SqliteReadinessProbe,
-    SqliteReviewSummaryStore,
+    SqliteAcceptanceCycleStore, SqliteDailyCrawlStateStore, SqliteGameCatalogueReadStore,
+    SqliteJobStore, SqliteReadinessProbe, SqliteReviewSummaryStore,
 };
 use gamepulse_worker_llm::{LocalExtractiveReviewSummarizer, ReviewSummaryHandler};
 use gamepulse_worker_source::{
@@ -24,6 +25,11 @@ use gamepulse_worker_source::{
 use observability::{LogFormat, ObservedJobHandler, ObservedPublicCoverEnricher};
 use runtime::{Runtime, RuntimeConfig, SystemRuntimeClock};
 use tokio::sync::Notify;
+
+use acceptance::{
+    AcceptanceCommand, AcceptanceReport, AcceptanceTerminal, EntryCommand, database_path_is_fresh,
+    parse_entry_command, run_acceptance_once,
+};
 
 const DATABASE_PATH_ENV: &str = "GAMEPULSE_DATABASE_PATH";
 const HTTP_ADDRESS_ENV: &str = "GAMEPULSE_HTTP_ADDRESS";
@@ -100,8 +106,24 @@ impl RuntimeEnvironment {
 
 #[tokio::main]
 async fn main() {
-    if run().await.is_err() {
-        std::process::exit(1);
+    match parse_entry_command(std::env::args_os().skip(1)) {
+        Ok(EntryCommand::Serve) => {
+            if run().await.is_err() {
+                std::process::exit(1);
+            }
+        }
+        Ok(EntryCommand::Acceptance(command)) => {
+            let report = run_acceptance(command).await;
+            println!("{}", report.to_json());
+            let exit_code = report.exit_code();
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+        Err(_) => {
+            eprintln!("invalid command");
+            std::process::exit(2);
+        }
     }
 }
 
@@ -122,69 +144,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await;
         }
     };
-    let review_summary_schedule = ReviewSummaryJobSchedule::new(3)?;
-    let llm_config = RuntimeConfig::worker_only("gamepulse-llm-runtime", 300, 1)?
-        .with_claim_filter(RuntimeJobTypeFilter::llm_lane());
-    let llm_handler: Arc<dyn JobHandler> =
-        Arc::new(ObservedJobHandler::new(ReviewSummaryHandler::new(
-            storage.review_summaries.clone(),
-            LocalExtractiveReviewSummarizer,
-        )));
-    let llm_handlers = Arc::new(JobHandlerRegistry::new([llm_handler])?);
     let wakeup = Arc::new(Notify::new());
     let mut source_runtime = if environment.source_work_enabled {
-        let source_client = MetacriticCanaryClient::new()?;
-        let public_html_cover = ObservedPublicCoverEnricher::new(PublicHtmlCoverEnricher::new(
-            MetacriticPublicHtmlTransport::new()?,
-        ));
-        let source_port = MetacriticDailyCrawlSource::new(source_client.clone());
         let schedule = HourlyJobSchedule::new(RuntimeJobType::SourceHourlyDiscovery, 3)?;
-        let source_ingestion_schedule = SourceIngestionJobSchedule::new(3)?;
         let source_config = RuntimeConfig::new("gamepulse-source-runtime", 300, 2, schedule)?
             .with_claim_filter(RuntimeJobTypeFilter::source_lane())
             .with_claim_pacing(JobClaimPacing::new(
                 "source",
                 SOURCE_LANE_MINIMUM_CLAIM_INTERVAL_SECONDS,
             )?);
-        let source_handler: Arc<dyn JobHandler> =
-            Arc::new(ObservedJobHandler::new(HourlyDiscoveryHandler::new(
-                storage.daily_crawl_state,
-                source_port,
-                source_ingestion_schedule,
-            )));
-        let ingestion_handler: Arc<dyn JobHandler> =
-            Arc::new(ObservedJobHandler::new(ReviewSourceIngestionHandler::new(
-                storage.review_summaries.clone(),
-                MetacriticGameReviewSource::with_public_cover_enricher(
-                    source_client,
-                    public_html_cover,
-                ),
-                review_summary_schedule,
-            )));
-        let source_handlers = Arc::new(JobHandlerRegistry::new([
-            source_handler,
-            ingestion_handler,
-        ])?);
-        Some(
-            Runtime::new(
-                storage.store.clone(),
-                Arc::new(SystemRuntimeClock),
-                source_config,
-                source_handlers,
-            )
-            .with_wakeup(wakeup.clone()),
-        )
+        Some(compose_source_runtime(
+            &storage,
+            source_config,
+            wakeup.clone(),
+        )?)
     } else {
         observability::source_work_disabled();
         None
     };
-    let mut llm_runtime = Runtime::new(
-        storage.store,
-        Arc::new(SystemRuntimeClock),
-        llm_config,
-        llm_handlers,
-    )
-    .with_wakeup(wakeup.clone());
+    let mut llm_runtime = compose_summary_runtime(&storage, wakeup.clone())?;
     let listener = tokio::net::TcpListener::bind(environment.http_address).await?;
     let web_server = axum::serve(
         listener,
@@ -228,6 +206,157 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     result?;
     Ok(())
+}
+
+/// Compose the production source lane once so long-running and one-shot entrypoints share the
+/// same source adapters, durable stores, typed handlers, and summary schedule.
+fn compose_source_runtime(
+    storage: &RuntimeStorage,
+    config: RuntimeConfig,
+    wakeup: Arc<Notify>,
+) -> Result<Runtime<SqliteJobStore, SystemRuntimeClock>, Box<dyn std::error::Error>> {
+    let review_summary_schedule = ReviewSummaryJobSchedule::new(3)?;
+    let source_client = MetacriticCanaryClient::new()?;
+    let public_html_cover = ObservedPublicCoverEnricher::new(PublicHtmlCoverEnricher::new(
+        MetacriticPublicHtmlTransport::new()?,
+    ));
+    let source_port = MetacriticDailyCrawlSource::new(source_client.clone());
+    let source_ingestion_schedule = SourceIngestionJobSchedule::new(3)?;
+    let source_handler: Arc<dyn JobHandler> =
+        Arc::new(ObservedJobHandler::new(HourlyDiscoveryHandler::new(
+            storage.daily_crawl_state.clone(),
+            source_port,
+            source_ingestion_schedule,
+        )));
+    let ingestion_handler: Arc<dyn JobHandler> =
+        Arc::new(ObservedJobHandler::new(ReviewSourceIngestionHandler::new(
+            storage.review_summaries.clone(),
+            MetacriticGameReviewSource::with_public_cover_enricher(
+                source_client,
+                public_html_cover,
+            ),
+            review_summary_schedule,
+        )));
+    let handlers = Arc::new(JobHandlerRegistry::new([
+        source_handler,
+        ingestion_handler,
+    ])?);
+    Ok(Runtime::new(
+        storage.store.clone(),
+        Arc::new(SystemRuntimeClock),
+        config,
+        handlers,
+    )
+    .with_wakeup(wakeup))
+}
+
+/// Compose the production local-review-summary lane once for both entrypoint modes.
+fn compose_summary_runtime(
+    storage: &RuntimeStorage,
+    wakeup: Arc<Notify>,
+) -> Result<Runtime<SqliteJobStore, SystemRuntimeClock>, Box<dyn std::error::Error>> {
+    let config = RuntimeConfig::worker_only("gamepulse-llm-runtime", 300, 1)?
+        .with_claim_filter(RuntimeJobTypeFilter::llm_lane());
+    let handler: Arc<dyn JobHandler> =
+        Arc::new(ObservedJobHandler::new(ReviewSummaryHandler::new(
+            storage.review_summaries.clone(),
+            LocalExtractiveReviewSummarizer,
+        )));
+    let handlers = Arc::new(JobHandlerRegistry::new([handler])?);
+    Ok(Runtime::new(
+        storage.store.clone(),
+        Arc::new(SystemRuntimeClock),
+        config,
+        handlers,
+    )
+    .with_wakeup(wakeup))
+}
+
+async fn run_acceptance(command: AcceptanceCommand) -> AcceptanceReport {
+    if !database_path_is_fresh(command.database_path()) {
+        return AcceptanceReport::new(
+            AcceptanceTerminal::ConfigurationFailure,
+            command.target(),
+            Default::default(),
+            0,
+        );
+    }
+    let storage = match RuntimeStorage::open(command.database_path()) {
+        Ok(storage) => storage,
+        Err(_) => {
+            return AcceptanceReport::new(
+                AcceptanceTerminal::RuntimeFailure,
+                command.target(),
+                Default::default(),
+                0,
+            );
+        }
+    };
+    let mut observation = match SqliteAcceptanceCycleStore::open(command.database_path()) {
+        Ok(observation) => observation,
+        Err(_) => {
+            return AcceptanceReport::new(
+                AcceptanceTerminal::RuntimeFailure,
+                command.target(),
+                Default::default(),
+                0,
+            );
+        }
+    };
+    let wakeup = Arc::new(Notify::new());
+    let schedule = match HourlyJobSchedule::new(RuntimeJobType::SourceHourlyDiscovery, 3) {
+        Ok(schedule) => schedule,
+        Err(_) => {
+            return AcceptanceReport::new(
+                AcceptanceTerminal::RuntimeFailure,
+                command.target(),
+                Default::default(),
+                0,
+            );
+        }
+    };
+    // The one-shot coordinator never enters the paced timer loop. It drives the same handlers
+    // through one enqueue and completion joins only; ordinary runtime pacing is unchanged.
+    let source_config = match RuntimeConfig::new("gamepulse-acceptance-source", 300, 2, schedule) {
+        Ok(config) => config.with_claim_filter(RuntimeJobTypeFilter::source_lane()),
+        Err(_) => {
+            return AcceptanceReport::new(
+                AcceptanceTerminal::RuntimeFailure,
+                command.target(),
+                Default::default(),
+                0,
+            );
+        }
+    };
+    let mut source_runtime = match compose_source_runtime(&storage, source_config, wakeup.clone()) {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return AcceptanceReport::new(
+                AcceptanceTerminal::RuntimeFailure,
+                command.target(),
+                Default::default(),
+                0,
+            );
+        }
+    };
+    let mut summary_runtime = match compose_summary_runtime(&storage, wakeup) {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return AcceptanceReport::new(
+                AcceptanceTerminal::RuntimeFailure,
+                command.target(),
+                Default::default(),
+                0,
+            );
+        }
+    };
+    run_acceptance_once(
+        &mut source_runtime,
+        &mut summary_runtime,
+        &mut observation,
+        &command,
+    )
+    .await
 }
 
 async fn serve_unready_http(

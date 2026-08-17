@@ -119,3 +119,20 @@ The bounded current Metacritic direct-HTTP contract is recorded in
 [`source-contracts/metacritic-direct-http.md`](source-contracts/metacritic-direct-http.md).
 It remains a monitored public-source dependency rather than a permanent API
 guarantee.
+
+## Evaluator acceptance cycle
+
+The sole binary provides one explicit opt-in, one-shot evaluator acceptance
+command. It accepts a fresh caller-selected SQLite path, defaults to the
+mandatory 20-game target, performs one persistence cycle through the ordinary
+application ports and worker lanes, and exits with one aggregate-safe machine
+report. It never starts the HTTP server, daemon, or hourly loop.
+
+The command schedules discovery once only. It does not create a second cycle,
+retry a failed job, or wait for optional work. It waits only for the mandatory
+source-ingestion and review-summary jobs created by its fresh cycle, subject to
+an explicit hard deadline. Success requires exactly the requested current
+mandatory target of stored records with video links and both persisted review
+summaries ready. The command neither removes nor overwrites a caller database;
+operators provide a fresh temporary path and remove it themselves after
+inspection.

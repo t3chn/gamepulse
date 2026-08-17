@@ -304,6 +304,15 @@ where
         self.accepting_work = false;
     }
 
+    /// Stop future work and abort active process-local tasks for a hard external deadline.
+    ///
+    /// Durable claims are intentionally left to normal lease recovery. This is used only by the
+    /// explicit one-shot acceptance command, whose process terminates immediately afterwards.
+    pub fn abort_active(&mut self) {
+        self.begin_shutdown();
+        self.tasks.abort_all();
+    }
+
     /// Join every active execution task after stopping scheduling and new claims.
     pub async fn shutdown(&mut self) -> Result<DispatchReport, RuntimeError> {
         self.begin_shutdown();

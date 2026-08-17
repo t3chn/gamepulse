@@ -2,6 +2,7 @@
 
 //! SQLite implementations of GamePulse application ports.
 
+mod acceptance_cycle;
 mod catalogue;
 mod game_snapshot;
 mod job_queue;
@@ -20,6 +21,7 @@ use rusqlite::{
     params,
 };
 
+pub use acceptance_cycle::{AcceptanceCycleReadStoreError, SqliteAcceptanceCycleStore};
 pub use catalogue::{GameCatalogueReadStoreError, SqliteGameCatalogueReadStore};
 pub use game_snapshot::{GameSnapshotStoreError, SqliteGameSnapshotStore};
 pub use job_queue::{JobStoreError, SqliteJobStore};

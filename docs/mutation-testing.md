@@ -44,3 +44,28 @@ as caught only when that same named test fails. A compile, Cargo, harness, copy,
 or other infrastructure failure is reported separately and never counted as a
 caught mutant. A compiling survivor fails the command. The harness never calls
 a public source, prints no fixture payload, and never patches the working tree.
+
+## M038 evaluator acceptance mutations
+
+Run the repository-owned one-shot acceptance harness from the repository root:
+
+```text
+mise run acceptance-mutation
+```
+
+The command copies the current tracked and ordinary untracked source files to a
+temporary directory outside the repository, runs offline, and removes the
+temporary directory on exit. This includes the inherited M038 files before a
+commit without copying ignored build output. It has a hard ceiling of three
+named mutants:
+
+1. schedule the hourly-discovery job a second time;
+2. continue after a retryable mandatory-job failure;
+3. report success when the final complete-video target is short.
+
+Each mutant first proves the exact named fixture integration test passes, then
+applies exactly one literal source mutation. A mutant is caught only when that
+same test fails. Compilation, copy, test-harness, or mutation-setup failures
+are infrastructure failures rather than caught mutants; a compiling survivor
+fails the harness. The harness never invokes the acceptance command or a public
+source.

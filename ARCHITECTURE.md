@@ -150,6 +150,22 @@ domain -----------------------------------> no workspace crate
   prompts and responses, but never credentials, hidden system instructions,
   private chain-of-thought, or unrelated HR context.
 
+### AD-11 — Keep evaluator acceptance one-shot and composition-native
+
+- **Prevents:** a test-only persistence path, an accidental second scheduler,
+  or evaluator output disclosing source and local operational data.
+- **Rule:** the sole binary may expose one explicit opt-in acceptance subcommand
+  for a fresh caller-selected SQLite file. It reuses the production source
+  adapters, SQLite stores, durable queue, typed handlers, and local summary
+  worker, but starts neither HTTP delivery nor a daemon. It enqueues one
+  hourly-discovery identity once, does not reschedule or retry a failed job,
+  and waits only for the source-ingestion and review-summary jobs created by
+  that fresh cycle. A hard caller deadline aborts active local tasks and
+  terminates the command. Its one report contains only fixed outcome categories
+  and aggregate counts; it excludes source identities, titles, review content,
+  payloads, credentials, URLs, and local paths. The normal hourly runtime and
+  its source-lane pacing remain unchanged.
+
 ## Workspace ownership
 
 | Crate | Owns | May depend on |
@@ -460,6 +476,20 @@ it atomically with a claim while preserving the existing 300-second leases and
 claim fencing. [`mise run mutation`](docs/mutation-testing.md) runs three declared temporary source-tree
 mutants against focused exact-20 regressions, classifies caught, noncompiling,
 and surviving mutants, has a hard three-mutant ceiling, and fails on a survivor.
+
+M038 adds the explicit evaluator acceptance command. Its one-shot coordinator
+uses the existing durable runtime for exactly one hourly-discovery enqueue, the
+same production worker-handler composition, and a separate SQLite aggregate
+read port. It uses no HTTP listener, timer-driven scheduler loop, retry pass,
+or second discovery enqueue. The command accepts only the current mandatory
+20-game target, because the domain's daily selection and atomic commit invariant
+is exactly 20. Its fresh-path precondition scopes every source-ingestion and
+summary job in the database to this one cycle; the aggregate reader never
+exposes raw records. Focused fixture-only integration tests cover the single
+discovery invocation, no retry, exact target, cycle-scoped summary drain,
+deadline, job failure, target failure, and report privacy. A dedicated
+three-mutant offline harness exercises the one-shot termination decisions;
+normal source calls remain outside CI and this milestone.
 
 ## Revisit conditions
 

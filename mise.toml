@@ -31,6 +31,10 @@ run = "bash scripts/mutation.sh"
 description = "Run bounded M033 diagnostic safety mutations"
 run = "bash scripts/diagnostic_mutation.sh"
 
+[tasks.acceptance-mutation]
+description = "Run bounded M038 one-shot acceptance mutations"
+run = "bash scripts/acceptance_mutation.sh"
+
 [tasks.demo]
 description = "Start the deterministic local GamePulse preview"
 run = "bash scripts/demo.sh"

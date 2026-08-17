@@ -2367,6 +2367,185 @@ impl fmt::Debug for JobAttempt {
     }
 }
 
+/// Aggregate lifecycle counts for one acceptance-cycle job family.
+///
+/// This intentionally contains no job identity, work reference, worker, error,
+/// timestamp, or source-derived data. The one-shot evaluator command uses it
+/// only after requiring a fresh database, which makes the two mandatory job
+/// families below belong to that one cycle.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AcceptanceJobProgress {
+    total: usize,
+    attempted: usize,
+    ready: usize,
+    claimed: usize,
+    succeeded: usize,
+    failed: usize,
+}
+
+impl AcceptanceJobProgress {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        total: usize,
+        attempted: usize,
+        ready: usize,
+        claimed: usize,
+        succeeded: usize,
+        failed: usize,
+    ) -> Self {
+        Self {
+            total,
+            attempted,
+            ready,
+            claimed,
+            succeeded,
+            failed,
+        }
+    }
+
+    pub const fn total(self) -> usize {
+        self.total
+    }
+
+    pub const fn attempted(self) -> usize {
+        self.attempted
+    }
+
+    pub const fn ready(self) -> usize {
+        self.ready
+    }
+
+    pub const fn claimed(self) -> usize {
+        self.claimed
+    }
+
+    pub const fn succeeded(self) -> usize {
+        self.succeeded
+    }
+
+    pub const fn failed(self) -> usize {
+        self.failed
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        self.succeeded.saturating_add(self.failed) == self.total
+    }
+}
+
+/// Fixed aggregate failure categories safe for an evaluator-facing report.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AcceptanceFailureCategories {
+    source_review_continuation_link: usize,
+    source_other_mandatory_stage: usize,
+    summary: usize,
+}
+
+impl AcceptanceFailureCategories {
+    pub const fn new(
+        source_review_continuation_link: usize,
+        source_other_mandatory_stage: usize,
+        summary: usize,
+    ) -> Self {
+        Self {
+            source_review_continuation_link,
+            source_other_mandatory_stage,
+            summary,
+        }
+    }
+
+    pub const fn source_review_continuation_link(self) -> usize {
+        self.source_review_continuation_link
+    }
+
+    pub const fn source_other_mandatory_stage(self) -> usize {
+        self.source_other_mandatory_stage
+    }
+
+    pub const fn summary(self) -> usize {
+        self.summary
+    }
+}
+
+/// Aggregate-only durable observation for the fresh one-shot acceptance cycle.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AcceptanceCycleSnapshot {
+    selected: usize,
+    source_ingestion: AcceptanceJobProgress,
+    summaries: AcceptanceJobProgress,
+    persisted: usize,
+    complete_video: usize,
+    summaries_ready: usize,
+    summaries_pending_or_missing: usize,
+    failures: AcceptanceFailureCategories,
+}
+
+impl AcceptanceCycleSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        selected: usize,
+        source_ingestion: AcceptanceJobProgress,
+        summaries: AcceptanceJobProgress,
+        persisted: usize,
+        complete_video: usize,
+        summaries_ready: usize,
+        summaries_pending_or_missing: usize,
+        failures: AcceptanceFailureCategories,
+    ) -> Self {
+        Self {
+            selected,
+            source_ingestion,
+            summaries,
+            persisted,
+            complete_video,
+            summaries_ready,
+            summaries_pending_or_missing,
+            failures,
+        }
+    }
+
+    pub const fn selected(self) -> usize {
+        self.selected
+    }
+
+    pub const fn source_ingestion(self) -> AcceptanceJobProgress {
+        self.source_ingestion
+    }
+
+    pub const fn summaries(self) -> AcceptanceJobProgress {
+        self.summaries
+    }
+
+    pub const fn persisted(self) -> usize {
+        self.persisted
+    }
+
+    pub const fn complete_video(self) -> usize {
+        self.complete_video
+    }
+
+    pub const fn summaries_ready(self) -> usize {
+        self.summaries_ready
+    }
+
+    pub const fn summaries_pending_or_missing(self) -> usize {
+        self.summaries_pending_or_missing
+    }
+
+    pub const fn failures(self) -> AcceptanceFailureCategories {
+        self.failures
+    }
+}
+
+/// Application-owned aggregate read port for the opt-in evaluator acceptance command.
+///
+/// The port cannot return titles, source identifiers, job identities, work references,
+/// timestamps, paths, errors, or source payload fields.
+pub trait AcceptanceCycleReadPort {
+    type Error;
+
+    fn acceptance_cycle_snapshot(&mut self) -> Result<AcceptanceCycleSnapshot, Self::Error>;
+}
+
 /// Application-owned durable queue boundary. Implementations must recover
 /// expired claims before selecting ready work and must atomically update a job
 /// and its attempt history for every lifecycle transition.
