@@ -1,0 +1,11 @@
+{
+  "data": {
+    "items": [{}, {}, {}, {}],
+    "totalResults": 4
+  },
+  "links": {
+    "next": {
+      "href": null
+    }
+  }
+}

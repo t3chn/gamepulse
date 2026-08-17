@@ -175,16 +175,17 @@ the observability boundary may emit.
 
 M016 changes no continuation acceptance rule. M017 adds one separately
 authorized review-only terminal normalization: a present `links.next` object
-whose `href` field is absent, rather than JSON `null`, is terminal only when
-the requested offset plus the parsed review-item count equals
-`data.totalResults` exactly, using checked arithmetic. A non-exhausted review
-placeholder remains invalid. A missing `links.next` retains its established
-terminal meaning, while explicit `links.next: null` or `href: null` is invalid.
-Finder/list continuations do not receive the normalization. The M015 critic
-first-page effective-page-size exception remains narrow, and every non-empty
-review or listing continuation still requires the existing exact host, path,
-duplicate-query-key, positive-limit, progression, overflow, and total-boundary
-validation.
+whose `href` field is absent is terminal only when the requested offset plus
+the parsed review-item count equals `data.totalResults` exactly, using checked
+arithmetic. M034R extends that same normalization to an `href: null` field
+after the bounded live diagnostic observed that structural shape. A
+non-exhausted review placeholder remains invalid. A missing `links.next`
+retains its established terminal meaning, while explicit `links.next: null`
+remains invalid. Finder/list continuations do not receive the normalization.
+The M015 critic first-page effective-page-size exception remains narrow, and
+every non-empty review or listing continuation still requires the existing
+exact host, path, duplicate-query-key, positive-limit, progression, overflow,
+and total-boundary validation.
 
 ## M028 aggregate-only diagnostic canary
 

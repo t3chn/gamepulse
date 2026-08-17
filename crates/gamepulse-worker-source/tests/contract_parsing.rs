@@ -18,6 +18,8 @@ const M015_CRITIC_SERVER_CLAMP: &str = include_str!("fixtures/m015-critic-server
 const M017_REVIEW_TERMINAL_WITH_ITEMS: &str =
     include_str!("fixtures/m017-review-terminal-with-items.json");
 const M017_REVIEW_TERMINAL_EMPTY: &str = include_str!("fixtures/m017-review-terminal-empty.json");
+const M034_REVIEW_TERMINAL_NULL_HREF: &str =
+    include_str!("fixtures/m034-review-terminal-null-href.json");
 
 fn example_game() -> GameIdentity {
     GameIdentity {
@@ -304,7 +306,7 @@ fn accepts_only_the_verified_server_clamp_for_the_first_critic_page() {
 }
 
 #[test]
-fn accepts_only_exhausted_review_placeholders_as_terminal() {
+fn accepts_only_exhausted_review_terminal_markers() {
     let game = example_game();
     let critic = parse_review_page(
         ReviewKind::Critic,
@@ -330,6 +332,18 @@ fn accepts_only_exhausted_review_placeholders_as_terminal() {
     assert_eq!(user.total_results, 0);
     assert_eq!(user.next, None);
 
+    let null_href = parse_review_page(
+        ReviewKind::Critic,
+        &game.slug,
+        0,
+        20,
+        M034_REVIEW_TERMINAL_NULL_HREF,
+    )
+    .expect("exhausted null href must be terminal");
+    assert_eq!(null_href.reviews.len(), 4);
+    assert_eq!(null_href.total_results, 4);
+    assert_eq!(null_href.next, None);
+
     let missing_next = without_next(M017_REVIEW_TERMINAL_EMPTY);
     assert_eq!(
         parse_review_page(ReviewKind::User, &game.slug, 0, 20, &missing_next)
@@ -352,9 +366,7 @@ fn accepts_only_exhausted_review_placeholders_as_terminal() {
 
     for body in [
         with_explicit_null_next(M017_REVIEW_TERMINAL_WITH_ITEMS),
-        with_explicit_null_href(M017_REVIEW_TERMINAL_WITH_ITEMS),
         with_explicit_null_next(M017_REVIEW_TERMINAL_EMPTY),
-        with_explicit_null_href(M017_REVIEW_TERMINAL_EMPTY),
     ] {
         assert!(matches!(
             parse_review_page(ReviewKind::Critic, &game.slug, 0, 20, &body),
@@ -362,12 +374,16 @@ fn accepts_only_exhausted_review_placeholders_as_terminal() {
         ));
     }
 
-    let non_exhausted =
+    let non_exhausted_absent_href =
         M017_REVIEW_TERMINAL_WITH_ITEMS.replace("\"totalResults\": 4", "\"totalResults\": 5");
-    assert!(matches!(
-        parse_review_page(ReviewKind::Critic, &game.slug, 0, 20, &non_exhausted),
-        Err(SourceError::InvalidContinuation)
-    ));
+    let non_exhausted_null_href =
+        M034_REVIEW_TERMINAL_NULL_HREF.replace("\"totalResults\": 4", "\"totalResults\": 5");
+    for body in [non_exhausted_absent_href, non_exhausted_null_href] {
+        assert!(matches!(
+            parse_review_page(ReviewKind::Critic, &game.slug, 0, 20, &body),
+            Err(SourceError::InvalidContinuation)
+        ));
+    }
 
     let exhausted_listing = LISTING.replace("\"totalResults\": 42", "\"totalResults\": 2");
     for body in [

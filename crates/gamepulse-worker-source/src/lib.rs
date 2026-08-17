@@ -2797,12 +2797,11 @@ fn parse_continuation(
         RawNextLink::Link(raw) => raw,
     };
     let href = match raw.href {
-        RawHref::Missing => {
+        RawHref::Missing | RawHref::Null => {
             return is_exhausted_review_page(&context)
                 .then_some(None)
                 .ok_or(SourceError::InvalidContinuation);
         }
-        RawHref::Null => return Err(SourceError::InvalidContinuation),
         RawHref::Value(href) => href,
     };
     let url = Url::parse(&href).map_err(|_| SourceError::InvalidContinuation)?;

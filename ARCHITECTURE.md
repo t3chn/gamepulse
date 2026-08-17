@@ -427,14 +427,15 @@ mandatory review-page parser rejects a continuation, or
 values are the durable handler failure data and the only source-ingestion
 failure categories emitted through the binary-owned observability boundary. No
 source error, link, URL component, request value, or response material crosses
-either boundary. M017 adds one separately authorized source-adapter rule: only
-a review-page `next` object with an absent `href` field, not a JSON `null`, may
-be terminal, and only when the requested offset plus parsed item count equals
-the declared total under checked arithmetic. A missing `links.next` preserves
-the established terminal behavior; explicit `next: null`, `href: null`,
-non-exhausted review placeholders, and all finder/list placeholders remain
-rejected. M015's critic first-page effective-page-size rule and all non-empty
-continuation validation remain unchanged.
+either boundary. M017 adds one separately authorized source-adapter rule: a
+review-page `next` object with an absent `href` field may be terminal only when
+the requested offset plus parsed item count equals the declared total under
+checked arithmetic. M034R extends that same exact-exhaustion rule to a JSON
+`href: null` after bounded aggregate-only live evidence observed that shape. A
+missing `links.next` preserves the established terminal behavior; explicit
+`next: null`, non-exhausted review placeholders, and all finder/list
+placeholders remain rejected. M015's critic first-page effective-page-size
+rule and all non-empty continuation validation remain unchanged.
 
 M003 requires targeted mutation testing because it introduces daily
 deduplication, crawl progression, and selection policy.
