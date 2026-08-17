@@ -178,18 +178,43 @@ and the eight-target production shape (seven normal libraries plus the sole
 binary) against metadata-shaped sabotage rules. Coverage is deferred; targeted
 mutation testing begins when meaningful critical behavior exists.
 
-### Opt-in public source canary
+### M028 opt-in source diagnostic
 
-The live canary is ignored by normal tests. It performs exactly one anonymous
-public request to the verified New Releases finder endpoint and prints only
-structural counts:
+The repository-owned diagnostic is an integration-test tool, not a second
+production binary and not part of ordinary source work. Its fixture mode runs
+only local fixtures through the same request budget, parser, and aggregate
+reporting path; it makes zero external requests:
 
 ```bash
-METACRITIC_LIVE_CANARY=1 cargo test --locked -p gamepulse-worker-source \
-  --test live_canary live_new_releases_contract_canary -- --ignored --exact --nocapture
+bash scripts/diagnostic_canary.sh fixture
 ```
 
-Run it deliberately and only within the request ceiling documented in
+The two live modes are ignored by normal tests and require separate explicit
+owner authorization before the environment opt-in is set. They use anonymous,
+direct HTTPS only, disable retries and redirects, reject a non-JSON or
+oversized response, bypass cookies/authentication/browser/proxy state, and
+print a structured aggregate report only. They never log or persist payloads,
+identities, URLs, headers, or response bodies.
+
+Finder mode permits one New Releases request:
+
+```bash
+GAMEPULSE_M028_LIVE_DIAGNOSTIC=1 bash scripts/diagnostic_canary.sh finder
+```
+
+Review-continuation mode permits at most finder, critic-first-page, and
+user-first-page requests for one ephemeral finder candidate. It stops on the
+first failure and never follows a continuation or candidate fallback:
+
+```bash
+GAMEPULSE_M028_LIVE_DIAGNOSTIC=1 bash scripts/diagnostic_canary.sh review-continuation
+```
+
+Terminal verdicts are `fixture_validated`, `contract_ready`, `access_denied`,
+`rate_limited`, `source_rejected`, `no_candidate`, and
+`request_budget_exhausted`. Only the first two are positive structural evidence;
+the others are fail-closed diagnostic results. Full behavior and boundaries are
+recorded in
 [`docs/source-contracts/metacritic-direct-http.md`](docs/source-contracts/metacritic-direct-http.md).
 
 ## Repository boundary

@@ -186,6 +186,41 @@ review or listing continuation still requires the existing exact host, path,
 duplicate-query-key, positive-limit, progression, overflow, and total-boundary
 validation.
 
+## M028 aggregate-only diagnostic canary
+
+M028 adds a repository-owned integration-test diagnostic, not a runtime path
+or a second production binary. Its unignored fixture command uses only local
+fixtures and makes zero network requests. It drives the committed listing and
+review parsers through the same process-local request budget and aggregate
+reporting path that the two ignored live modes use.
+
+The opt-in finder mode permits one New Releases GET. The opt-in
+review-continuation mode permits no more than three GETs total: finder, critic
+first page, and user first page for the first finder candidate held only in
+process memory. Both modes are unavailable unless a later owner explicitly
+authorizes the run and sets the documented opt-in. A non-200 response,
+non-JSON content type, invalid UTF-8, body-cap failure, malformed JSON,
+parser rejection, absent candidate, or exhausted budget stops the sequence;
+there are no retries, redirects, fallback candidates, second sequences, or
+continuation requests.
+
+Each live request is constructed and rechecked against the exact HTTPS backend
+host, expected path, complete query contract, default port, and absent user
+info or fragment before it is sent. The isolated client sets only
+`Accept: application/json`, disables retries, redirects, and proxy use, has a
+bounded timeout and body, and does not enable cookies, authentication, browser
+state, HTML, media, CDN, YouTube, or LLM traffic.
+
+Its sole output is a serialized aggregate report: mode, request count and
+ceiling, terminal verdict, status category, content-type/UTF-8/JSON booleans,
+item count, numeric-total boolean, continuation and href presence kinds,
+boolean link checks, parser accept/reject, and one fixed safe category. The
+report has no raw status, payload, review text, source identity, URL, header,
+cookie, credential, response body, or local path. `contract_ready` and
+`fixture_validated` are positive structural evidence; `access_denied`,
+`rate_limited`, `source_rejected`, `no_candidate`, and
+`request_budget_exhausted` are terminal fail-closed results.
+
 ## Remaining risks
 
 - The backend is a public site implementation, not a versioned public API.
