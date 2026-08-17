@@ -13,20 +13,21 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::to_bytes;
 use gamepulse_application::{
-    GameReviewRefresh, GameReviewRefreshStore, JobHandler, JobHandlerRegistry, JobRequest,
-    JobStatus, JobStore, JobTimestamp, ReviewExcerpt, ReviewInput, ReviewKind,
-    ReviewRefreshFingerprint, ReviewSummary, ReviewSummaryJobSchedule, ReviewSummaryOutput,
-    ReviewSummaryRequest, ReviewSummaryStore, RuntimeJobType, RuntimeJobTypeFilter,
-    SourceProductId,
+    AsyncReviewSourceIngestionPort, GameReviewRefresh, GameReviewRefreshStore, JobHandler,
+    JobHandlerRegistry, JobRequest, JobStatus, JobStore, JobTimestamp, ReviewExcerpt, ReviewInput,
+    ReviewKind, ReviewRefreshFingerprint, ReviewSummary, ReviewSummaryJobSchedule,
+    ReviewSummaryOutput, ReviewSummaryRequest, ReviewSummaryStore, RuntimeJobType,
+    RuntimeJobTypeFilter, SourceIngestionRequest, SourceProductId,
 };
 use gamepulse_storage_sqlite::{
     SqliteGameCatalogueReadStore, SqliteJobStore, SqliteReviewSummaryStore,
 };
 use gamepulse_worker_llm::{LocalExtractiveReviewSummarizer, ReviewSummaryHandler};
 use gamepulse_worker_source::{
-    GameDetail, GameIdentity, GameIngestionTransport, MetacriticGameReviewSource, PlatformDetail,
-    PlatformUserScore, ReviewPage, ReviewSourceIngestionHandler, SourceIngestionFailureCategory,
-    parse_game_detail, parse_platform_user_score_for_snapshot, parse_review_page,
+    GameDetail, GameIdentity, GameIngestionTransport, MetacriticGameReviewError,
+    MetacriticGameReviewSource, PlatformDetail, PlatformUserScore, ReviewPage,
+    ReviewSourceIngestionHandler, SourceIngestionFailureCategory, parse_game_detail,
+    parse_platform_user_score_for_snapshot, parse_review_page,
 };
 use runtime::{Runtime, RuntimeClock, RuntimeClockError, RuntimeConfig, RuntimeTaskOutcome};
 use rusqlite::{Connection, params};
@@ -600,6 +601,34 @@ async fn source_review_continuation_failure_is_durable_and_leaves_no_partial_ref
             .and_then(gamepulse_application::JobAttempt::error),
         Some("review_continuation_link")
     );
+}
+
+#[tokio::test]
+async fn valid_missing_video_fixture_reaches_missing_required_video_not_identity_mismatch() {
+    let transport = FixtureTransport::with_missing_video();
+    let source = MetacriticGameReviewSource::new(transport.clone());
+    let outcome = source
+        .ingest_reviews(
+            SourceIngestionRequest::new(101, "example-game")
+                .expect("fixture request must be valid"),
+        )
+        .await;
+
+    assert!(
+        matches!(
+            &outcome,
+            Err(MetacriticGameReviewError::MissingRequiredVideo)
+        ),
+        "valid fixture must reach MissingRequiredVideo"
+    );
+    assert!(
+        !matches!(
+            &outcome,
+            Err(MetacriticGameReviewError::MismatchedGameIdentity)
+        ),
+        "valid fixture must not fail as MismatchedGameIdentity"
+    );
+    assert_eq!(transport.calls(), ["detail:example-game"]);
 }
 
 #[tokio::test]
