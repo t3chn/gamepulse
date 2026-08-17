@@ -118,6 +118,12 @@ Platform entries use a numeric `id`, `slug`, release date, and optional
 `criticScoreSummary.score`. Developer names are the `production.companies`
 entries whose `typeName` is `Developer`.
 
+An absent `video` remains structurally valid source data. M035 applies the
+separate assignment eligibility rule at mandatory source-ingestion time: it
+rejects such a detail before persistence under the existing aggregate-only
+`other_mandatory_stage` category. This does not change direct-HTTP parsing or
+expose source values through diagnostics.
+
 The endpoint does not attach every platform's Userscore to its platform array.
 Fetch it separately for each platform slug:
 

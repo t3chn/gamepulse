@@ -437,6 +437,15 @@ missing `links.next` preserves the established terminal behavior; explicit
 placeholders remain rejected. M015's critic first-page effective-page-size
 rule and all non-empty continuation validation remain unchanged.
 
+M035 makes the assignment's stored video link an eligibility requirement for
+mandatory source ingestion. The source-adapter parser may still represent an
+absent backend video field structurally, but `MetacriticGameReviewSource` must
+reject that detail before fetching dependent mandatory fields or constructing a
+review refresh. The handler records the existing safe
+`other_mandatory_stage` failure category; it persists no game, review input,
+summary, or summary job for that attempt. The source-agnostic snapshot model
+continues to represent an absent video for non-mandatory fixtures and reads.
+
 M003 requires targeted mutation testing because it introduces daily
 deduplication, crawl progression, and selection policy.
 

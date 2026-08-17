@@ -194,6 +194,7 @@ enum FixtureError {
 struct FixtureTransport {
     calls: Arc<Mutex<Vec<String>>>,
     review_failure: Option<FixtureError>,
+    missing_video: bool,
 }
 
 impl FixtureTransport {
@@ -208,6 +209,15 @@ impl FixtureTransport {
         Self {
             calls: Arc::new(Mutex::new(Vec::new())),
             review_failure: Some(FixtureError::ReviewContinuationLink),
+            missing_video: false,
+        }
+    }
+
+    fn with_missing_video() -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            review_failure: None,
+            missing_video: true,
         }
     }
 }
@@ -232,8 +242,14 @@ impl GameIngestionTransport for FixtureTransport {
             .lock()
             .expect("fixture calls must not be poisoned")
             .push(format!("detail:{}", expected.slug));
+        let missing_video = self.missing_video;
         Box::pin(async move {
-            parse_game_detail(&expected, DETAIL).map_err(|_| FixtureError::Unavailable)
+            let mut detail =
+                parse_game_detail(&expected, DETAIL).map_err(|_| FixtureError::Unavailable)?;
+            if missing_video {
+                detail.video = None;
+            }
+            Ok(detail)
         })
     }
 
@@ -481,6 +497,14 @@ async fn fixture_refresh_creates_two_separated_summary_jobs_and_renders_persiste
         .expect("polarity rows must decode");
     assert_eq!(inputs, 2);
     assert_eq!(jobs, 2);
+    let games_with_video = reopened
+        .query_row(
+            "SELECT COUNT(*) FROM games WHERE video_url IS NOT NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("mandatory video count must reopen");
+    assert_eq!(games_with_video, 1);
     assert_eq!(
         polarities,
         [
@@ -576,6 +600,101 @@ async fn source_review_continuation_failure_is_durable_and_leaves_no_partial_ref
             .and_then(gamepulse_application::JobAttempt::error),
         Some("review_continuation_link")
     );
+}
+
+#[tokio::test]
+async fn missing_required_video_fails_without_persisting_or_enqueuing_summaries() {
+    let database = TemporaryDatabase::new();
+    let queue = Arc::new(Mutex::new(
+        SqliteJobStore::open(&database.path).expect("queue database must open"),
+    ));
+    let reviews = Arc::new(Mutex::new(
+        SqliteReviewSummaryStore::open(&database.path).expect("review database must open"),
+    ));
+    let transport = FixtureTransport::with_missing_video();
+    queue
+        .lock()
+        .expect("queue must not be poisoned")
+        .enqueue(
+            JobRequest::new(
+                "m035-source-missing-video",
+                RuntimeJobType::SourceGameIngestion.as_str(),
+                "metacritic-game:101:example-game",
+                1,
+                timestamp(10),
+            )
+            .expect("source job must be valid"),
+        )
+        .expect("source job must enqueue");
+    let source_handler: Arc<dyn JobHandler> = Arc::new(ReviewSourceIngestionHandler::new(
+        reviews.clone(),
+        MetacriticGameReviewSource::new(transport.clone()),
+        ReviewSummaryJobSchedule::new(1).expect("summary schedule must be valid"),
+    ));
+    let mut runtime = Runtime::new(
+        queue.clone(),
+        Arc::new(FixedClock(20)),
+        source_config(),
+        Arc::new(JobHandlerRegistry::new([source_handler]).expect("source registry must be valid")),
+    );
+
+    assert_eq!(
+        runtime
+            .dispatch_available()
+            .expect("source must claim")
+            .claimed,
+        1
+    );
+    assert_eq!(
+        runtime
+            .join_all()
+            .await
+            .expect("source task must join")
+            .settled,
+        [RuntimeTaskOutcome::Failed(
+            gamepulse_application::JobFailureResult::Failed
+        )]
+    );
+    drop(runtime);
+    drop(queue);
+    drop(reviews);
+
+    let reopened = rusqlite::Connection::open(&database.path).expect("database must reopen");
+    for table in ["games", "review_inputs", "review_summaries"] {
+        let count = reopened
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count must load");
+        assert_eq!(count, 0, "{table} must remain empty after a missing video");
+    }
+    let summary_jobs = reopened
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE job_type = 'llm.review-summary'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("summary job count must load");
+    assert_eq!(summary_jobs, 0);
+    let mut attempts = SqliteJobStore::open(&database.path).expect("queue database must reopen");
+    assert_eq!(
+        attempts
+            .job("m035-source-missing-video")
+            .expect("source job must load")
+            .expect("source job must exist")
+            .status(),
+        JobStatus::Failed
+    );
+    assert_eq!(
+        attempts
+            .attempts("m035-source-missing-video")
+            .expect("attempt history must load")
+            .as_slice()
+            .first()
+            .and_then(gamepulse_application::JobAttempt::error),
+        Some("other_mandatory_stage")
+    );
+    assert_eq!(transport.calls(), ["detail:example-game"]);
 }
 
 #[test]

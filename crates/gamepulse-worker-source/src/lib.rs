@@ -1505,6 +1505,7 @@ pub enum MetacriticGameReviewError<E> {
     PlatformUserScoreTransport(E),
     ReviewPageTransport(E),
     MismatchedGameIdentity,
+    MissingRequiredVideo,
     MismatchedReviewKind,
     Snapshot(GameSnapshotMappingError),
     ReviewInput(ReviewInputMappingError),
@@ -1526,6 +1527,9 @@ impl<E> fmt::Display for MetacriticGameReviewError<E> {
             Self::MismatchedGameIdentity => formatter.write_str(
                 "Metacritic review ingestion detail did not match the requested identity",
             ),
+            Self::MissingRequiredVideo => {
+                formatter.write_str("Metacritic mandatory video link was missing")
+            }
             Self::MismatchedReviewKind => {
                 formatter.write_str("Metacritic review response did not match the requested kind")
             }
@@ -1576,6 +1580,9 @@ where
                     .map_err(MetacriticGameReviewError::DetailTransport)?;
                 if detail.id != expected_game.id || detail.slug != expected_game.slug {
                     return Err(MetacriticGameReviewError::MismatchedGameIdentity);
+                }
+                if detail.video.is_none() {
+                    return Err(MetacriticGameReviewError::MissingRequiredVideo);
                 }
                 let mut user_scores = Vec::with_capacity(detail.platforms.len());
                 for platform in detail.platforms.iter().cloned() {
@@ -1644,6 +1651,7 @@ where
             | MetacriticGameReviewError::PlatformUserScoreTransport(_)
             | MetacriticGameReviewError::ReviewPageTransport(_)
             | MetacriticGameReviewError::MismatchedGameIdentity
+            | MetacriticGameReviewError::MissingRequiredVideo
             | MetacriticGameReviewError::MismatchedReviewKind
             | MetacriticGameReviewError::Snapshot(_)
             | MetacriticGameReviewError::ReviewInput(_)
