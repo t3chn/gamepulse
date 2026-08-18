@@ -6,9 +6,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gamepulse_application::{
-    ClaimedJob, HourlyJobSchedule, JobClaimPacing, JobClaimRequest, JobCompletion,
-    JobEnqueueResult, JobFailure, JobFailureResult, JobHandlerFailure, JobHandlerRegistry,
-    JobHandlerResult, JobInputError, JobStore, JobTimestamp, RuntimeJobTypeFilter, TypedJob,
+    ClaimedJob, FailureCategoryCounts, HourlyJobSchedule, JobClaimPacing, JobClaimRequest,
+    JobCompletion, JobEnqueueResult, JobFailure, JobFailureResult, JobHandlerFailure,
+    JobHandlerRegistry, JobHandlerResult, JobInputError, JobStore, JobTimestamp,
+    RuntimeJobTypeFilter, TypedJob, WorkerFailureCategory,
 };
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
@@ -161,6 +162,13 @@ pub enum SchedulerOutcome {
 pub struct DispatchReport {
     pub claimed: usize,
     pub settled: Vec<RuntimeTaskOutcome>,
+    pub observed_failures: FailureCategoryCounts,
+}
+
+impl DispatchReport {
+    pub const fn observed_failures(&self) -> FailureCategoryCounts {
+        self.observed_failures
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,7 +197,7 @@ where
     handlers: Arc<JobHandlerRegistry>,
     wakeup: Option<Arc<Notify>>,
     accepting_work: bool,
-    tasks: JoinSet<RuntimeTaskOutcome>,
+    tasks: JoinSet<RuntimeTaskResult>,
 }
 
 impl<S, C> Runtime<S, C>
@@ -323,9 +331,11 @@ where
     pub async fn join_all(&mut self) -> Result<DispatchReport, RuntimeError> {
         let mut report = self.reap_finished()?;
         while let Some(joined) = self.tasks.join_next().await {
-            report
-                .settled
-                .push(joined.map_err(|_| RuntimeError::TaskJoinFailed)?);
+            let joined = joined.map_err(|_| RuntimeError::TaskJoinFailed)?;
+            if let Some(category) = joined.observation {
+                report.observed_failures.increment(category);
+            }
+            report.settled.push(joined.outcome);
         }
         Ok(report)
     }
@@ -420,9 +430,11 @@ where
     fn reap_finished(&mut self) -> Result<DispatchReport, RuntimeError> {
         let mut report = DispatchReport::default();
         while let Some(joined) = self.tasks.try_join_next() {
-            report
-                .settled
-                .push(joined.map_err(|_| RuntimeError::TaskJoinFailed)?);
+            let joined = joined.map_err(|_| RuntimeError::TaskJoinFailed)?;
+            if let Some(category) = joined.observation {
+                report.observed_failures.increment(category);
+            }
+            report.settled.push(joined.outcome);
         }
         Ok(report)
     }
@@ -466,13 +478,18 @@ where
     }
 }
 
+struct RuntimeTaskResult {
+    outcome: RuntimeTaskOutcome,
+    observation: Option<WorkerFailureCategory>,
+}
+
 async fn execute_claim<S, C>(
     store: Arc<Mutex<S>>,
     clock: Arc<C>,
     handlers: Arc<JobHandlerRegistry>,
     wakeup: Option<Arc<Notify>>,
     claimed: ClaimedJob,
-) -> RuntimeTaskOutcome
+) -> RuntimeTaskResult
 where
     S: JobStore + Send + 'static,
     S::Error: Send + 'static,
@@ -487,7 +504,7 @@ where
         attempt,
         "durable job claimed"
     );
-    let outcome = if let Some(job) = TypedJob::from_record(claimed.job()) {
+    let (outcome, worker_category) = if let Some(job) = TypedJob::from_record(claimed.job()) {
         let Some(handler) = handlers.handler(job.job_type()) else {
             let outcome = settle_failure(
                 store,
@@ -506,19 +523,28 @@ where
                 latency_ms = elapsed_millis(started.elapsed()),
                 "durable job settled"
             );
-            return outcome;
+            return runtime_task_result(outcome, Some(WorkerFailureCategory::OtherMandatory));
         };
 
         match handler.handle(job).await {
-            JobHandlerResult::Succeeded => settle_success(store, clock, claimed),
-            JobHandlerResult::Failed(error) => settle_failure(store, clock, claimed, error),
+            JobHandlerResult::Succeeded => (settle_success(store, clock, claimed), None),
+            JobHandlerResult::Failed(error) => {
+                let observation = error.observation();
+                (
+                    settle_failure(store, clock, claimed, error),
+                    Some(observation),
+                )
+            }
         }
     } else {
-        settle_failure(
-            store,
-            clock,
-            claimed,
-            JobHandlerFailure::new(UNSUPPORTED_JOB_TYPE),
+        (
+            settle_failure(
+                store,
+                clock,
+                claimed,
+                JobHandlerFailure::new(UNSUPPORTED_JOB_TYPE),
+            ),
+            Some(WorkerFailureCategory::OtherMandatory),
         )
     };
     if let Some(wakeup) = wakeup {
@@ -532,7 +558,27 @@ where
         latency_ms = elapsed_millis(started.elapsed()),
         "durable job settled"
     );
-    outcome
+    runtime_task_result(outcome, worker_category)
+}
+
+fn runtime_task_result(
+    outcome: RuntimeTaskOutcome,
+    worker_category: Option<WorkerFailureCategory>,
+) -> RuntimeTaskResult {
+    let observation = match outcome {
+        RuntimeTaskOutcome::Succeeded => None,
+        RuntimeTaskOutcome::CompletionRejected
+        | RuntimeTaskOutcome::FailureRejected
+        | RuntimeTaskOutcome::ClockUnavailable
+        | RuntimeTaskOutcome::StoreUnavailable => Some(WorkerFailureCategory::PersistenceOrQueue),
+        RuntimeTaskOutcome::Failed(_) => {
+            Some(worker_category.unwrap_or(WorkerFailureCategory::OtherMandatory))
+        }
+    };
+    RuntimeTaskResult {
+        outcome,
+        observation,
+    }
 }
 
 pub(crate) fn scheduler_outcome_category(outcome: SchedulerOutcome) -> &'static str {

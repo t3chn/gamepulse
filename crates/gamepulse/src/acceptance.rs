@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gamepulse_application::{
-    AcceptanceCycleReadPort, AcceptanceCycleSnapshot, DAILY_CRAWL_SELECTION_LIMIT, JobStore,
+    AcceptanceCycleReadPort, AcceptanceCycleSnapshot, DAILY_CRAWL_SELECTION_LIMIT,
+    FailureCategoryCounts, JobStore, WorkerFailureCategory,
 };
 
 use crate::runtime::{Runtime, RuntimeClock, RuntimeTaskOutcome};
@@ -169,6 +170,7 @@ pub struct AcceptanceReport {
     terminal: AcceptanceTerminal,
     target: usize,
     snapshot: AcceptanceCycleSnapshot,
+    observed_failures: FailureCategoryCounts,
     runtime_millis: u64,
 }
 
@@ -183,6 +185,23 @@ impl AcceptanceReport {
             terminal,
             target,
             snapshot,
+            observed_failures: FailureCategoryCounts::zero(),
+            runtime_millis,
+        }
+    }
+
+    pub const fn with_observed_failures(
+        terminal: AcceptanceTerminal,
+        target: usize,
+        snapshot: AcceptanceCycleSnapshot,
+        observed_failures: FailureCategoryCounts,
+        runtime_millis: u64,
+    ) -> Self {
+        Self {
+            terminal,
+            target,
+            snapshot,
+            observed_failures,
             runtime_millis,
         }
     }
@@ -198,6 +217,11 @@ impl AcceptanceReport {
     #[allow(dead_code)]
     pub const fn snapshot(&self) -> AcceptanceCycleSnapshot {
         self.snapshot
+    }
+
+    #[allow(dead_code)]
+    pub const fn observed_failures(&self) -> FailureCategoryCounts {
+        self.observed_failures
     }
 
     /// Render the one allowed stdout object. No source-derived strings are interpolated.
@@ -224,6 +248,11 @@ impl AcceptanceReport {
                 "\"runtime\":{runtime},",
                 "\"deadline\":{deadline},",
                 "\"target\":{target_failure}}},",
+                "\"observed_failure_categories\":{{",
+                "\"missing_required_video\":{missing_required_video},",
+                "\"source_transport_or_contract\":{source_transport_or_contract},",
+                "\"persistence_or_queue\":{persistence_or_queue},",
+                "\"other_mandatory\":{other_mandatory}}},",
                 "\"runtime_ms\":{runtime_millis}}}"
             ),
             schema = ACCEPTANCE_SCHEMA_VERSION,
@@ -241,6 +270,10 @@ impl AcceptanceReport {
             runtime = runtime,
             deadline = deadline,
             target_failure = target,
+            missing_required_video = self.observed_failures.missing_required_video(),
+            source_transport_or_contract = self.observed_failures.source_transport_or_contract(),
+            persistence_or_queue = self.observed_failures.persistence_or_queue(),
+            other_mandatory = self.observed_failures.other_mandatory(),
             runtime_millis = self.runtime_millis,
         )
     }
@@ -264,6 +297,7 @@ where
     O: AcceptanceCycleReadPort,
 {
     let started = Instant::now();
+    let mut observed_failures = FailureCategoryCounts::zero();
     let mut terminal = match tokio::time::timeout(
         command.deadline(),
         execute_cycle(
@@ -271,6 +305,7 @@ where
             summary_runtime,
             observation,
             command.target(),
+            &mut observed_failures,
         ),
     )
     .await
@@ -286,14 +321,16 @@ where
     let snapshot = match observation.acceptance_cycle_snapshot() {
         Ok(snapshot) => snapshot,
         Err(_) => {
+            observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
             terminal = AcceptanceTerminal::RuntimeFailure;
             AcceptanceCycleSnapshot::default()
         }
     };
-    AcceptanceReport::new(
+    AcceptanceReport::with_observed_failures(
         terminal,
         command.target(),
         snapshot,
+        observed_failures,
         elapsed_millis(started.elapsed()),
     )
 }
@@ -303,6 +340,7 @@ async fn execute_cycle<S, C, O>(
     summary_runtime: &mut Runtime<S, C>,
     observation: &mut O,
     target: usize,
+    observed_failures: &mut FailureCategoryCounts,
 ) -> Result<(), AcceptanceTerminal>
 where
     S: JobStore + Send + 'static,
@@ -310,46 +348,65 @@ where
     C: RuntimeClock,
     O: AcceptanceCycleReadPort,
 {
-    match source_runtime
-        .schedule_hourly()
-        .map_err(|_| AcceptanceTerminal::RuntimeFailure)?
-    {
+    match source_runtime.schedule_hourly().map_err(|_| {
+        observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
+        AcceptanceTerminal::RuntimeFailure
+    })? {
         crate::runtime::SchedulerOutcome::Enqueued => {}
         crate::runtime::SchedulerOutcome::Duplicate | crate::runtime::SchedulerOutcome::Stopped => {
             return Err(AcceptanceTerminal::TargetFailure);
         }
     }
 
-    let discovery = source_runtime
-        .dispatch_available()
-        .map_err(|_| AcceptanceTerminal::RuntimeFailure)?;
+    let discovery = source_runtime.dispatch_available().map_err(|_| {
+        observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
+        AcceptanceTerminal::RuntimeFailure
+    })?;
+    observed_failures.merge(discovery.observed_failures());
     if discovery.claimed != 1 {
         return Err(AcceptanceTerminal::TargetFailure);
     }
-    let discovery = source_runtime
-        .join_all()
-        .await
-        .map_err(|_| AcceptanceTerminal::RuntimeFailure)?;
+    let discovery = source_runtime.join_all().await.map_err(|_| {
+        observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
+        AcceptanceTerminal::RuntimeFailure
+    })?;
+    observed_failures.merge(discovery.observed_failures());
     if !all_succeeded(&discovery.settled) {
         return Err(AcceptanceTerminal::MandatoryJobFailure);
     }
 
-    let snapshot = observation
-        .acceptance_cycle_snapshot()
-        .map_err(|_| AcceptanceTerminal::RuntimeFailure)?;
+    let snapshot = observation.acceptance_cycle_snapshot().map_err(|_| {
+        observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
+        AcceptanceTerminal::RuntimeFailure
+    })?;
     if snapshot.selected() != target || snapshot.source_ingestion().total() != target {
         return Err(AcceptanceTerminal::TargetFailure);
     }
 
-    drain_mandatory_lane(source_runtime, observation, target, Lane::Source).await?;
+    drain_mandatory_lane(
+        source_runtime,
+        observation,
+        target,
+        Lane::Source,
+        observed_failures,
+    )
+    .await?;
     let summary_target = target
         .checked_mul(2)
         .ok_or(AcceptanceTerminal::TargetFailure)?;
-    drain_mandatory_lane(summary_runtime, observation, summary_target, Lane::Summary).await?;
+    drain_mandatory_lane(
+        summary_runtime,
+        observation,
+        summary_target,
+        Lane::Summary,
+        observed_failures,
+    )
+    .await?;
 
-    let snapshot = observation
-        .acceptance_cycle_snapshot()
-        .map_err(|_| AcceptanceTerminal::RuntimeFailure)?;
+    let snapshot = observation.acceptance_cycle_snapshot().map_err(|_| {
+        observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
+        AcceptanceTerminal::RuntimeFailure
+    })?;
     if snapshot.selected() != target
         || snapshot.source_ingestion().total() != target
         || snapshot.source_ingestion().succeeded() != target
@@ -376,6 +433,7 @@ async fn drain_mandatory_lane<S, C, O>(
     observation: &mut O,
     expected: usize,
     lane: Lane,
+    observed_failures: &mut FailureCategoryCounts,
 ) -> Result<(), AcceptanceTerminal>
 where
     S: JobStore + Send + 'static,
@@ -384,9 +442,10 @@ where
     O: AcceptanceCycleReadPort,
 {
     loop {
-        let snapshot = observation
-            .acceptance_cycle_snapshot()
-            .map_err(|_| AcceptanceTerminal::RuntimeFailure)?;
+        let snapshot = observation.acceptance_cycle_snapshot().map_err(|_| {
+            observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
+            AcceptanceTerminal::RuntimeFailure
+        })?;
         let jobs = match lane {
             Lane::Source => snapshot.source_ingestion(),
             Lane::Summary => snapshot.summaries(),
@@ -405,16 +464,19 @@ where
             };
         }
 
-        let dispatched = runtime
-            .dispatch_available()
-            .map_err(|_| AcceptanceTerminal::RuntimeFailure)?;
+        let dispatched = runtime.dispatch_available().map_err(|_| {
+            observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
+            AcceptanceTerminal::RuntimeFailure
+        })?;
+        observed_failures.merge(dispatched.observed_failures());
         if dispatched.claimed == 0 {
             return Err(AcceptanceTerminal::TargetFailure);
         }
-        let settled = runtime
-            .join_all()
-            .await
-            .map_err(|_| AcceptanceTerminal::RuntimeFailure)?;
+        let settled = runtime.join_all().await.map_err(|_| {
+            observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
+            AcceptanceTerminal::RuntimeFailure
+        })?;
+        observed_failures.merge(settled.observed_failures());
         if !all_succeeded(&settled.settled) {
             return Err(AcceptanceTerminal::MandatoryJobFailure);
         }

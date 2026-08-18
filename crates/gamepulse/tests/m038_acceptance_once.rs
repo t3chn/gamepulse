@@ -22,9 +22,10 @@ use acceptance::{
 use gamepulse_application::{
     AcceptanceCycleReadPort, AcceptanceCycleSnapshot, AsyncDailyCrawlSourcePort,
     AsyncReviewSourceIngestionPort, CrawlDiscoveryRequest, DiscoveryCandidate, DiscoveryPage,
-    GameSnapshot, GameVideoLink, HourlyJobSchedule, JobHandler, JobHandlerRegistry, JobTimestamp,
-    ReviewExcerpt, ReviewInput, ReviewKind, ReviewSourceIngestion, ReviewSummaryJobSchedule,
-    RuntimeJobType, RuntimeJobTypeFilter, SourceIngestionRequest, SourceProductId,
+    FailureCategoryCounts, GameSnapshot, GameVideoLink, HourlyJobSchedule, JobHandler,
+    JobHandlerRegistry, JobTimestamp, ReviewExcerpt, ReviewInput, ReviewKind,
+    ReviewSourceIngestion, ReviewSummaryJobSchedule, RuntimeJobType, RuntimeJobTypeFilter,
+    SourceIngestionRequest, SourceProductId, WorkerFailureCategory,
 };
 use gamepulse_storage_sqlite::{
     AcceptanceCycleReadStoreError, SqliteAcceptanceCycleStore, SqliteDailyCrawlStateStore,
@@ -485,6 +486,32 @@ fn command(path: PathBuf, deadline_seconds: u64) -> AcceptanceCommand {
     AcceptanceCommand::new(path, 20, deadline_seconds).expect("fixture command must be valid")
 }
 
+#[test]
+fn observed_failure_counts_start_zero_increment_reset_and_hold_no_private_values() {
+    let mut counts = FailureCategoryCounts::zero();
+    assert_eq!(counts, FailureCategoryCounts::default());
+    for category in [
+        WorkerFailureCategory::MissingRequiredVideo,
+        WorkerFailureCategory::SourceTransportOrContract,
+        WorkerFailureCategory::PersistenceOrQueue,
+        WorkerFailureCategory::OtherMandatory,
+    ] {
+        counts.increment(category);
+    }
+    assert_eq!(counts.missing_required_video(), 1);
+    assert_eq!(counts.source_transport_or_contract(), 1);
+    assert_eq!(counts.persistence_or_queue(), 1);
+    assert_eq!(counts.other_mandatory(), 1);
+    assert_eq!(
+        WorkerFailureCategory::MissingRequiredVideo.as_str(),
+        "missing_required_video"
+    );
+    assert!(!format!("{counts:?}").contains("fixture"));
+    assert!(!format!("{counts:?}").contains("example-game"));
+    counts.reset();
+    assert_eq!(counts, FailureCategoryCounts::zero());
+}
+
 #[tokio::test]
 async fn acceptance_runs_one_cycle_and_drains_only_its_mandatory_summary_jobs() {
     let database = TemporaryDatabase::new("complete");
@@ -542,6 +569,41 @@ async fn acceptance_stops_after_the_first_retryable_mandatory_failure_without_re
         report.snapshot().failures().source_other_mandatory_stage(),
         1
     );
+}
+
+#[tokio::test]
+async fn initial_schedule_failure_counts_as_process_local_persistence_or_queue() {
+    let database = TemporaryDatabase::new("initial-schedule-failure");
+    let queue = Arc::new(Mutex::new(
+        SqliteJobStore::open(&database.path).expect("fixture queue must open"),
+    ));
+    let mut source_runtime = Runtime::new(
+        queue.clone(),
+        Arc::new(FixedClock(-1)),
+        source_config(),
+        Arc::new(JobHandlerRegistry::default()),
+    );
+    let mut summary_runtime = Runtime::new(
+        queue,
+        Arc::new(FixedClock(-1)),
+        summary_config(),
+        Arc::new(JobHandlerRegistry::default()),
+    );
+    let mut observation = SqliteAcceptanceCycleStore::open(&database.path)
+        .expect("fixture acceptance reader must open");
+
+    let report = run_acceptance_once(
+        &mut source_runtime,
+        &mut summary_runtime,
+        &mut observation,
+        &command(database.path.clone(), 5),
+    )
+    .await;
+
+    assert_eq!(report.terminal(), AcceptanceTerminal::RuntimeFailure);
+    assert_eq!(report.observed_failures().persistence_or_queue(), 1);
+    assert_eq!(report.observed_failures().missing_required_video(), 0);
+    assert_eq!(report.snapshot(), AcceptanceCycleSnapshot::default());
 }
 
 #[tokio::test]

@@ -27,7 +27,7 @@ use gamepulse_application::{
     DiscoveryPage, GameReviewRefreshStore, GameSnapshotStore, JobHandler, JobHandlerFailure,
     JobHandlerFuture, JobHandlerResult, ReviewInput, ReviewPolarity, ReviewSourceIngestion,
     ReviewSourceIngestionError, ReviewSummaryJobSchedule, RuntimeJobType,
-    SourceIngestionJobSchedule, SourceIngestionRequest, TypedJob,
+    SourceIngestionJobSchedule, SourceIngestionRequest, TypedJob, WorkerFailureCategory,
     execute_async_daily_crawl_with_source_ingestion_jobs, execute_async_review_source_ingestion,
     execute_async_source_ingestion, persist_game_review_refresh, upsert_game_snapshot,
 };
@@ -1547,6 +1547,10 @@ impl<E: std::error::Error + 'static> std::error::Error for MetacriticGameReviewE
 /// Source-worker extension for reducing an opaque ingestion error to a safe durable category.
 pub trait ReviewSourceFailureClassifier: AsyncReviewSourceIngestionPort {
     fn failure_category(&self, error: &Self::Error) -> SourceIngestionFailureCategory;
+
+    fn observation_category(&self, _error: &Self::Error) -> WorkerFailureCategory {
+        WorkerFailureCategory::OtherMandatory
+    }
 }
 
 impl<T, C> AsyncReviewSourceIngestionPort for MetacriticGameReviewSource<T, C>
@@ -1639,6 +1643,24 @@ where
     T::Error: Send + 'static,
     C: OptionalPublicCoverEnricher + Send + Sync + 'static,
 {
+    fn observation_category(&self, error: &Self::Error) -> WorkerFailureCategory {
+        match error {
+            MetacriticGameReviewError::MissingRequiredVideo => {
+                WorkerFailureCategory::MissingRequiredVideo
+            }
+            MetacriticGameReviewError::DetailTransport(_)
+            | MetacriticGameReviewError::PlatformUserScoreTransport(_)
+            | MetacriticGameReviewError::ReviewPageTransport(_)
+            | MetacriticGameReviewError::MismatchedGameIdentity
+            | MetacriticGameReviewError::MismatchedReviewKind => {
+                WorkerFailureCategory::SourceTransportOrContract
+            }
+            MetacriticGameReviewError::Snapshot(_)
+            | MetacriticGameReviewError::ReviewInput(_)
+            | MetacriticGameReviewError::Ingestion(_) => WorkerFailureCategory::OtherMandatory,
+        }
+    }
+
     fn failure_category(&self, error: &Self::Error) -> SourceIngestionFailureCategory {
         match error {
             MetacriticGameReviewError::ReviewPageTransport(error)
@@ -1726,13 +1748,22 @@ where
             .await;
             match outcome {
                 Ok(()) => JobHandlerResult::Succeeded,
-                Err(ReviewSourceIngestionError::Source(error)) => JobHandlerResult::Failed(
-                    JobHandlerFailure::new(source_port.failure_category(&error).as_str()),
-                ),
-                Err(ReviewSourceIngestionError::InvalidRefresh(_))
-                | Err(ReviewSourceIngestionError::Store(_)) => {
-                    JobHandlerResult::Failed(JobHandlerFailure::new(
+                Err(ReviewSourceIngestionError::Source(error)) => {
+                    JobHandlerResult::Failed(JobHandlerFailure::with_observation(
+                        source_port.failure_category(&error).as_str(),
+                        source_port.observation_category(&error),
+                    ))
+                }
+                Err(ReviewSourceIngestionError::InvalidRefresh(_)) => {
+                    JobHandlerResult::Failed(JobHandlerFailure::with_observation(
                         SourceIngestionFailureCategory::OtherMandatoryStage.as_str(),
+                        WorkerFailureCategory::SourceTransportOrContract,
+                    ))
+                }
+                Err(ReviewSourceIngestionError::Store(_)) => {
+                    JobHandlerResult::Failed(JobHandlerFailure::with_observation(
+                        SourceIngestionFailureCategory::OtherMandatoryStage.as_str(),
+                        WorkerFailureCategory::PersistenceOrQueue,
                     ))
                 }
             }

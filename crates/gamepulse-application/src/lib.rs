@@ -2893,17 +2893,128 @@ impl fmt::Debug for TypedJob {
     }
 }
 
-/// Opaque handler failure data. The runtime persists it through `JobStore` but never logs it.
+/// Fixed, process-local categories for evaluator-safe failure observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerFailureCategory {
+    MissingRequiredVideo,
+    SourceTransportOrContract,
+    PersistenceOrQueue,
+    OtherMandatory,
+}
+
+impl WorkerFailureCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingRequiredVideo => "missing_required_video",
+            Self::SourceTransportOrContract => "source_transport_or_contract",
+            Self::PersistenceOrQueue => "persistence_or_queue",
+            Self::OtherMandatory => "other_mandatory",
+        }
+    }
+}
+
+/// Process-local aggregate counts. It contains no job, source, error, or path data.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FailureCategoryCounts {
+    missing_required_video: usize,
+    source_transport_or_contract: usize,
+    persistence_or_queue: usize,
+    other_mandatory: usize,
+}
+
+impl FailureCategoryCounts {
+    pub const fn zero() -> Self {
+        Self {
+            missing_required_video: 0,
+            source_transport_or_contract: 0,
+            persistence_or_queue: 0,
+            other_mandatory: 0,
+        }
+    }
+
+    pub fn increment(&mut self, category: WorkerFailureCategory) {
+        match category {
+            WorkerFailureCategory::MissingRequiredVideo => {
+                self.missing_required_video = self.missing_required_video.saturating_add(1)
+            }
+            WorkerFailureCategory::SourceTransportOrContract => {
+                self.source_transport_or_contract =
+                    self.source_transport_or_contract.saturating_add(1)
+            }
+            WorkerFailureCategory::PersistenceOrQueue => {
+                self.persistence_or_queue = self.persistence_or_queue.saturating_add(1)
+            }
+            WorkerFailureCategory::OtherMandatory => {
+                self.other_mandatory = self.other_mandatory.saturating_add(1)
+            }
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.missing_required_video = self
+            .missing_required_video
+            .saturating_add(other.missing_required_video);
+        self.source_transport_or_contract = self
+            .source_transport_or_contract
+            .saturating_add(other.source_transport_or_contract);
+        self.persistence_or_queue = self
+            .persistence_or_queue
+            .saturating_add(other.persistence_or_queue);
+        self.other_mandatory = self.other_mandatory.saturating_add(other.other_mandatory);
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::zero();
+    }
+
+    pub const fn missing_required_video(self) -> usize {
+        self.missing_required_video
+    }
+
+    pub const fn source_transport_or_contract(self) -> usize {
+        self.source_transport_or_contract
+    }
+
+    pub const fn persistence_or_queue(self) -> usize {
+        self.persistence_or_queue
+    }
+
+    pub const fn other_mandatory(self) -> usize {
+        self.other_mandatory
+    }
+}
+
+/// Opaque handler failure data. The runtime persists only `message`; observation is ephemeral.
 #[derive(Clone, Eq, PartialEq)]
-pub struct JobHandlerFailure(String);
+pub struct JobHandlerFailure {
+    message: String,
+    observation: WorkerFailureCategory,
+}
 
 impl JobHandlerFailure {
     pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            observation: WorkerFailureCategory::OtherMandatory,
+        }
+    }
+
+    pub fn with_observation(
+        message: impl Into<String>,
+        observation: WorkerFailureCategory,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            observation,
+        }
     }
 
     pub fn message(&self) -> &str {
-        &self.0
+        &self.message
+    }
+
+    pub const fn observation(&self) -> WorkerFailureCategory {
+        self.observation
     }
 }
 
@@ -2911,7 +3022,7 @@ impl fmt::Debug for JobHandlerFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("JobHandlerFailure")
-            .field("message_bytes", &self.0.len())
+            .field("message_bytes", &self.message.len())
             .finish()
     }
 }
