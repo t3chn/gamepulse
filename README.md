@@ -220,7 +220,9 @@ non-numeric explicit value, and any target other than 20, are rejected before
 SQLite opens because the domain's atomic daily-selection invariant is exactly
 20. It performs exactly one hourly-discovery enqueue, then drains only the mandatory source-ingestion
 and local review-summary jobs derived in that fresh database. It starts no
-listener, daemon, or repeat scheduler, and it does not retry a failed job.
+listener, daemon, or repeat scheduler. Retryable source failures use only the
+existing durable queue attempt budget and persisted backoff; terminal failures
+still stop the cycle.
 It preserves the normal durable source-lane claim pace: when a source job is
 waiting only for its persisted next eligibility, the command waits within its
 hard deadline and then reclaims through SQLite. That wait is neither a retry

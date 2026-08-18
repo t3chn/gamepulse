@@ -143,3 +143,8 @@ If SQLite reports that a mandatory source job is ready but blocked only until
 the persisted next claim time, the cycle waits within its hard deadline and
 then makes the ordinary claim. This wait is not a retry or a second discovery
 cycle.
+
+Retryable source failures retain the queue's existing bounded attempt budget
+and persisted backoff. The acceptance coordinator may reclaim them only after
+that durable eligibility and only within its hard deadline; terminal failures
+remain fail-closed.

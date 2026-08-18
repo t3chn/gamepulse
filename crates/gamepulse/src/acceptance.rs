@@ -281,7 +281,8 @@ impl AcceptanceReport {
 
 /// Run exactly one scheduler enqueue followed by the cycle's mandatory worker jobs.
 ///
-/// No timer-driven production loop, retry, or second scheduler enqueue is used here.
+/// No timer-driven production loop or second scheduler enqueue is used here. Retryable source
+/// failures remain owned by the durable queue and are reclaimed only after persisted eligibility.
 /// The fresh database precondition means every accepted source-ingestion and review-summary job
 /// is scoped to this one cycle.
 pub async fn run_acceptance_once<S, C, O>(
@@ -467,7 +468,7 @@ where
             AcceptanceTerminal::RuntimeFailure
         })?;
         observed_failures.merge(settled.observed_failures());
-        if !all_succeeded(&settled.settled) {
+        if !source_attempts_can_continue(&settled.settled) {
             return Err(AcceptanceTerminal::MandatoryJobFailure);
         }
     }
@@ -538,6 +539,19 @@ fn all_succeeded(outcomes: &[RuntimeTaskOutcome]) -> bool {
         && outcomes
             .iter()
             .all(|outcome| matches!(outcome, RuntimeTaskOutcome::Succeeded))
+}
+
+fn source_attempts_can_continue(outcomes: &[RuntimeTaskOutcome]) -> bool {
+    !outcomes.is_empty()
+        && outcomes.iter().all(|outcome| {
+            matches!(
+                outcome,
+                RuntimeTaskOutcome::Succeeded
+                    | RuntimeTaskOutcome::Failed(
+                        gamepulse_application::JobFailureResult::ReadyForRetry
+                    )
+            )
+        })
 }
 
 fn elapsed_millis(elapsed: Duration) -> u64 {

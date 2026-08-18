@@ -488,8 +488,10 @@ is exactly 20. Its fresh-path precondition scopes every source-ingestion and
 summary job in the database to this one cycle; the aggregate reader never
 exposes raw records. It retains the production source lane's persisted claim
 pacing, waiting only until SQLite's next eligible claim time within the hard
-deadline; this is not a retry or a second enqueue. Focused fixture-only integration tests cover the single
-discovery invocation, no retry, exact target, cycle-scoped summary drain,
+deadline; this is not a second enqueue. Retryable source failures retain the
+existing durable attempt budget and persisted backoff. Focused fixture-only
+integration tests cover the single discovery invocation, bounded durable retry,
+exact target, cycle-scoped summary drain,
 deadline, job failure, target failure, and report privacy. A dedicated
 three-mutant offline harness exercises the one-shot termination decisions;
 normal source calls remain outside CI and this milestone.

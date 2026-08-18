@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use acceptance::{
@@ -194,6 +194,21 @@ struct FixedClock(i64);
 impl RuntimeClock for FixedClock {
     fn now(&self) -> Result<JobTimestamp, RuntimeClockError> {
         JobTimestamp::new(self.0).map_err(|_| RuntimeClockError::Overflow)
+    }
+}
+
+struct AdvancingClock(AtomicI64);
+
+impl AdvancingClock {
+    const fn new(initial: i64) -> Self {
+        Self(AtomicI64::new(initial))
+    }
+}
+
+impl RuntimeClock for AdvancingClock {
+    fn now(&self) -> Result<JobTimestamp, RuntimeClockError> {
+        JobTimestamp::new(self.0.fetch_add(100, Ordering::SeqCst))
+            .map_err(|_| RuntimeClockError::Overflow)
     }
 }
 
@@ -392,6 +407,23 @@ fn paced_runtimes(
     )
 }
 
+fn retrying_runtimes(
+    database: &TemporaryDatabase,
+    discovery: FixtureDailySource,
+    reviews: FixtureReviewSource,
+) -> (
+    Runtime<SqliteJobStore, AdvancingClock>,
+    Runtime<SqliteJobStore, AdvancingClock>,
+) {
+    runtimes_with_clock(
+        database,
+        discovery,
+        reviews,
+        source_config(),
+        Arc::new(AdvancingClock::new(10)),
+    )
+}
+
 fn runtimes_with_clock<C>(
     database: &TemporaryDatabase,
     discovery: FixtureDailySource,
@@ -585,12 +617,12 @@ async fn acceptance_runs_one_cycle_and_drains_only_its_mandatory_summary_jobs() 
 }
 
 #[tokio::test]
-async fn acceptance_stops_after_the_first_retryable_mandatory_failure_without_retrying() {
+async fn acceptance_reclaims_a_retryable_source_failure_from_the_durable_queue() {
     let database = TemporaryDatabase::new("failure");
     let discovery = FixtureDailySource::complete();
     let reviews = FixtureReviewSource::new(FixtureReviewMode::FirstCallFails);
     let (mut source_runtime, mut summary_runtime) =
-        runtimes(&database, discovery.clone(), reviews.clone());
+        retrying_runtimes(&database, discovery.clone(), reviews.clone());
     let mut observation = SqliteAcceptanceCycleStore::open(&database.path)
         .expect("fixture acceptance reader must open");
 
@@ -602,19 +634,17 @@ async fn acceptance_stops_after_the_first_retryable_mandatory_failure_without_re
     )
     .await;
 
-    assert_eq!(report.terminal(), AcceptanceTerminal::MandatoryJobFailure);
+    assert_eq!(report.terminal(), AcceptanceTerminal::Complete);
     assert_eq!(discovery.calls(), 1);
-    assert_eq!(reviews.calls(), 2);
-    assert_eq!(report.snapshot().source_ingestion().attempted(), 2);
-    assert_eq!(report.snapshot().summaries().attempted(), 0);
-    assert_eq!(
-        report.snapshot().failures().source_other_mandatory_stage(),
-        1
-    );
+    assert_eq!(reviews.calls(), 21);
+    assert_eq!(report.snapshot().source_ingestion().attempted(), 21);
+    assert_eq!(report.snapshot().summaries().attempted(), 40);
+    assert_eq!(report.snapshot().summaries_ready(), 20);
+    assert_eq!(report.observed_failures().other_mandatory(), 1);
 }
 
 #[tokio::test]
-async fn acceptance_waits_for_persisted_source_pacing_before_settling_a_failure() {
+async fn acceptance_deadline_bounds_persisted_retry_and_pacing_waits() {
     let database = TemporaryDatabase::new("paced-failure");
     let discovery = FixtureDailySource::complete();
     let reviews = FixtureReviewSource::new(FixtureReviewMode::FirstCallFails);
@@ -631,10 +661,13 @@ async fn acceptance_waits_for_persisted_source_pacing_before_settling_a_failure(
     )
     .await;
 
-    assert_eq!(report.terminal(), AcceptanceTerminal::MandatoryJobFailure);
+    assert_eq!(report.terminal(), AcceptanceTerminal::Deadline);
     assert_eq!(discovery.calls(), 1);
-    assert_eq!(reviews.calls(), 1);
-    assert_eq!(report.snapshot().source_ingestion().attempted(), 1);
+    assert!(reviews.calls() >= 1);
+    assert_eq!(
+        report.snapshot().source_ingestion().attempted(),
+        reviews.calls()
+    );
     assert_eq!(report.snapshot().summaries().attempted(), 0);
 }
 
