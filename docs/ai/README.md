@@ -24,3 +24,17 @@ sanitized export when raw runtime records contain excluded material.
 
 The technical planning that predates this repository is disclosed in
 [`prehistory.md`](prehistory.md).
+
+## Included sanitized exports
+
+The [`transcripts`](transcripts/) directory contains complete visible prompts
+and responses for the evaluator-facing implementation and independent review
+tasks whose sanitized exports were retained during development:
+
+- M004-M007;
+- M009-M010.
+
+Each file is labeled as sanitized rather than raw. Local roots, runtime task
+identifiers, private routing metadata, hidden instructions, and unrelated
+application context are excluded. Private control-plane conversations are not
+evaluator-facing project correspondence and are not exported.

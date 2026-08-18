@@ -38,8 +38,27 @@ an explicit offline source-work switch for smoke evidence, and a non-root contai
 M014 adds local-only, privacy-bounded tracing in the sole binary: explicit deterministic human
 or structured JSON output, lifecycle/HTTP/queue/source-summary categories, and a direct
 source-disabled binary smoke. No telemetry backend is configured.
-Runs/run_items, SSE, media, external LLM/provider integration, and an actual deployment remain
+Runs/run_items and the production deployment are implemented. SSE, media,
+manual triggering, and external LLM/provider integration remain optional and
 unimplemented.
+
+## Live delivery
+
+- Service: [https://gamepulse.10g.dev/games](https://gamepulse.10g.dev/games)
+- Repository: [https://github.com/t3chn/gamepulse](https://github.com/t3chn/gamepulse)
+- Image: `ghcr.io/t3chn/gamepulse:952e7fa`
+- Image digest: `sha256:4bc97cc98cc3cc57c588f440adfe25e1ace7cd855a68b646c65d2bb0f5ed8df4`
+
+The production deployment uses one replica, a persistent 1 GiB `local-path`
+SQLite volume, nginx ingress, and Let's Encrypt TLS. Its liveness, readiness,
+catalogue, search, platform filter, rating order, detail summaries, and similar
+game navigation were verified through the public HTTPS route.
+
+The final bounded live acceptance run completed in 43.439 seconds with 20
+selected, 20 attempted, 20 persisted, and both summaries ready for all 20
+games. Metacritic supplied a video for 4 of those 20 records; source-omitted
+video remains explicitly unavailable instead of replacing a newest game with
+a different candidate.
 
 ## Baseline architecture
 
@@ -154,9 +173,10 @@ docker run --rm -p 3000:3000 \
 
 SQLite has one durable writer and GamePulse supports exactly one replica with
 one persistent volume claim. Do not scale this image horizontally or add a
-database/queue service. Exact deployment namespace, host/TLS route, immutable
-image digest, PVC name/class, and production source-work authorization are
-handoff TODOs; they are intentionally not inferred here.
+database/queue service. Production runs in namespace `gamepulse`, serves
+`gamepulse.10g.dev`, mounts the `gamepulse-data` `local-path` PVC, and enables
+ordinary source work. The deployed image identity is recorded in the live
+delivery section above.
 
 The source lane and the opt-in public canary are separate. Enabling ordinary
 source work may make Metacritic requests through the normal runtime. The canary
@@ -168,7 +188,7 @@ readiness, or an offline smoke.
 | Area | Status |
 | --- | --- |
 | Stored catalogue, detail, mandatory review summaries | Implemented with deterministic local coverage |
-| Local delivery readiness and container definition | Implemented locally; deployment handoff remains TODO |
+| Local delivery readiness, container, and production deployment | Implemented and publicly verified |
 | Metacritic live canary | Explicit opt-in only |
 | Runs/run_items, SSE, manual trigger, YouTube/media, external LLM | Not implemented |
 
