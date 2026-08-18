@@ -1466,6 +1466,25 @@ fn validate_public_cover_url(value: &str) -> Option<GamePublicCoverUrl> {
     GamePublicCoverUrl::new(url.to_string()).ok()
 }
 
+fn derive_public_cover_url(image: &ImageDescriptor) -> Option<GamePublicCoverUrl> {
+    if image.bucket_type != "catalog" || image.kind != "cardImage" {
+        return None;
+    }
+    let path = image.bucket_path.strip_prefix("/provider/")?;
+    if path.is_empty()
+        || path.contains("..")
+        || path.contains(['\\', '?', '#'])
+        || image.filename.is_empty()
+        || image.filename.contains(['/', '\\', '?', '#'])
+        || !path.ends_with(&format!("/{}", image.filename))
+    {
+        return None;
+    }
+    validate_public_cover_url(&format!(
+        "https://www.metacritic.com/a/img/catalog/provider/{path}"
+    ))
+}
+
 /// Map one parsed product payload and the available per-platform Userscores into the inner model.
 ///
 /// This is deliberately request-free. Missing score responses remain `None`; supplied scores must
@@ -1495,6 +1514,7 @@ pub fn map_game_detail_to_snapshot(
         }
     }
 
+    let public_cover_url = detail.cover_image().and_then(derive_public_cover_url);
     let cover = detail
         .cover_image()
         .map(|image| {
@@ -1548,6 +1568,7 @@ pub fn map_game_detail_to_snapshot(
         platform_scores,
         developers,
     )
+    .map(|snapshot| snapshot.with_public_cover_url(public_cover_url))
     .map_err(GameSnapshotMappingError::InvalidSnapshot)
 }
 
@@ -1849,7 +1870,10 @@ where
                 mandatory_future.as_mut().poll(context)
             })
             .await?;
-            let snapshot = snapshot.with_public_cover_url(completed_cover.flatten());
+            let public_cover_url = completed_cover
+                .flatten()
+                .or_else(|| snapshot.public_cover_url().cloned());
+            let snapshot = snapshot.with_public_cover_url(public_cover_url);
             ReviewSourceIngestion::new(snapshot, critic, user)
                 .map_err(MetacriticGameReviewError::Ingestion)
         })

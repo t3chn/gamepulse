@@ -8,7 +8,7 @@ use askama::Template;
 use axum::Router;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use gamepulse_application::{
     CatalogueGameDetail, CataloguePage, CatalogueQuery, CatalogueReviewSummary,
@@ -89,10 +89,14 @@ h3 { margin: 0; font-size: 1.05rem; letter-spacing: -0.012em; }
 .primary-button:hover { border-color: var(--primary); background: var(--primary); color: var(--canvas); }
 .results-heading { display: flex; align-items: end; justify-content: space-between; gap: 1rem; margin-bottom: 1.2rem; }
 .results-heading p { margin: 0; color: var(--muted); font-size: 0.9rem; text-align: right; }
-.game-grid, .similar-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 1rem; margin: 0; padding: 0; list-style: none; }
-.game-card, .similar-card { height: 100%; padding: 1rem; border: 1px solid var(--line); border-radius: 1rem; background: var(--surface); }
+.game-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 1rem; margin: 0; padding: 0; list-style: none; }
+.game-card { height: 100%; padding: 1rem; border: 1px solid var(--line); border-radius: 1rem; background: var(--surface); }
 .game-card:hover, .game-card:focus-within, .similar-card:hover, .similar-card:focus-within { border-color: var(--line-strong); }
-.game-card__top { display: grid; grid-template-columns: 4.25rem 1fr auto; gap: 0.85rem; align-items: start; }
+.game-card__top { display: grid; grid-template-columns: 4.25rem minmax(0, 1fr); gap: 0.6rem 0.85rem; align-content: start; }
+.game-card__top > .cover-image, .game-card__top > .cover-placeholder { grid-column: 1; grid-row: 1 / span 2; align-self: start; }
+.game-card__top > div:not(.cover-placeholder):not(.score-badge) { grid-column: 2; grid-row: 1; min-width: 0; }
+.game-card__top > .score-badge { grid-column: 2; grid-row: 2; justify-self: start; }
+.game-card h3 { overflow-wrap: break-word; hyphens: auto; text-wrap: pretty; }
 .cover-placeholder { display: grid; width: 100%; min-height: 5.25rem; place-items: center; border: 1px solid var(--line-strong); border-radius: 0.7rem; background: var(--surface-raised); color: var(--primary); font-size: 1.25rem; font-weight: 850; letter-spacing: -0.07em; }
 .cover-placeholder--large { width: 9.5rem; min-height: 12rem; font-size: 2rem; }
 .cover-image { display: block; width: 100%; min-height: 5.25rem; max-height: 12rem; border: 1px solid var(--line-strong); border-radius: 0.7rem; background: var(--surface-raised); object-fit: cover; }
@@ -101,6 +105,7 @@ h3 { margin: 0; font-size: 1.05rem; letter-spacing: -0.012em; }
 .game-title { color: var(--ink); text-decoration-color: transparent; }
 .game-title:hover, .game-title:focus-visible { color: var(--primary); text-decoration-color: currentColor; }
 .score-badge { display: grid; min-width: 3.25rem; gap: 0.1rem; padding: 0.42rem 0.48rem; border: 1px solid var(--primary); border-radius: 0.6rem; background: oklch(0.22 0.035 140); text-align: center; }
+.score-badge { max-width: 7.5rem; overflow-wrap: anywhere; }
 .score-badge__label { color: var(--muted); font-size: 0.65rem; font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase; }
 .score-badge strong { color: var(--primary); font-size: 1.25rem; line-height: 1; }
 .score-badge--empty { border-color: var(--line-strong); background: transparent; }
@@ -120,7 +125,7 @@ h3 { margin: 0; font-size: 1.05rem; letter-spacing: -0.012em; }
 .detail-hero__copy { min-width: 0; }
 .detail-hero h1 { max-width: 16ch; }
 .detail-hero .chip-list { margin-top: 1.25rem; }
-.detail-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(17rem, 0.85fr); gap: 1rem; margin-top: 1rem; }
+.detail-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(17rem, 0.85fr); gap: 1rem; margin-top: 1rem; align-items: start; }
 .content-section { padding: 1.25rem; border: 1px solid var(--line); border-radius: 1rem; background: var(--surface); }
 .content-section h2 { margin-bottom: 1rem; }
 .content-section--wide { grid-row: span 2; }
@@ -139,6 +144,8 @@ td:first-child { color: var(--ink); font-weight: 750; }
 .summary-list { display: grid; gap: 0.45rem; margin: 0; padding-left: 1.2rem; color: var(--muted); line-height: 1.5; }
 .summary-list li::marker { color: var(--primary); }
 .status-copy { margin: 0; color: var(--muted); line-height: 1.6; }
+.similar-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(11rem, 100%), 1fr)); gap: 0.6rem; margin: 1rem 0 0; padding: 0; list-style: none; }
+.similar-card { height: 100%; padding: 0.7rem 0.85rem; border: 1px solid var(--line); border-radius: 0.7rem; background: var(--surface); }
 .similar-card a { display: block; color: var(--ink); font-weight: 800; text-decoration-color: transparent; }
 .similar-card a:hover, .similar-card a:focus-visible { color: var(--primary); text-decoration-color: currentColor; }
 .provenance { margin-top: 1rem; border-top: 1px solid var(--line); }
@@ -171,9 +178,11 @@ where
     P::Error: Send + 'static,
 {
     Router::new()
+        .route("/", get(root_redirect))
         .route("/games", get(list_games::<P>))
         .route("/games/{id}", get(show_game::<P>))
         .with_state(CatalogueState { catalogue })
+        .fallback(missing_page)
 }
 
 /// Build the complete HTTP surface, including liveness and durable-store readiness.
@@ -193,6 +202,18 @@ where
         .merge(catalogue_router(catalogue))
 }
 
+async fn root_redirect() -> Redirect {
+    root_redirect_value()
+}
+
+fn root_redirect_value() -> Redirect {
+    Redirect::permanent("/games")
+}
+
+async fn missing_page() -> Response {
+    not_found_response()
+}
+
 /// Build the safe HTTP surface used while the configured durable store is unavailable.
 pub fn unavailable_service_router<R>(readiness_probe: Arc<R>) -> Router
 where
@@ -200,6 +221,7 @@ where
     R::Error: Send + 'static,
 {
     Router::new()
+        .route("/", get(root_redirect))
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness::<R>))
         .route("/games", get(database_unavailable))
@@ -302,13 +324,20 @@ where
 
 async fn show_game<P>(
     State(state): State<CatalogueState<P>>,
-    Path(source_product_id): Path<u64>,
+    Path(raw_source_product_id): Path<String>,
 ) -> Response
 where
     P: GameCatalogueReadPort + Send + 'static,
     P::Error: Send + 'static,
 {
-    game_detail_response(state.catalogue, source_product_id).await
+    match parse_source_product_id(&raw_source_product_id) {
+        Some(source_product_id) => game_detail_response(state.catalogue, source_product_id).await,
+        None => not_found_response(),
+    }
+}
+
+fn parse_source_product_id(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok()
 }
 
 /// Render one stored-game HTTP response without opening a listener.
@@ -452,7 +481,7 @@ fn decode_hex(value: u8) -> Option<u8> {
           <select id="platform" name="platform">
             <option value="">All stored platforms</option>
             {% for platform in platforms %}
-            <option value="{{ platform.source_slug }}"{% if platform.selected %} selected{% endif %}>{{ platform.source_slug }}</option>
+            <option value="{{ platform.source_slug }}"{% if platform.selected %} selected{% endif %}>{{ platform.label }}</option>
             {% endfor %}
           </select>
         </div>
@@ -470,7 +499,7 @@ fn decode_hex(value: u8) -> Option<u8> {
     <section aria-labelledby="results-title">
       <div class="results-heading">
         <h2 id="results-title">{{ games.len() }} stored games</h2>
-        <p>Sorted by the best stored Metascore.</p>
+        <p>{{ score_sort_copy }}</p>
       </div>
       <ol class="game-grid" aria-label="Stored games">
         {% for game in games %}
@@ -485,15 +514,12 @@ fn decode_hex(value: u8) -> Option<u8> {
               {% endmatch %}
               <div>
                 <h3><a class="game-title" href="/games/{{ game.source_product_id }}">{{ game.title }}</a></h3>
-                {% if !game.has_public_cover %}
-                <p class="cover-status">No local cover image stored</p>
-                {% endif %}
               </div>
               {% match game.highest_metascore %}
               {% when Some with (metascore) %}
-              <div class="score-badge"><span class="score-badge__label">Metascore</span><strong>{{ metascore }}</strong></div>
+              <div class="score-badge"><span class="score-badge__label">{{ score_context_label }}</span><strong>{{ metascore }}</strong></div>
               {% when None %}
-              <div class="score-badge score-badge--empty"><span class="score-badge__label">Metascore</span><strong>—</strong></div>
+              <div class="score-badge score-badge--empty"><span class="score-badge__label">{{ score_context_label }}</span><strong>—</strong></div>
               {% endmatch %}
             </div>
             {% if game.platforms.len() == 0 %}
@@ -525,20 +551,38 @@ struct CatalogueTemplate {
     platforms: Vec<CataloguePlatformView>,
     games: Vec<CatalogueGameCardView>,
     has_filters: bool,
+    score_context_label: String,
+    score_sort_copy: String,
 }
 
 impl CatalogueTemplate {
     fn from_page(page: CataloguePage, query: CatalogueHttpQuery) -> Self {
         let selected_platform = query.platform_slug;
+        let selected_platform_label = platform_label(&selected_platform);
+        let score_context_label = if selected_platform.is_empty() {
+            "Best score".to_owned()
+        } else {
+            selected_platform_label.clone()
+        };
+        let score_sort_copy = if selected_platform.is_empty() {
+            "Sorted by the best stored Metascore across platforms.".to_owned()
+        } else {
+            format!(
+                "Sorted by the stored {selected_platform_label} Metascore; releases without a score appear last."
+            )
+        };
         Self {
             ui_css: UI_CSS,
             has_filters: !query.title_search.is_empty() || !selected_platform.is_empty(),
             title_search: query.title_search,
+            score_context_label,
+            score_sort_copy,
             platforms: page
                 .platform_filters()
                 .iter()
                 .map(|platform| CataloguePlatformView {
                     source_slug: platform.source_slug().to_owned(),
+                    label: platform_label(platform.source_slug()),
                     selected: platform
                         .source_slug()
                         .eq_ignore_ascii_case(&selected_platform),
@@ -551,9 +595,12 @@ impl CatalogueTemplate {
                     source_product_id: game.source_product_id().value(),
                     title: game.title().to_owned(),
                     public_cover_url: game.public_cover_url().map(str::to_owned),
-                    has_public_cover: game.public_cover_url().is_some(),
                     highest_metascore: game.highest_metascore(),
-                    platforms: game.platforms().to_vec(),
+                    platforms: game
+                        .platforms()
+                        .iter()
+                        .map(|platform| platform_label(platform))
+                        .collect(),
                     developers: game.developers().to_vec(),
                 })
                 .collect(),
@@ -563,6 +610,7 @@ impl CatalogueTemplate {
 
 struct CataloguePlatformView {
     source_slug: String,
+    label: String,
     selected: bool,
 }
 
@@ -570,7 +618,6 @@ struct CatalogueGameCardView {
     source_product_id: u64,
     title: String,
     public_cover_url: Option<String>,
-    has_public_cover: bool,
     highest_metascore: Option<u8>,
     platforms: Vec<String>,
     developers: Vec<String>,
@@ -637,7 +684,7 @@ struct CatalogueGameCardView {
               <tbody>
                 {% for platform in game.platform_scores %}
                 <tr>
-                  <td>{{ platform.source_slug }}</td>
+                  <td>{{ platform.label }}</td>
                   <td>{% match platform.metascore %}{% when Some with (metascore) %}<span class="score-value">{{ metascore }}</span>{% when None %}<span class="score-unavailable">Not stored</span>{% endmatch %}</td>
                   <td>{% match platform.userscore %}{% when Some with (userscore) %}<span class="score-value">{{ userscore }}</span>{% when None %}<span class="score-unavailable">Not stored</span>{% endmatch %}</td>
                 </tr>
@@ -663,37 +710,42 @@ struct CatalogueGameCardView {
           {% endmatch %}
         </section>
         <section class="content-section" aria-labelledby="critics-title">
-          <h2 id="critics-title">Critic review summary</h2>
+          <h2 id="critics-title">What critics said</h2>
           {% match game.critic_summary %}
           {% when Some with (summary) %}
             {% match summary.status %}
             {% when ReviewSummaryStatus::Pending %}<p class="status-copy">Summary pending for the current stored review refresh.</p>
             {% when ReviewSummaryStatus::Unavailable %}<p class="status-copy">Unavailable: no stored critic excerpts.</p>
             {% when ReviewSummaryStatus::Available %}
-            <div class="summary-group"><h3>Likes</h3><ul class="summary-list">{% for item in summary.likes %}<li>{{ item }}</li>{% endfor %}</ul></div>
-            <div class="summary-group"><h3>Dislikes</h3><ul class="summary-list">{% for item in summary.dislikes %}<li>{{ item }}</li>{% endfor %}</ul></div>
+            {% if summary.likes.len() > 0 %}<div class="summary-group"><h3>Praise</h3><ul class="summary-list">{% for item in summary.likes %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+            {% if summary.dislikes.len() > 0 %}<div class="summary-group"><h3>Criticism</h3><ul class="summary-list">{% for item in summary.dislikes %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+            {% if summary.mixed.len() > 0 %}<div class="summary-group"><h3>Mixed</h3><ul class="summary-list">{% for item in summary.mixed %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+            {% if summary.likes.len() == 0 && summary.dislikes.len() == 0 && summary.mixed.len() == 0 %}<p class="status-copy">Reviews were stored, but no clear highlights were available.</p>{% endif %}
             {% endmatch %}
           {% when None %}<p class="status-copy">No stored critic review summary.</p>
           {% endmatch %}
         </section>
         <section class="content-section" aria-labelledby="users-title">
-          <h2 id="users-title">User review summary</h2>
+          <h2 id="users-title">What players said</h2>
           {% match game.user_summary %}
           {% when Some with (summary) %}
             {% match summary.status %}
             {% when ReviewSummaryStatus::Pending %}<p class="status-copy">Summary pending for the current stored review refresh.</p>
             {% when ReviewSummaryStatus::Unavailable %}<p class="status-copy">Unavailable: no stored user excerpts.</p>
             {% when ReviewSummaryStatus::Available %}
-            <div class="summary-group"><h3>Likes</h3><ul class="summary-list">{% for item in summary.likes %}<li>{{ item }}</li>{% endfor %}</ul></div>
-            <div class="summary-group"><h3>Dislikes</h3><ul class="summary-list">{% for item in summary.dislikes %}<li>{{ item }}</li>{% endfor %}</ul></div>
+            {% if summary.likes.len() > 0 %}<div class="summary-group"><h3>Praise</h3><ul class="summary-list">{% for item in summary.likes %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+            {% if summary.dislikes.len() > 0 %}<div class="summary-group"><h3>Criticism</h3><ul class="summary-list">{% for item in summary.dislikes %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+            {% if summary.mixed.len() > 0 %}<div class="summary-group"><h3>Mixed</h3><ul class="summary-list">{% for item in summary.mixed %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+            {% if summary.likes.len() == 0 && summary.dislikes.len() == 0 && summary.mixed.len() == 0 %}<p class="status-copy">Reviews were stored, but no clear highlights were available.</p>{% endif %}
             {% endmatch %}
           {% when None %}<p class="status-copy">No stored user review summary.</p>
           {% endmatch %}
         </section>
         <section class="content-section content-section--wide" aria-labelledby="similar-title">
-          <h2 id="similar-title">Similar stored games</h2>
+          <h2 id="similar-title">Other games in this catalogue</h2>
+          <p class="status-copy">Matched on a shared platform or studio, so genres may vary.</p>
           {% if game.similar_games.len() == 0 %}
-          <p class="status-copy">No similar stored games found. Similarity only uses games already saved locally.</p>
+          <p class="status-copy">Nothing else in the catalogue shares a platform or studio with this game.</p>
           {% else %}
           <ul class="similar-grid">
             {% for similar in game.similar_games %}
@@ -752,9 +804,9 @@ impl GameDetailTemplate {
                     .platform_scores()
                     .iter()
                     .map(|platform| CataloguePlatformScoreView {
-                        source_slug: platform.source_slug().to_owned(),
+                        label: platform_label(platform.source_slug()),
                         metascore: platform.metascore(),
-                        userscore: platform.userscore(),
+                        userscore: visible_userscore(platform.userscore()),
                     })
                     .collect(),
                 developers: game.developers().to_vec(),
@@ -804,17 +856,35 @@ fn review_summary_view(summary: &CatalogueReviewSummary) -> ReviewSummaryView {
             status: ReviewSummaryStatus::Pending,
             likes: Vec::new(),
             dislikes: Vec::new(),
+            mixed: Vec::new(),
         },
         CatalogueReviewSummary::Unavailable => ReviewSummaryView {
             status: ReviewSummaryStatus::Unavailable,
             likes: Vec::new(),
             dislikes: Vec::new(),
+            mixed: Vec::new(),
         },
-        CatalogueReviewSummary::Available { likes, dislikes } => ReviewSummaryView {
-            status: ReviewSummaryStatus::Available,
-            likes: likes.clone(),
-            dislikes: dislikes.clone(),
-        },
+        CatalogueReviewSummary::Available { likes, dislikes } => {
+            let mixed = likes
+                .iter()
+                .filter(|item| dislikes.contains(item))
+                .cloned()
+                .collect::<Vec<_>>();
+            ReviewSummaryView {
+                status: ReviewSummaryStatus::Available,
+                likes: likes
+                    .iter()
+                    .filter(|item| !mixed.contains(item))
+                    .cloned()
+                    .collect(),
+                dislikes: dislikes
+                    .iter()
+                    .filter(|item| !mixed.contains(item))
+                    .cloned()
+                    .collect(),
+                mixed,
+            }
+        }
     }
 }
 
@@ -829,6 +899,7 @@ struct ReviewSummaryView {
     status: ReviewSummaryStatus,
     likes: Vec<String>,
     dislikes: Vec<String>,
+    mixed: Vec<String>,
 }
 
 struct CatalogueCoverView {
@@ -844,9 +915,26 @@ struct CatalogueVideoView {
 }
 
 struct CataloguePlatformScoreView {
-    source_slug: String,
+    label: String,
     metascore: Option<u8>,
     userscore: Option<f64>,
+}
+
+fn visible_userscore(score: Option<f64>) -> Option<f64> {
+    score.filter(|score| *score > 0.0)
+}
+
+fn platform_label(slug: &str) -> String {
+    match slug {
+        "pc" => "PC".to_owned(),
+        "ios-iphoneipad" => "iOS (iPhone / iPad)".to_owned(),
+        "nintendo-switch" => "Nintendo Switch".to_owned(),
+        "nintendo-switch-2" => "Nintendo Switch 2".to_owned(),
+        "playstation-5" => "PlayStation 5".to_owned(),
+        "xbox-one" => "Xbox One".to_owned(),
+        "xbox-series-x" => "Xbox Series X".to_owned(),
+        other => other.replace('-', " "),
+    }
 }
 
 struct SimilarGameView {
@@ -891,5 +979,41 @@ struct NotFoundTemplate {
 impl NotFoundTemplate {
     fn new() -> Self {
         Self { ui_css: UI_CSS }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presentation_helpers_keep_source_keys_internal_and_hide_tbd_zero_scores() {
+        assert_eq!(platform_label("pc"), "PC");
+        assert_eq!(platform_label("playstation-5"), "PlayStation 5");
+        assert_eq!(platform_label("future-platform"), "future platform");
+        assert_eq!(visible_userscore(Some(0.0)), None);
+        assert_eq!(visible_userscore(Some(8.3)), Some(8.3));
+        assert_eq!(visible_userscore(None), None);
+    }
+
+    #[test]
+    fn mixed_review_items_are_rendered_once_in_their_own_group() {
+        let summary = CatalogueReviewSummary::Available {
+            likes: vec!["praise".to_owned(), "mixed".to_owned()],
+            dislikes: vec!["criticism".to_owned(), "mixed".to_owned()],
+        };
+        let view = review_summary_view(&summary);
+        assert_eq!(view.likes, ["praise"]);
+        assert_eq!(view.dislikes, ["criticism"]);
+        assert_eq!(view.mixed, ["mixed"]);
+    }
+
+    #[test]
+    fn route_helpers_redirect_root_and_reject_non_numeric_game_ids() {
+        let response = root_redirect_value().into_response();
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(response.headers().get("location").unwrap(), "/games");
+        assert_eq!(parse_source_product_id("42"), Some(42));
+        assert_eq!(parse_source_product_id("does-not-exist"), None);
     }
 }

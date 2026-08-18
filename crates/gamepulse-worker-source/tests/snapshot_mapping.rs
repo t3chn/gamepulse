@@ -141,3 +141,28 @@ fn missing_source_fields_stay_explicitly_absent_without_an_eligibility_policy() 
             .all(|platform| platform.userscore().is_none())
     );
 }
+
+#[test]
+fn derives_only_the_observed_first_party_catalog_cover_shape() {
+    let mut detail = parse_game_detail(&example_game(), DETAIL).expect("detail fixture must parse");
+    assert!(!detail.images.is_empty(), "fixture image must exist");
+    detail.images[0].bucket_type = "catalog".to_owned();
+    detail.images[0].bucket_path = "/provider/7/2/7-example.jpg".to_owned();
+    detail.images[0].filename = "7-example.jpg".to_owned();
+
+    let snapshot = map_game_detail_to_snapshot(&detail, []).expect("observed shape must map");
+    assert_eq!(
+        snapshot.public_cover_url().map(|url| url.as_str()),
+        Some("https://www.metacritic.com/a/img/catalog/provider/7/2/7-example.jpg")
+    );
+
+    for invalid_path in [
+        "/provider/7/2/other.jpg",
+        "/provider/7/../7-example.jpg",
+        "/provider/7/2/7-example.jpg?size=large",
+    ] {
+        detail.images[0].bucket_path = invalid_path.to_owned();
+        let snapshot = map_game_detail_to_snapshot(&detail, []).expect("descriptor must still map");
+        assert!(snapshot.public_cover_url().is_none());
+    }
+}

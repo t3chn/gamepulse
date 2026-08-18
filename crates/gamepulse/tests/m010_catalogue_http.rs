@@ -158,7 +158,7 @@ fn fixture_catalogue(database: &TemporaryDatabase) -> Arc<Mutex<SqliteGameCatalo
             105,
             "Echo",
             "Stored Echo description",
-            &[(9, "handheld", None, None)],
+            &[(9, "handheld", None, Some(0.0))],
             &["Studio C"],
             false,
         ),
@@ -415,8 +415,8 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
         "<img class=\"cover-image\" src=\"https://www.metacritic.com/images/example-game.jpg\" alt=\"Cover for Alpha\">"
     ));
     assert!(all_games.contains("class=\"cover-placeholder\" aria-hidden=\"true\""));
-    assert!(all_games.contains("No local cover image stored"));
-    assert!(all_games.contains("class=\"score-badge__label\">Metascore"));
+    assert!(!all_games.contains("No local cover image stored"));
+    assert!(all_games.contains("class=\"score-badge__label\">Best score"));
     assert!(
         all_games
             .contains("background: var(--primary-strong); color: var(--canvas); font-weight: 800;")
@@ -446,6 +446,8 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
         ],
     );
     assert!(!platform.contains("href=\"/games/103\">Gamma"));
+    assert!(platform.contains("class=\"score-badge__label\">PC"));
+    assert!(platform.contains("Sorted by the stored PC Metascore"));
 
     let (status, detail) =
         read_response(gamepulse_web::game_detail_response(Arc::clone(&catalogue), 101).await).await;
@@ -457,6 +459,7 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
     ));
     assert!(detail.contains("<caption>Stored score comparison by platform</caption>"));
     assert!(detail.contains("<th scope=\"col\">Userscore</th>"));
+    assert!(detail.contains("<td>PC</td>"));
     assert!(detail.contains("<details class=\"provenance\">"));
     assert!(detail.contains("products/example"));
     assert!(detail.contains(
@@ -472,6 +475,12 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
         ],
     );
     assert!(!detail.contains("Unseeded game"));
+
+    let (status, zero_score_detail) =
+        read_response(gamepulse_web::game_detail_response(Arc::clone(&catalogue), 105).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(zero_score_detail.contains("<td>handheld</td>"));
+    assert!(!zero_score_detail.contains("<span class=\"score-value\">0</span>"));
 
     let (status, linked_detail) =
         read_response(gamepulse_web::game_detail_response(Arc::clone(&catalogue), 104).await).await;

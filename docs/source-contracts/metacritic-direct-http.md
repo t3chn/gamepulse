@@ -112,8 +112,12 @@ The observed `data.item` shape supplies numeric `id`, `slug`, title,
 description, image descriptors (`bucketPath`, `bucketType`, `filename`,
 `typeName`), genres, platform descriptors, production companies, and an
 optional Metacritic-hosted `video` with `embedUrl` and `manifestUrl`. The
-cover candidate is an image whose `typeName` is `cardImage`; M002 keeps its
-descriptor and does not fabricate a rendered CDN URL.
+cover candidate is an image whose `typeName` is `cardImage`. The source adapter
+keeps the descriptor and may derive the observed first-party image form
+`https://www.metacritic.com/a/img/catalog/provider/...` only when the bucket is
+exactly `catalog`, the path starts with `/provider/`, the path ends with the
+separately supplied filename, and neither value contains traversal, query,
+fragment, or separator ambiguity. Any other descriptor remains provenance only.
 Platform entries use a numeric `id`, `slug`, release date, and optional
 `criticScoreSummary.score`. Developer names are the `production.companies`
 entries whose `typeName` is `Developer`.

@@ -4,6 +4,10 @@ GamePulse is a take-home project that collects newly released games from
 Metacritic, stores their details and review summaries, and presents the result
 in a searchable web catalogue.
 
+**The submitted version uses no external LLM.** Review highlights are produced
+locally by a deterministic summarizer, so evaluation requires no model account,
+API key, or paid provider.
+
 - **Live service:** [gamepulse.10g.dev/games](https://gamepulse.10g.dev/games)
 - **Repository:** [github.com/t3chn/gamepulse](https://github.com/t3chn/gamepulse)
 - **AI-assisted development record:** [`docs/ai/`](docs/ai/)
@@ -195,6 +199,12 @@ docker run --rm -p 3000:3000 \
 
 The deployed image is `ghcr.io/t3chn/gamepulse:952e7fa` with digest
 `sha256:4bc97cc98cc3cc57c588f440adfe25e1ace7cd855a68b646c65d2bb0f5ed8df4`.
+
+Pushes to `main` run the architecture and offline test suite, build the locked
+`Dockerfile`, and publish `ghcr.io/t3chn/gamepulse:v0.0.<run-number>`. The
+workflow publishes no mutable `latest` tag and records the immutable digest in
+its run summary. Image publication does not deploy the service: the separate
+GitOps repository owns the production image reference and rollout.
 
 ## Repository boundary
 

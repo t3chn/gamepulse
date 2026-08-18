@@ -119,9 +119,10 @@ domain -----------------------------------> no workspace crate
   HTTP when proven. Browser inspection is development evidence, not a baseline
   runtime dependency. M012 permits one separate, optional public-HTML request
   to `www.metacritic.com/game/{slug}/` per source game-ingestion attempt only
-  to read one validated `og:image` declaration. It is never used by catalogue
-  or detail reads, never derives a CDN URL, and cannot affect mandatory source
-  settlement.
+  to read one validated `og:image` declaration. The source adapter may also
+  derive the observed first-party Metacritic image URL from a strictly
+  validated `catalog`/`cardImage` descriptor. Neither path is used by catalogue
+  or detail reads, and neither can affect mandatory source settlement.
 
 ### AD-8 — Keep the UI server-rendered and embedded
 
@@ -356,11 +357,13 @@ queue settlement, daily selection, and summary behavior unchanged. The durable
 run boundary is independent of optional cover results; a cover failure neither
 changes candidate acceptance nor source progression.
 
-M021 renders a validated public cover URL only after source enrichment and SQLite snapshot
-persistence have carried it into the catalogue read model. Catalogue and detail templates use the
-persisted value directly without a server-side or render-time fetch; an absent URL retains the
-safe local placeholder. The original source descriptor remains provenance data and is never
-converted into a fabricated image URL.
+M021 renders a validated public cover URL only after the source adapter and SQLite snapshot
+persistence have carried it into the catalogue read model. A descriptor-derived URL is accepted
+only for the observed exact `catalog` bucket, `cardImage` kind, `/provider/` path, and matching
+filename, with traversal, query, fragment, separator, and host changes rejected. Catalogue and
+detail templates use the persisted value directly without a server-side or render-time fetch; an
+absent URL retains the safe local placeholder. The original source descriptor remains provenance
+data.
 
 M013 adds local delivery readiness without changing the one-binary,
 one-process topology. `gamepulse-web` owns `GET /health/live` and
