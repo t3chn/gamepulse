@@ -221,7 +221,10 @@ SQLite opens because the domain's atomic daily-selection invariant is exactly
 20. It performs exactly one hourly-discovery enqueue, then drains only the mandatory source-ingestion
 and local review-summary jobs derived in that fresh database. It starts no
 listener, daemon, or repeat scheduler, and it does not retry a failed job.
-The deadline is hard and required.
+It preserves the normal durable source-lane claim pace: when a source job is
+waiting only for its persisted next eligibility, the command waits within its
+hard deadline and then reclaims through SQLite. That wait is neither a retry
+nor a second enqueue. The deadline is hard and required.
 
 Its stdout is exactly one compact `gamepulse.acceptance.v1` aggregate JSON
 report. It includes the terminal outcome, target, selected, attempted,

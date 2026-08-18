@@ -340,6 +340,18 @@ where
         Ok(report)
     }
 
+    /// Wait once for the next durable claim eligibility without treating the delay as queue truth.
+    ///
+    /// This is used by the explicit one-shot coordinator after a paced lane reports no
+    /// immediately claimable work. The later SQLite claim remains authoritative.
+    pub async fn wait_for_next_claim_eligibility(&self) -> Result<bool, RuntimeError> {
+        let Some(wait) = self.next_claim_wait()? else {
+            return Ok(false);
+        };
+        tokio::time::sleep(wait).await;
+        Ok(true)
+    }
+
     /// Run the production hourly loop until the caller signals graceful shutdown.
     #[allow(dead_code)]
     pub async fn run_until_shutdown<F>(&mut self, shutdown_signal: F) -> Result<(), RuntimeError>

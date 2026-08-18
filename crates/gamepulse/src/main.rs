@@ -321,9 +321,23 @@ async fn run_acceptance(command: AcceptanceCommand) -> AcceptanceReport {
         }
     };
     // The one-shot coordinator never enters the paced timer loop. It drives the same handlers
-    // through one enqueue and completion joins only; ordinary runtime pacing is unchanged.
+    // through one enqueue and completion joins only, while retaining the durable source pace.
+    let source_pacing =
+        match JobClaimPacing::new("source", SOURCE_LANE_MINIMUM_CLAIM_INTERVAL_SECONDS) {
+            Ok(pacing) => pacing,
+            Err(_) => {
+                return AcceptanceReport::new(
+                    AcceptanceTerminal::RuntimeFailure,
+                    command.target(),
+                    Default::default(),
+                    0,
+                );
+            }
+        };
     let source_config = match RuntimeConfig::new("gamepulse-acceptance-source", 300, 2, schedule) {
-        Ok(config) => config.with_claim_filter(RuntimeJobTypeFilter::source_lane()),
+        Ok(config) => config
+            .with_claim_filter(RuntimeJobTypeFilter::source_lane())
+            .with_claim_pacing(source_pacing),
         Err(_) => {
             return AcceptanceReport::new(
                 AcceptanceTerminal::RuntimeFailure,

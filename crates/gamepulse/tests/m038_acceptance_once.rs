@@ -22,8 +22,8 @@ use acceptance::{
 use gamepulse_application::{
     AcceptanceCycleReadPort, AcceptanceCycleSnapshot, AsyncDailyCrawlSourcePort,
     AsyncReviewSourceIngestionPort, CrawlDiscoveryRequest, DiscoveryCandidate, DiscoveryPage,
-    FailureCategoryCounts, GameSnapshot, GameVideoLink, HourlyJobSchedule, JobHandler,
-    JobHandlerRegistry, JobTimestamp, ReviewExcerpt, ReviewInput, ReviewKind,
+    FailureCategoryCounts, GameSnapshot, GameVideoLink, HourlyJobSchedule, JobClaimPacing,
+    JobHandler, JobHandlerRegistry, JobTimestamp, ReviewExcerpt, ReviewInput, ReviewKind,
     ReviewSourceIngestion, ReviewSummaryJobSchedule, RuntimeJobType, RuntimeJobTypeFilter,
     SourceIngestionRequest, SourceProductId, WorkerFailureCategory,
 };
@@ -36,7 +36,7 @@ use gamepulse_worker_source::{
     HourlyDiscoveryHandler, ReviewSourceFailureClassifier, ReviewSourceIngestionHandler,
     SourceIngestionFailureCategory,
 };
-use runtime::{Runtime, RuntimeClock, RuntimeClockError, RuntimeConfig};
+use runtime::{Runtime, RuntimeClock, RuntimeClockError, RuntimeConfig, SystemRuntimeClock};
 
 static NEXT_DATABASE: AtomicUsize = AtomicUsize::new(0);
 
@@ -346,6 +346,12 @@ fn source_config() -> RuntimeConfig {
     .with_claim_filter(RuntimeJobTypeFilter::source_lane())
 }
 
+fn paced_source_config() -> RuntimeConfig {
+    source_config().with_claim_pacing(
+        JobClaimPacing::new("source", 3).expect("fixture source pace must be valid"),
+    )
+}
+
 fn summary_config() -> RuntimeConfig {
     RuntimeConfig::worker_only("m038-summary", 300, 1)
         .expect("fixture summary runtime config must be valid")
@@ -360,6 +366,42 @@ fn runtimes(
     Runtime<SqliteJobStore, FixedClock>,
     Runtime<SqliteJobStore, FixedClock>,
 ) {
+    runtimes_with_clock(
+        database,
+        discovery,
+        reviews,
+        source_config(),
+        Arc::new(FixedClock(10)),
+    )
+}
+
+fn paced_runtimes(
+    database: &TemporaryDatabase,
+    discovery: FixtureDailySource,
+    reviews: FixtureReviewSource,
+) -> (
+    Runtime<SqliteJobStore, SystemRuntimeClock>,
+    Runtime<SqliteJobStore, SystemRuntimeClock>,
+) {
+    runtimes_with_clock(
+        database,
+        discovery,
+        reviews,
+        paced_source_config(),
+        Arc::new(SystemRuntimeClock),
+    )
+}
+
+fn runtimes_with_clock<C>(
+    database: &TemporaryDatabase,
+    discovery: FixtureDailySource,
+    reviews: FixtureReviewSource,
+    source_runtime_config: RuntimeConfig,
+    clock: Arc<C>,
+) -> (Runtime<SqliteJobStore, C>, Runtime<SqliteJobStore, C>)
+where
+    C: RuntimeClock,
+{
     let queue = Arc::new(Mutex::new(
         SqliteJobStore::open(&database.path).expect("fixture queue must open"),
     ));
@@ -386,8 +428,8 @@ fn runtimes(
     ));
     let source_runtime = Runtime::new(
         queue.clone(),
-        Arc::new(FixedClock(10)),
-        source_config(),
+        clock.clone(),
+        source_runtime_config,
         Arc::new(
             JobHandlerRegistry::new([discovery_handler, ingestion_handler])
                 .expect("fixture source handlers must be valid"),
@@ -395,7 +437,7 @@ fn runtimes(
     );
     let summary_runtime = Runtime::new(
         queue,
-        Arc::new(FixedClock(10)),
+        clock,
         summary_config(),
         Arc::new(
             JobHandlerRegistry::new([summary_handler])
@@ -569,6 +611,31 @@ async fn acceptance_stops_after_the_first_retryable_mandatory_failure_without_re
         report.snapshot().failures().source_other_mandatory_stage(),
         1
     );
+}
+
+#[tokio::test]
+async fn acceptance_waits_for_persisted_source_pacing_before_settling_a_failure() {
+    let database = TemporaryDatabase::new("paced-failure");
+    let discovery = FixtureDailySource::complete();
+    let reviews = FixtureReviewSource::new(FixtureReviewMode::FirstCallFails);
+    let (mut source_runtime, mut summary_runtime) =
+        paced_runtimes(&database, discovery.clone(), reviews.clone());
+    let mut observation = SqliteAcceptanceCycleStore::open(&database.path)
+        .expect("fixture acceptance reader must open");
+
+    let report = run_acceptance_once(
+        &mut source_runtime,
+        &mut summary_runtime,
+        &mut observation,
+        &command(database.path.clone(), 10),
+    )
+    .await;
+
+    assert_eq!(report.terminal(), AcceptanceTerminal::MandatoryJobFailure);
+    assert_eq!(discovery.calls(), 1);
+    assert_eq!(reviews.calls(), 1);
+    assert_eq!(report.snapshot().source_ingestion().attempted(), 1);
+    assert_eq!(report.snapshot().summaries().attempted(), 0);
 }
 
 #[tokio::test]

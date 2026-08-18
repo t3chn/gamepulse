@@ -486,7 +486,9 @@ or second discovery enqueue. The command accepts only the current mandatory
 20-game target, because the domain's daily selection and atomic commit invariant
 is exactly 20. Its fresh-path precondition scopes every source-ingestion and
 summary job in the database to this one cycle; the aggregate reader never
-exposes raw records. Focused fixture-only integration tests cover the single
+exposes raw records. It retains the production source lane's persisted claim
+pacing, waiting only until SQLite's next eligible claim time within the hard
+deadline; this is not a retry or a second enqueue. Focused fixture-only integration tests cover the single
 discovery invocation, no retry, exact target, cycle-scoped summary drain,
 deadline, job failure, target failure, and report privacy. A dedicated
 three-mutant offline harness exercises the one-shot termination decisions;

@@ -281,7 +281,7 @@ impl AcceptanceReport {
 
 /// Run exactly one scheduler enqueue followed by the cycle's mandatory worker jobs.
 ///
-/// No timer-driven production loop, sleep, retry, or second scheduler enqueue is used here.
+/// No timer-driven production loop, retry, or second scheduler enqueue is used here.
 /// The fresh database precondition means every accepted source-ingestion and review-summary job
 /// is scoped to this one cycle.
 pub async fn run_acceptance_once<S, C, O>(
@@ -450,6 +450,16 @@ where
         })?;
         observed_failures.merge(dispatched.observed_failures());
         if dispatched.claimed == 0 {
+            let waited = runtime
+                .wait_for_next_claim_eligibility()
+                .await
+                .map_err(|_| {
+                    observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
+                    AcceptanceTerminal::RuntimeFailure
+                })?;
+            if waited {
+                continue;
+            }
             return Err(AcceptanceTerminal::TargetFailure);
         }
         let settled = runtime.join_all().await.map_err(|_| {

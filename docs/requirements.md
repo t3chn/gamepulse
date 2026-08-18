@@ -137,3 +137,9 @@ exactly the requested current mandatory target of stored records with video
 links and both persisted review summaries ready. The command neither removes nor overwrites a caller database;
 operators provide a fresh temporary path and remove it themselves after
 inspection.
+
+The acceptance cycle preserves the service's durable source-lane claim pacing.
+If SQLite reports that a mandatory source job is ready but blocked only until
+the persisted next claim time, the cycle waits within its hard deadline and
+then makes the ordinary claim. This wait is not a retry or a second discovery
+cycle.
