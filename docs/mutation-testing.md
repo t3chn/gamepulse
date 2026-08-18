@@ -69,3 +69,28 @@ same test fails. Compilation, copy, test-harness, or mutation-setup failures
 are infrastructure failures rather than caught mutants; a compiling survivor
 fails the harness. The harness never invokes the acceptance command or a public
 source.
+
+## M054 durable run mutations
+
+Run the targeted durable run harness from the repository root:
+
+```text
+bash scripts/m054_mutation.sh
+```
+
+The harness copies tracked and ordinary untracked source into a temporary
+directory outside the repository, runs offline, and removes it on exit. Its
+hard ceiling is five named mutants:
+
+1. let a stale reclaimed queue token settle a run item;
+2. allow an item to settle after the durable run deadline;
+3. retry the source job after durable source exhaustion;
+4. schedule a ninth durable SEE ALL browse page;
+5. drop the fixed missing-video aggregate observation from a successful settlement.
+
+Each mutation first proves its focused baseline fixture, applies exactly one
+literal change, and is caught only when that same fixture fails. A survivor or
+infrastructure failure fails the harness. It makes no network request and never
+patches the working tree. This is a targeted M054 P1 harness; candidate ordering,
+quota, and exact-target behavior remain covered by the focused deterministic
+fixtures rather than claimed as mutants in this five-attempt pass.

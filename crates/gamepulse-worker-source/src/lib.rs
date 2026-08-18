@@ -11,7 +11,7 @@ use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::tree_builder::{ElemName, ElementFlags, NodeOrText, QuirksMode, TreeSink};
@@ -24,12 +24,14 @@ use serde_json::Value;
 use gamepulse_application::{
     AsyncDailyCrawlSourcePort, AsyncReviewSourceIngestionPort, AsyncSourceIngestionPort,
     CrawlDayKey, CrawlDiscoveryRequest, DailyCrawlOutcome, DailyCrawlStatePort, DiscoveryCandidate,
-    DiscoveryPage, GameReviewRefreshStore, GameSnapshotStore, JobHandler, JobHandlerFailure,
+    DiscoveryPage, DurableRunDiscovery, DurableRunProgressOutcome, DurableRunProgressStore,
+    GameReviewRefresh, GameReviewRefreshStore, GameSnapshotStore, JobHandler, JobHandlerFailure,
     JobHandlerFuture, JobHandlerResult, ReviewInput, ReviewPolarity, ReviewSourceIngestion,
-    ReviewSourceIngestionError, ReviewSummaryJobSchedule, RuntimeJobType,
-    SourceIngestionJobSchedule, SourceIngestionRequest, TypedJob, WorkerFailureCategory,
-    execute_async_daily_crawl_with_source_ingestion_jobs, execute_async_review_source_ingestion,
-    execute_async_source_ingestion, persist_game_review_refresh, upsert_game_snapshot,
+    ReviewSourceIngestionError, ReviewSummaryJobSchedule, RunSourceIngestionRequest,
+    RuntimeJobType, SourceIngestionJobSchedule, SourceIngestionRequest, TypedJob,
+    WorkerFailureCategory, execute_async_daily_crawl_with_source_ingestion_jobs,
+    execute_async_review_source_ingestion, execute_async_source_ingestion,
+    persist_game_review_refresh, upsert_game_snapshot,
 };
 use gamepulse_domain::{
     BrowseCursor, GameCoverDescriptor, GameDeveloper, GamePlatformScore, GamePublicCoverUrl,
@@ -48,6 +50,8 @@ const HOURLY_SCHEDULE_SECONDS: u64 = 60 * 60;
 const HOURS_PER_UTC_DAY: u64 = 24;
 const MAX_SCHEDULED_HOUR_SLOT: u64 = (i64::MAX as u64) / HOURLY_SCHEDULE_SECONDS;
 const HOURLY_DISCOVERY_FAILURE: &str = "source hourly discovery failed";
+const DURABLE_RUN_DISCOVERY_FAILURE: &str = "durable source run discovery failed";
+const DURABLE_RUN_INGESTION_FAILURE: &str = "durable source run ingestion failed";
 const REVIEW_PAGE_LIMIT: u32 = 20;
 const PUBLIC_HTML_BASE_URL: &str = "https://www.metacritic.com/";
 const PUBLIC_HTML_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
@@ -58,6 +62,38 @@ const MAX_PUBLIC_HTML_PARSE_DEPTH: usize = 64;
 const MAX_PUBLIC_HTML_ATTRIBUTES_PER_ELEMENT: usize = 64;
 const MAX_PUBLIC_HTML_ATTRIBUTE_BYTES: usize = 65_536;
 const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
+
+/// Clock used at the durable source settlement boundary after source I/O completes.
+pub trait SourceRunClock: Send + Sync {
+    fn now(&self) -> Result<gamepulse_application::JobTimestamp, SourceRunClockError>;
+}
+
+/// Production source-worker clock. Tests inject a deterministic implementation through the same
+/// handler constructor so deadline checks never depend on a fixture's claim timestamp.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemSourceRunClock;
+
+impl SourceRunClock for SystemSourceRunClock {
+    fn now(&self) -> Result<gamepulse_application::JobTimestamp, SourceRunClockError> {
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| SourceRunClockError)?
+            .as_secs();
+        let seconds = i64::try_from(seconds).map_err(|_| SourceRunClockError)?;
+        gamepulse_application::JobTimestamp::new(seconds).map_err(|_| SourceRunClockError)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceRunClockError;
+
+impl fmt::Display for SourceRunClockError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("source run clock is unavailable")
+    }
+}
+
+impl std::error::Error for SourceRunClockError {}
 
 /// Fixed, non-sensitive categories for terminal mandatory source-ingestion failures.
 ///
@@ -244,6 +280,192 @@ where
                 Ok(DailyCrawlOutcome::Selected(_)) => JobHandlerResult::Succeeded,
                 Ok(DailyCrawlOutcome::Exhausted(_)) | Err(_) => {
                     JobHandlerResult::Failed(JobHandlerFailure::new(HOURLY_DISCOVERY_FAILURE))
+                }
+            }
+        })
+    }
+}
+
+/// Production source-lane handler for the durable exact-target mandatory run.
+///
+/// A scheduler hour creates or resumes one day-owned run. Later pages are represented by durable
+/// source jobs emitted by the run store, so a missing-video rejection advances the same run rather
+/// than ending the hour or retrying that candidate.
+pub struct DurableRunDiscoveryHandler<S, T> {
+    run_store: Arc<Mutex<S>>,
+    source_port: Arc<T>,
+    source_ingestion_schedule: SourceIngestionJobSchedule,
+    clock: Arc<dyn SourceRunClock>,
+}
+
+impl<S, T> DurableRunDiscoveryHandler<S, T> {
+    pub fn new(
+        run_store: Arc<Mutex<S>>,
+        source_port: T,
+        source_ingestion_schedule: SourceIngestionJobSchedule,
+    ) -> Self {
+        Self::with_clock(
+            run_store,
+            source_port,
+            source_ingestion_schedule,
+            SystemSourceRunClock,
+        )
+    }
+
+    pub fn with_clock(
+        run_store: Arc<Mutex<S>>,
+        source_port: T,
+        source_ingestion_schedule: SourceIngestionJobSchedule,
+        clock: impl SourceRunClock + 'static,
+    ) -> Self {
+        Self {
+            run_store,
+            source_port: Arc::new(source_port),
+            source_ingestion_schedule,
+            clock: Arc::new(clock),
+        }
+    }
+}
+
+impl<S, T> JobHandler for DurableRunDiscoveryHandler<S, T>
+where
+    S: DurableRunProgressStore + Send + 'static,
+    S::Error: Send + 'static,
+    T: AsyncDailyCrawlSourcePort + Send + Sync + 'static,
+    T::Error: Send + 'static,
+{
+    fn job_type(&self) -> RuntimeJobType {
+        RuntimeJobType::SourceHourlyDiscovery
+    }
+
+    fn handle(&self, job: TypedJob) -> JobHandlerFuture {
+        let run_store = Arc::clone(&self.run_store);
+        let source_port = Arc::clone(&self.source_port);
+        let schedule = self.source_ingestion_schedule;
+        let clock = Arc::clone(&self.clock);
+        Box::pin(async move {
+            let Some(claim_fence) = job.claim_fence() else {
+                return JobHandlerResult::Failed(JobHandlerFailure::new(
+                    DURABLE_RUN_DISCOVERY_FAILURE,
+                ));
+            };
+            let now = match clock.now() {
+                Ok(now) => now,
+                Err(_) => {
+                    return JobHandlerResult::Failed(JobHandlerFailure::new(
+                        DURABLE_RUN_DISCOVERY_FAILURE,
+                    ));
+                }
+            };
+            let discovery =
+                if let Ok(day) = crawl_day_key_from_hourly_work_reference(job.work_ref()) {
+                    let deadline = job
+                        .created_at()
+                        .value()
+                        .checked_add(HOURLY_SCHEDULE_SECONDS as i64)
+                        .and_then(|value| gamepulse_application::JobTimestamp::new(value).ok());
+                    let Some(deadline) = deadline else {
+                        return JobHandlerResult::Failed(JobHandlerFailure::new(
+                            DURABLE_RUN_DISCOVERY_FAILURE,
+                        ));
+                    };
+                    let mut store = match run_store.lock() {
+                        Ok(store) => store,
+                        Err(_) => {
+                            return JobHandlerResult::Failed(JobHandlerFailure::new(
+                                DURABLE_RUN_DISCOVERY_FAILURE,
+                            ));
+                        }
+                    };
+                    match store.begin_or_resume(
+                        &day,
+                        20,
+                        job.created_at(),
+                        deadline,
+                        job.identity(),
+                        claim_fence,
+                        now,
+                    ) {
+                        Ok(discovery) => discovery,
+                        Err(_) => {
+                            return JobHandlerResult::Failed(JobHandlerFailure::new(
+                                DURABLE_RUN_DISCOVERY_FAILURE,
+                            ));
+                        }
+                    }
+                } else if let Ok(progress) =
+                    DurableRunDiscovery::from_progress_work_reference(job.work_ref())
+                {
+                    let mut store = match run_store.lock() {
+                        Ok(store) => store,
+                        Err(_) => {
+                            return JobHandlerResult::Failed(JobHandlerFailure::new(
+                                DURABLE_RUN_DISCOVERY_FAILURE,
+                            ));
+                        }
+                    };
+                    match store.load_progress_discovery(
+                        progress.run_id(),
+                        progress.version(),
+                        job.identity(),
+                        claim_fence,
+                        now,
+                    ) {
+                        Ok(discovery) => discovery,
+                        Err(_) => {
+                            return JobHandlerResult::Failed(JobHandlerFailure::new(
+                                DURABLE_RUN_DISCOVERY_FAILURE,
+                            ));
+                        }
+                    }
+                } else {
+                    return JobHandlerResult::Failed(JobHandlerFailure::new(
+                        DURABLE_RUN_DISCOVERY_FAILURE,
+                    ));
+                };
+
+            let Some(discovery) = discovery else {
+                return JobHandlerResult::Succeeded;
+            };
+            let page = match source_port.discover(discovery.request()).await {
+                Ok(page) => page,
+                Err(_) => {
+                    return JobHandlerResult::Failed(JobHandlerFailure::new(
+                        DURABLE_RUN_DISCOVERY_FAILURE,
+                    ));
+                }
+            };
+            let now = match clock.now() {
+                Ok(now) => now,
+                Err(_) => {
+                    return JobHandlerResult::Failed(JobHandlerFailure::new(
+                        DURABLE_RUN_DISCOVERY_FAILURE,
+                    ));
+                }
+            };
+            let outcome = match run_store.lock() {
+                Ok(mut store) => store.record_discovery_page(
+                    &discovery,
+                    &page,
+                    schedule,
+                    job.created_at(),
+                    job.identity(),
+                    claim_fence,
+                    now,
+                ),
+                Err(_) => {
+                    return JobHandlerResult::Failed(JobHandlerFailure::new(
+                        DURABLE_RUN_DISCOVERY_FAILURE,
+                    ));
+                }
+            };
+            match outcome {
+                Ok(DurableRunProgressOutcome::Progressed)
+                | Ok(DurableRunProgressOutcome::AlreadyTerminal)
+                | Ok(DurableRunProgressOutcome::DeadlineExceeded)
+                | Ok(DurableRunProgressOutcome::SourceExhausted) => JobHandlerResult::Succeeded,
+                Err(_) => {
+                    JobHandlerResult::Failed(JobHandlerFailure::new(DURABLE_RUN_DISCOVERY_FAILURE))
                 }
             }
         })
@@ -1768,6 +1990,172 @@ where
                 }
             }
         })
+    }
+}
+
+/// Source-lane handler for a run-owned mandatory candidate.
+///
+/// The candidate's complete refresh and accepted-count transition share one SQLite transaction.
+/// `MissingRequiredVideo` instead records the fixed terminal rejection and schedules the next
+/// candidate or page in that same transaction; it is therefore not retried and cannot consume
+/// quota.
+pub struct DurableRunReviewSourceIngestionHandler<S, P> {
+    run_store: Arc<Mutex<S>>,
+    source_port: Arc<P>,
+    summary_schedule: ReviewSummaryJobSchedule,
+    source_ingestion_schedule: SourceIngestionJobSchedule,
+    clock: Arc<dyn SourceRunClock>,
+}
+
+impl<S, P> DurableRunReviewSourceIngestionHandler<S, P> {
+    pub fn new(
+        run_store: Arc<Mutex<S>>,
+        source_port: P,
+        summary_schedule: ReviewSummaryJobSchedule,
+        source_ingestion_schedule: SourceIngestionJobSchedule,
+    ) -> Self {
+        Self::with_clock(
+            run_store,
+            source_port,
+            summary_schedule,
+            source_ingestion_schedule,
+            SystemSourceRunClock,
+        )
+    }
+
+    pub fn with_clock(
+        run_store: Arc<Mutex<S>>,
+        source_port: P,
+        summary_schedule: ReviewSummaryJobSchedule,
+        source_ingestion_schedule: SourceIngestionJobSchedule,
+        clock: impl SourceRunClock + 'static,
+    ) -> Self {
+        Self {
+            run_store,
+            source_port: Arc::new(source_port),
+            summary_schedule,
+            source_ingestion_schedule,
+            clock: Arc::new(clock),
+        }
+    }
+}
+
+impl<S, P> JobHandler for DurableRunReviewSourceIngestionHandler<S, P>
+where
+    S: DurableRunProgressStore + Send + 'static,
+    S::Error: Send + 'static,
+    P: AsyncReviewSourceIngestionPort + ReviewSourceFailureClassifier + Send + Sync + 'static,
+    P::Error: Send + 'static,
+{
+    fn job_type(&self) -> RuntimeJobType {
+        RuntimeJobType::SourceGameIngestion
+    }
+
+    fn handle(&self, job: TypedJob) -> JobHandlerFuture {
+        let run_store = Arc::clone(&self.run_store);
+        let source_port = Arc::clone(&self.source_port);
+        let summary_schedule = self.summary_schedule;
+        let source_ingestion_schedule = self.source_ingestion_schedule;
+        let clock = Arc::clone(&self.clock);
+        Box::pin(async move {
+            let Ok(request) = RunSourceIngestionRequest::from_work_reference(job.work_ref()) else {
+                return JobHandlerResult::Failed(JobHandlerFailure::new(
+                    DURABLE_RUN_INGESTION_FAILURE,
+                ));
+            };
+            let Some(claim_fence) = job.claim_fence() else {
+                return JobHandlerResult::Failed(JobHandlerFailure::new(
+                    DURABLE_RUN_INGESTION_FAILURE,
+                ));
+            };
+            let source_result = source_port.ingest_reviews(request.source().clone()).await;
+            let now = match clock.now() {
+                Ok(now) => now,
+                Err(_) => {
+                    return JobHandlerResult::Failed(JobHandlerFailure::new(
+                        DURABLE_RUN_INGESTION_FAILURE,
+                    ));
+                }
+            };
+            match source_result {
+                Ok(ingestion) => {
+                    let (snapshot, critic, user) = ingestion.into_parts();
+                    let refresh = match GameReviewRefresh::new(
+                        snapshot,
+                        critic,
+                        user,
+                        summary_schedule,
+                        job.created_at(),
+                    ) {
+                        Ok(refresh) => refresh,
+                        Err(_) => {
+                            return JobHandlerResult::Failed(JobHandlerFailure::with_observation(
+                                DURABLE_RUN_INGESTION_FAILURE,
+                                WorkerFailureCategory::OtherMandatory,
+                            ));
+                        }
+                    };
+                    match run_store.lock() {
+                        Ok(mut store) => durable_run_ingestion_settlement(
+                            store.persist_completed_item(
+                                &request,
+                                job.identity(),
+                                &refresh,
+                                source_ingestion_schedule,
+                                job.created_at(),
+                                claim_fence,
+                                now,
+                            ),
+                            None,
+                        ),
+                        Err(_) => JobHandlerResult::Failed(JobHandlerFailure::new(
+                            DURABLE_RUN_INGESTION_FAILURE,
+                        )),
+                    }
+                }
+                Err(error)
+                    if source_port.observation_category(&error)
+                        == WorkerFailureCategory::MissingRequiredVideo =>
+                {
+                    match run_store.lock() {
+                        Ok(mut store) => durable_run_ingestion_settlement(
+                            store.reject_missing_required_video(
+                                &request,
+                                job.identity(),
+                                source_ingestion_schedule,
+                                job.created_at(),
+                                claim_fence,
+                                now,
+                            ),
+                            Some(WorkerFailureCategory::MissingRequiredVideo),
+                        ),
+                        Err(_) => JobHandlerResult::Failed(JobHandlerFailure::new(
+                            DURABLE_RUN_INGESTION_FAILURE,
+                        )),
+                    }
+                }
+                Err(error) => JobHandlerResult::Failed(JobHandlerFailure::with_observation(
+                    source_port.failure_category(&error).as_str(),
+                    source_port.observation_category(&error),
+                )),
+            }
+        })
+    }
+}
+
+fn durable_run_ingestion_settlement<E>(
+    outcome: Result<DurableRunProgressOutcome, E>,
+    observation: Option<WorkerFailureCategory>,
+) -> JobHandlerResult {
+    match outcome {
+        Ok(DurableRunProgressOutcome::Progressed)
+        | Ok(DurableRunProgressOutcome::AlreadyTerminal)
+        | Ok(DurableRunProgressOutcome::DeadlineExceeded)
+        | Ok(DurableRunProgressOutcome::SourceExhausted) => match observation {
+            Some(observation) => JobHandlerResult::SucceededWithObservation(observation),
+            None => JobHandlerResult::Succeeded,
+        },
+        Err(_) => JobHandlerResult::Failed(JobHandlerFailure::new(DURABLE_RUN_INGESTION_FAILURE)),
     }
 }
 

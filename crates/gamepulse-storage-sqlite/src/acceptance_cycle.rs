@@ -36,7 +36,10 @@ impl AcceptanceCycleReadPort for SqliteAcceptanceCycleStore {
     ) -> Result<AcceptanceCycleSnapshot, AcceptanceCycleReadStoreError> {
         let selected = count(
             &self.connection,
-            "SELECT COUNT(*) FROM crawl_day_selected_candidates",
+            "SELECT COALESCE(
+                (SELECT accepted_count FROM runs ORDER BY created_at DESC, run_id DESC LIMIT 1),
+                (SELECT COUNT(*) FROM crawl_day_selected_candidates)
+             )",
         )?;
         let source_ingestion = job_progress(&self.connection, SOURCE_INGESTION_JOB_TYPE)?;
         let summaries = job_progress(&self.connection, REVIEW_SUMMARY_JOB_TYPE)?;

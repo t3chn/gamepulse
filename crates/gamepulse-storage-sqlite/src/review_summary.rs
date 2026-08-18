@@ -46,81 +46,89 @@ impl GameReviewRefreshStore for SqliteReviewSummaryStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ReviewSummaryStoreError::database)?;
-        upsert_snapshot_in_transaction(&transaction, refresh.snapshot())
-            .map_err(ReviewSummaryStoreError::snapshot)?;
-        let product_id = sqlite_identifier(refresh.snapshot().source_product_id())?;
-        if !matches_current_review_refresh(&transaction, product_id, refresh)? {
-            for kind in ReviewKind::ALL {
-                let input = refresh.input(kind);
-                transaction
-                    .execute(
-                        "INSERT INTO review_inputs (
-                            game_source_product_id, review_kind, content_hash, refresh_fingerprint
-                         ) VALUES (?1, ?2, ?3, ?4)
-                         ON CONFLICT(game_source_product_id, review_kind) DO UPDATE SET
-                            content_hash = excluded.content_hash,
-                            refresh_fingerprint = excluded.refresh_fingerprint",
-                        params![
-                            product_id,
-                            kind.as_str(),
-                            input.content_hash().as_str(),
-                            refresh.fingerprint().as_str(),
-                        ],
-                    )
-                    .map_err(ReviewSummaryStoreError::database)?;
-                transaction
-                    .execute(
-                        "DELETE FROM review_input_excerpts
-                         WHERE game_source_product_id = ?1 AND review_kind = ?2",
-                        params![product_id, kind.as_str()],
-                    )
-                    .map_err(ReviewSummaryStoreError::database)?;
-                for (position, excerpt) in input.excerpts().iter().enumerate() {
-                    transaction
-                        .execute(
-                        "INSERT INTO review_input_excerpts (
-                                game_source_product_id, review_kind, excerpt_position, excerpt, polarity
-                             ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![
-                                product_id,
-                                kind.as_str(),
-                                i64::try_from(position).map_err(|_| {
-                                    ReviewSummaryStoreError::malformed("review excerpt position")
-                                })?,
-                                excerpt.as_str(),
-                                excerpt.polarity().map(ReviewPolarity::as_str),
-                            ],
-                        )
-                        .map_err(ReviewSummaryStoreError::database)?;
-                }
-                transaction
-                    .execute(
-                        "INSERT INTO review_summaries (
-                            game_source_product_id, review_kind, refresh_fingerprint, state
-                         ) VALUES (?1, ?2, ?3, 'pending')
-                         ON CONFLICT(game_source_product_id, review_kind) DO UPDATE SET
-                            refresh_fingerprint = excluded.refresh_fingerprint,
-                            state = 'pending'",
-                        params![product_id, kind.as_str(), refresh.fingerprint().as_str()],
-                    )
-                    .map_err(ReviewSummaryStoreError::database)?;
-                transaction
-                    .execute(
-                        "DELETE FROM review_summary_items
-                         WHERE game_source_product_id = ?1 AND review_kind = ?2",
-                        params![product_id, kind.as_str()],
-                    )
-                    .map_err(ReviewSummaryStoreError::database)?;
-            }
-            for request in refresh.jobs() {
-                enqueue_derived_request(&transaction, request)
-                    .map_err(ReviewSummaryStoreError::job)?;
-            }
-        }
+        persist_review_refresh_in_transaction(&transaction, refresh)?;
         transaction
             .commit()
             .map_err(ReviewSummaryStoreError::database)
     }
+}
+
+pub(crate) fn persist_review_refresh_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    refresh: &GameReviewRefresh,
+) -> Result<(), ReviewSummaryStoreError> {
+    upsert_snapshot_in_transaction(transaction, refresh.snapshot())
+        .map_err(ReviewSummaryStoreError::snapshot)?;
+    let product_id = sqlite_identifier(refresh.snapshot().source_product_id())?;
+    if matches_current_review_refresh(transaction, product_id, refresh)? {
+        return Ok(());
+    }
+    for kind in ReviewKind::ALL {
+        let input = refresh.input(kind);
+        transaction
+            .execute(
+                "INSERT INTO review_inputs (
+                    game_source_product_id, review_kind, content_hash, refresh_fingerprint
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(game_source_product_id, review_kind) DO UPDATE SET
+                    content_hash = excluded.content_hash,
+                    refresh_fingerprint = excluded.refresh_fingerprint",
+                params![
+                    product_id,
+                    kind.as_str(),
+                    input.content_hash().as_str(),
+                    refresh.fingerprint().as_str(),
+                ],
+            )
+            .map_err(ReviewSummaryStoreError::database)?;
+        transaction
+            .execute(
+                "DELETE FROM review_input_excerpts
+                 WHERE game_source_product_id = ?1 AND review_kind = ?2",
+                params![product_id, kind.as_str()],
+            )
+            .map_err(ReviewSummaryStoreError::database)?;
+        for (position, excerpt) in input.excerpts().iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO review_input_excerpts (
+                        game_source_product_id, review_kind, excerpt_position, excerpt, polarity
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        product_id,
+                        kind.as_str(),
+                        i64::try_from(position).map_err(|_| {
+                            ReviewSummaryStoreError::malformed("review excerpt position")
+                        })?,
+                        excerpt.as_str(),
+                        excerpt.polarity().map(ReviewPolarity::as_str),
+                    ],
+                )
+                .map_err(ReviewSummaryStoreError::database)?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO review_summaries (
+                    game_source_product_id, review_kind, refresh_fingerprint, state
+                 ) VALUES (?1, ?2, ?3, 'pending')
+                 ON CONFLICT(game_source_product_id, review_kind) DO UPDATE SET
+                    refresh_fingerprint = excluded.refresh_fingerprint,
+                    state = 'pending'",
+                params![product_id, kind.as_str(), refresh.fingerprint().as_str()],
+            )
+            .map_err(ReviewSummaryStoreError::database)?;
+        transaction
+            .execute(
+                "DELETE FROM review_summary_items
+                 WHERE game_source_product_id = ?1 AND review_kind = ?2",
+                params![product_id, kind.as_str()],
+            )
+            .map_err(ReviewSummaryStoreError::database)?;
+    }
+    for request in refresh.jobs() {
+        enqueue_derived_request(transaction, request).map_err(ReviewSummaryStoreError::job)?;
+    }
+    Ok(())
 }
 
 fn matches_current_review_refresh(

@@ -131,8 +131,8 @@ run_mutant() {
 run_mutant \
   second-schedule-call \
   crates/gamepulse/src/acceptance.rs \
-  $'    match source_runtime\n        .schedule_hourly()\n        .map_err(|_| AcceptanceTerminal::RuntimeFailure)?' \
-  $'    let _first_schedule = source_runtime\n        .schedule_hourly()\n        .map_err(|_| AcceptanceTerminal::RuntimeFailure)?;\n    match source_runtime.schedule_hourly().map_err(|_| AcceptanceTerminal::RuntimeFailure)?' \
+  $'    match source_runtime.schedule_hourly().map_err(|_| {' \
+  $'    let _first_schedule = source_runtime.schedule_hourly().map_err(|_| {\n        observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);\n        AcceptanceTerminal::RuntimeFailure\n    })?;\n    match source_runtime\n        .schedule_hourly()\n        .map_err(|_| {' \
   acceptance_runs_one_cycle_and_drains_only_its_mandatory_summary_jobs
 run_mutant \
   continue-after-mandatory-failure \

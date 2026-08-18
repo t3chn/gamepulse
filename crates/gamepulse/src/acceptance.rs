@@ -379,18 +379,11 @@ where
         observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
         AcceptanceTerminal::RuntimeFailure
     })?;
-    if snapshot.selected() != target || snapshot.source_ingestion().total() != target {
+    if snapshot.selected() > target || snapshot.source_ingestion().total() == 0 {
         return Err(AcceptanceTerminal::TargetFailure);
     }
 
-    drain_mandatory_lane(
-        source_runtime,
-        observation,
-        target,
-        Lane::Source,
-        observed_failures,
-    )
-    .await?;
+    drain_source_run(source_runtime, observation, target, observed_failures).await?;
     let summary_target = target
         .checked_mul(2)
         .ok_or(AcceptanceTerminal::TargetFailure)?;
@@ -408,8 +401,9 @@ where
         AcceptanceTerminal::RuntimeFailure
     })?;
     if snapshot.selected() != target
-        || snapshot.source_ingestion().total() != target
-        || snapshot.source_ingestion().succeeded() != target
+        || !snapshot.source_ingestion().is_terminal()
+        || snapshot.source_ingestion().failed() != 0
+        || snapshot.source_ingestion().succeeded() < target
         || snapshot.summaries().total() != summary_target
         || snapshot.summaries().succeeded() != summary_target
         || snapshot.persisted() != target
@@ -422,9 +416,55 @@ where
     Ok(())
 }
 
+async fn drain_source_run<S, C, O>(
+    runtime: &mut Runtime<S, C>,
+    observation: &mut O,
+    target: usize,
+    observed_failures: &mut FailureCategoryCounts,
+) -> Result<(), AcceptanceTerminal>
+where
+    S: JobStore + Send + 'static,
+    S::Error: Send + 'static,
+    C: RuntimeClock,
+    O: AcceptanceCycleReadPort,
+{
+    loop {
+        let snapshot = observation.acceptance_cycle_snapshot().map_err(|_| {
+            observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
+            AcceptanceTerminal::RuntimeFailure
+        })?;
+        let jobs = snapshot.source_ingestion();
+        if snapshot.selected() > target || jobs.failed() > 0 {
+            return Err(if jobs.failed() > 0 {
+                AcceptanceTerminal::MandatoryJobFailure
+            } else {
+                AcceptanceTerminal::TargetFailure
+            });
+        }
+        if snapshot.selected() == target && jobs.is_terminal() {
+            return Ok(());
+        }
+        let dispatched = runtime.dispatch_available().map_err(|_| {
+            observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
+            AcceptanceTerminal::RuntimeFailure
+        })?;
+        observed_failures.merge(dispatched.observed_failures());
+        if dispatched.claimed == 0 {
+            return Err(AcceptanceTerminal::TargetFailure);
+        }
+        let settled = runtime.join_all().await.map_err(|_| {
+            observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);
+            AcceptanceTerminal::RuntimeFailure
+        })?;
+        observed_failures.merge(settled.observed_failures());
+        if !all_succeeded(&settled.settled) {
+            return Err(AcceptanceTerminal::MandatoryJobFailure);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Lane {
-    Source,
     Summary,
 }
 
@@ -447,7 +487,6 @@ where
             AcceptanceTerminal::RuntimeFailure
         })?;
         let jobs = match lane {
-            Lane::Source => snapshot.source_ingestion(),
             Lane::Summary => snapshot.summaries(),
         };
         if jobs.total() != expected {
@@ -477,8 +516,9 @@ where
             AcceptanceTerminal::RuntimeFailure
         })?;
         observed_failures.merge(settled.observed_failures());
-        if !all_succeeded(&settled.settled) {
-            return Err(AcceptanceTerminal::MandatoryJobFailure);
+        match all_succeeded(&settled.settled) {
+            true => {}
+            false => return Err(AcceptanceTerminal::MandatoryJobFailure),
         }
     }
 }

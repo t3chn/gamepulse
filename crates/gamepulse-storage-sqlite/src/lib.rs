@@ -7,6 +7,7 @@ mod catalogue;
 mod game_snapshot;
 mod job_queue;
 mod review_summary;
+mod run_progress;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -26,6 +27,7 @@ pub use catalogue::{GameCatalogueReadStoreError, SqliteGameCatalogueReadStore};
 pub use game_snapshot::{GameSnapshotStoreError, SqliteGameSnapshotStore};
 pub use job_queue::{JobStoreError, SqliteJobStore};
 pub use review_summary::{ReviewSummaryStoreError, SqliteReviewSummaryStore};
+pub use run_progress::{RunProgressStoreError, SqliteRunProgressStore};
 
 const DAILY_CRAWL_SCHEMA_VERSION: i64 = 1;
 const JOB_QUEUE_SCHEMA_VERSION: i64 = 2;
@@ -33,7 +35,8 @@ const GAME_SNAPSHOT_SCHEMA_VERSION: i64 = 3;
 const REVIEW_SUMMARY_SCHEMA_VERSION: i64 = 4;
 const PUBLIC_COVER_URL_SCHEMA_VERSION: i64 = 5;
 const REVIEW_EXCERPT_POLARITY_SCHEMA_VERSION: i64 = 6;
-const SCHEMA_VERSION: i64 = 7;
+const RETRY_BACKOFF_AND_SOURCE_PACING_SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const DAILY_CRAWL_MIGRATION_0001: &str = include_str!("../migrations/0001_daily_crawl_state.sql");
 const JOB_QUEUE_MIGRATION_0002: &str = include_str!("../migrations/0002_job_queue.sql");
 const GAME_SNAPSHOT_MIGRATION_0003: &str = include_str!("../migrations/0003_game_snapshots.sql");
@@ -44,6 +47,7 @@ const REVIEW_EXCERPT_POLARITY_MIGRATION_0006: &str =
     include_str!("../migrations/0006_review_excerpt_polarity.sql");
 const RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007: &str =
     include_str!("../migrations/0007_retry_backoff_and_source_pacing.sql");
+const DURABLE_RUNS_MIGRATION_0008: &str = include_str!("../migrations/0008_durable_runs.sql");
 
 /// Read-only SQLite readiness adapter for the configured persistent database.
 ///
@@ -367,6 +371,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(DURABLE_RUNS_MIGRATION_0008)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -397,6 +404,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(DURABLE_RUNS_MIGRATION_0008)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -425,6 +435,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(DURABLE_RUNS_MIGRATION_0008)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -451,6 +464,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(DURABLE_RUNS_MIGRATION_0008)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -475,6 +491,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(DURABLE_RUNS_MIGRATION_0008)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -496,6 +515,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
+                .execute_batch(DURABLE_RUNS_MIGRATION_0008)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
@@ -512,6 +534,27 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .execute_batch(RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(DURABLE_RUNS_MIGRATION_0008)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .commit()
+                .map_err(DailyCrawlStateStoreError::database)
+        }
+        RETRY_BACKOFF_AND_SOURCE_PACING_SCHEMA_VERSION => {
+            validate_daily_crawl_schema(connection)?;
+            validate_job_queue_schema(connection)?;
+            validate_game_snapshot_schema(connection)?;
+            validate_review_summary_schema(connection)?;
+            let transaction = connection
+                .transaction()
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(DURABLE_RUNS_MIGRATION_0008)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -532,7 +575,8 @@ fn validate_owned_schema(connection: &mut Connection) -> Result<(), DailyCrawlSt
     validate_daily_crawl_schema(connection)?;
     validate_job_queue_schema(connection)?;
     validate_game_snapshot_schema(connection)?;
-    validate_review_summary_schema(connection)
+    validate_review_summary_schema(connection)?;
+    validate_run_progress_schema(connection)
 }
 
 /// Read-only portion of the owned-schema validator used by readiness.
@@ -544,7 +588,68 @@ fn validate_required_schema_structure(
     validate_daily_crawl_schema_structure(connection)?;
     validate_job_queue_schema_structure(connection)?;
     validate_game_snapshot_schema_structure(connection)?;
-    validate_review_summary_schema(connection)
+    validate_review_summary_schema(connection)?;
+    validate_run_progress_schema_structure(connection)
+}
+
+fn validate_run_progress_schema(
+    connection: &mut Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    validate_run_progress_schema_structure(connection)
+}
+
+fn validate_run_progress_schema_structure(
+    connection: &Connection,
+) -> Result<(), DailyCrawlStateStoreError> {
+    validate_table_columns(
+        connection,
+        "runs",
+        &[
+            ("run_id", "TEXT", 1, 1),
+            ("day_key", "TEXT", 1, 0),
+            ("target_count", "INTEGER", 1, 0),
+            ("accepted_count", "INTEGER", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("source_phase", "TEXT", 1, 0),
+            ("browse_cursor", "TEXT", 0, 0),
+            ("deadline_at", "INTEGER", 1, 0),
+            ("version", "INTEGER", 1, 0),
+            ("progress_fence", "INTEGER", 1, 0),
+            ("next_item_order", "INTEGER", 1, 0),
+            ("browse_page_count", "INTEGER", 1, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("updated_at", "INTEGER", 1, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "run_items",
+        &[
+            ("run_id", "TEXT", 1, 1),
+            ("source_product_id", "TEXT", 1, 2),
+            ("source_slug", "TEXT", 1, 0),
+            ("discovery_order", "INTEGER", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("job_identity", "TEXT", 0, 0),
+            ("rejection_category", "TEXT", 0, 0),
+        ],
+    )?;
+    validate_table_layout(connection, "runs", false)?;
+    validate_table_layout(connection, "run_items", true)?;
+    validate_foreign_key_groups(
+        connection,
+        "run_items",
+        &[(
+            0,
+            0,
+            "runs",
+            "run_id",
+            "run_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE",
+        )],
+    )
 }
 
 fn validate_daily_crawl_schema(

@@ -1304,6 +1304,164 @@ pub trait AsyncDailyCrawlSourcePort: Send + Sync {
     fn discover(&self, request: CrawlDiscoveryRequest) -> Self::DiscoverFuture<'_>;
 }
 
+/// The current source page expected by a durable mandatory run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableRunDiscovery {
+    run_id: String,
+    request: CrawlDiscoveryRequest,
+    version: u64,
+}
+
+impl DurableRunDiscovery {
+    pub fn new(
+        run_id: impl Into<String>,
+        request: CrawlDiscoveryRequest,
+        version: u64,
+    ) -> Result<Self, DurableRunDiscoveryError> {
+        let run_id = run_id.into();
+        if run_id.is_empty() || run_id.len() > 128 || run_id.contains(':') {
+            return Err(DurableRunDiscoveryError::InvalidRunId);
+        }
+        Ok(Self {
+            run_id,
+            request,
+            version,
+        })
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub const fn request(&self) -> CrawlDiscoveryRequest {
+        self.request
+    }
+
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn progress_work_reference(&self) -> String {
+        format!(
+            "{RUN_PROGRESS_WORK_REFERENCE_PREFIX}{}:{}",
+            self.run_id, self.version
+        )
+    }
+
+    pub fn from_progress_work_reference(value: &str) -> Result<Self, DurableRunDiscoveryError> {
+        let encoded = value
+            .strip_prefix(RUN_PROGRESS_WORK_REFERENCE_PREFIX)
+            .ok_or(DurableRunDiscoveryError::MalformedWorkReference)?;
+        let (run_id, version) = encoded
+            .split_once(':')
+            .ok_or(DurableRunDiscoveryError::MalformedWorkReference)?;
+        if version.is_empty()
+            || !version.bytes().all(|byte| byte.is_ascii_digit())
+            || (version.len() > 1 && version.starts_with('0'))
+        {
+            return Err(DurableRunDiscoveryError::MalformedWorkReference);
+        }
+        let version = version
+            .parse::<u64>()
+            .map_err(|_| DurableRunDiscoveryError::MalformedWorkReference)?;
+        // The exact request is recovered from durable run state, not from the opaque work ref.
+        Self::new(run_id, CrawlDiscoveryRequest::NewReleases, version)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableRunDiscoveryError {
+    InvalidRunId,
+    MalformedWorkReference,
+}
+
+impl fmt::Display for DurableRunDiscoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRunId => {
+                formatter.write_str("run identifier must be bounded and colon-free")
+            }
+            Self::MalformedWorkReference => {
+                formatter.write_str("malformed durable run progress work reference")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DurableRunDiscoveryError {}
+
+/// Safe terminal outcomes for durable run progression.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableRunProgressOutcome {
+    Progressed,
+    AlreadyTerminal,
+    DeadlineExceeded,
+    SourceExhausted,
+}
+
+/// Application-owned port for the mandatory exact-target run lifecycle.
+///
+/// The adapter must atomically bind a run item state transition, derived source job scheduling,
+/// and (for a completed item) the game/review refresh. New durable control metadata may retain
+/// only stable identity, routing slug, lifecycle, fencing/version data, and fixed rejection
+/// categories; raw source material and errors are forbidden.
+#[allow(clippy::too_many_arguments)]
+pub trait DurableRunProgressStore {
+    type Error;
+
+    fn begin_or_resume(
+        &mut self,
+        day: &CrawlDayKey,
+        target: usize,
+        created_at: JobTimestamp,
+        deadline_at: JobTimestamp,
+        job_identity: &str,
+        claim_fence: JobClaimFence,
+        now: JobTimestamp,
+    ) -> Result<Option<DurableRunDiscovery>, Self::Error>;
+
+    fn load_progress_discovery(
+        &mut self,
+        run_id: &str,
+        version: u64,
+        job_identity: &str,
+        claim_fence: JobClaimFence,
+        now: JobTimestamp,
+    ) -> Result<Option<DurableRunDiscovery>, Self::Error>;
+
+    fn record_discovery_page(
+        &mut self,
+        discovery: &DurableRunDiscovery,
+        page: &DiscoveryPage,
+        schedule: SourceIngestionJobSchedule,
+        created_at: JobTimestamp,
+        job_identity: &str,
+        claim_fence: JobClaimFence,
+        now: JobTimestamp,
+    ) -> Result<DurableRunProgressOutcome, Self::Error>;
+
+    fn persist_completed_item(
+        &mut self,
+        request: &RunSourceIngestionRequest,
+        job_identity: &str,
+        refresh: &GameReviewRefresh,
+        schedule: SourceIngestionJobSchedule,
+        created_at: JobTimestamp,
+        claim_fence: JobClaimFence,
+        now: JobTimestamp,
+    ) -> Result<DurableRunProgressOutcome, Self::Error>;
+
+    fn reject_missing_required_video(
+        &mut self,
+        request: &RunSourceIngestionRequest,
+        job_identity: &str,
+        schedule: SourceIngestionJobSchedule,
+        created_at: JobTimestamp,
+        claim_fence: JobClaimFence,
+        now: JobTimestamp,
+    ) -> Result<DurableRunProgressOutcome, Self::Error>;
+}
+
 /// The sole persistence boundary for this milestone.
 ///
 /// `commit` must make the next daily state and its selected candidates visible together, or make
@@ -2732,6 +2890,107 @@ impl std::error::Error for RuntimeJobTypeFilterError {}
 
 /// The canonical opaque work-reference prefix for one Metacritic source-ingestion job.
 pub const SOURCE_INGESTION_WORK_REFERENCE_PREFIX: &str = "metacritic-game:";
+/// The opaque work-reference prefix for a source-ingestion item owned by a durable run.
+pub const RUN_SOURCE_INGESTION_WORK_REFERENCE_PREFIX: &str = "metacritic-run:";
+/// The opaque work-reference prefix for a durable run's next discovery page.
+pub const RUN_PROGRESS_WORK_REFERENCE_PREFIX: &str = "metacritic-run-progress:";
+
+/// A source-ingestion request tied to one durable mandatory run.
+///
+/// The run identifier is application control metadata. It intentionally carries no title, URL,
+/// source payload, or error material; the mutable source slug remains only the routing component
+/// needed by the existing source adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunSourceIngestionRequest {
+    run_id: String,
+    source: SourceIngestionRequest,
+}
+
+impl RunSourceIngestionRequest {
+    pub fn new(
+        run_id: impl Into<String>,
+        source_product_id: u64,
+        source_slug: impl Into<String>,
+    ) -> Result<Self, RunSourceIngestionRequestError> {
+        let run_id = run_id.into();
+        if run_id.is_empty() || run_id.len() > 128 || run_id.contains(':') {
+            return Err(RunSourceIngestionRequestError::InvalidRunId);
+        }
+        Ok(Self {
+            run_id,
+            source: SourceIngestionRequest::new(source_product_id, source_slug)
+                .map_err(RunSourceIngestionRequestError::Source)?,
+        })
+    }
+
+    pub fn from_work_reference(value: &str) -> Result<Self, RunSourceIngestionRequestError> {
+        let encoded = value
+            .strip_prefix(RUN_SOURCE_INGESTION_WORK_REFERENCE_PREFIX)
+            .ok_or(RunSourceIngestionRequestError::MalformedWorkReference)?;
+        let mut parts = encoded.split(':');
+        let run_id = parts
+            .next()
+            .ok_or(RunSourceIngestionRequestError::MalformedWorkReference)?;
+        let source_product_id = parts
+            .next()
+            .ok_or(RunSourceIngestionRequestError::MalformedWorkReference)?;
+        let source_slug = parts
+            .next()
+            .ok_or(RunSourceIngestionRequestError::MalformedWorkReference)?;
+        if parts.next().is_some()
+            || source_product_id.is_empty()
+            || !source_product_id.bytes().all(|byte| byte.is_ascii_digit())
+            || (source_product_id.len() > 1 && source_product_id.starts_with('0'))
+        {
+            return Err(RunSourceIngestionRequestError::MalformedWorkReference);
+        }
+        let source_product_id = source_product_id
+            .parse::<u64>()
+            .map_err(|_| RunSourceIngestionRequestError::MalformedWorkReference)?;
+        Self::new(run_id, source_product_id, source_slug)
+            .map_err(|_| RunSourceIngestionRequestError::MalformedWorkReference)
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn source(&self) -> &SourceIngestionRequest {
+        &self.source
+    }
+
+    pub fn work_reference(&self) -> String {
+        format!(
+            "{RUN_SOURCE_INGESTION_WORK_REFERENCE_PREFIX}{}:{}:{}",
+            self.run_id,
+            self.source.source_product_id().value(),
+            self.source.source_slug()
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunSourceIngestionRequestError {
+    InvalidRunId,
+    Source(SourceIngestionRequestError),
+    MalformedWorkReference,
+}
+
+impl fmt::Display for RunSourceIngestionRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRunId => {
+                formatter.write_str("run identifier must be bounded and colon-free")
+            }
+            Self::Source(error) => error.fmt(formatter),
+            Self::MalformedWorkReference => {
+                formatter.write_str("malformed durable run work reference")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RunSourceIngestionRequestError {}
 
 /// Application-owned policy for a source-ingestion job derived from a selected candidate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2782,11 +3041,48 @@ impl SourceIngestionJobSchedule {
             })
             .collect()
     }
+
+    /// Build the one durable source-ingestion request for a candidate owned by a run.
+    pub fn request_for_run(
+        self,
+        run_id: &str,
+        candidate: &DiscoveryCandidate,
+        created_at: JobTimestamp,
+    ) -> Result<JobRequest, SourceIngestionJobScheduleError> {
+        let request = RunSourceIngestionRequest::new(
+            run_id,
+            candidate.source_product_id().value(),
+            candidate.source_slug(),
+        )
+        .map_err(|error| match error {
+            RunSourceIngestionRequestError::Source(error) => {
+                SourceIngestionJobScheduleError::Request(error)
+            }
+            RunSourceIngestionRequestError::InvalidRunId
+            | RunSourceIngestionRequestError::MalformedWorkReference => {
+                SourceIngestionJobScheduleError::RunRequest(error)
+            }
+        })?;
+        JobRequest::new(
+            format!(
+                "{}:{}:{}",
+                RuntimeJobType::SourceGameIngestion.as_str(),
+                run_id,
+                request.source().source_product_id().value()
+            ),
+            RuntimeJobType::SourceGameIngestion.as_str(),
+            request.work_reference(),
+            self.max_attempts,
+            created_at,
+        )
+        .map_err(SourceIngestionJobScheduleError::JobRequest)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceIngestionJobScheduleError {
     Request(SourceIngestionRequestError),
+    RunRequest(RunSourceIngestionRequestError),
     JobRequest(JobInputError),
 }
 
@@ -2794,6 +3090,7 @@ impl fmt::Display for SourceIngestionJobScheduleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Request(error) => error.fmt(formatter),
+            Self::RunRequest(error) => error.fmt(formatter),
             Self::JobRequest(error) => error.fmt(formatter),
         }
     }
@@ -2853,6 +3150,35 @@ pub struct TypedJob {
     job_type: RuntimeJobType,
     work_ref: String,
     created_at: JobTimestamp,
+    claimed_at: Option<JobTimestamp>,
+    claim_fence: Option<JobClaimFence>,
+}
+
+/// The bounded portion of a queue claim that a handler may present to another durable adapter.
+///
+/// It intentionally omits the worker identity and carries only the monotonic token plus expiry
+/// needed to reject a reclaimed worker before it changes application state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobClaimFence {
+    claim_token: u32,
+    lease_expires_at: JobTimestamp,
+}
+
+impl JobClaimFence {
+    pub const fn from_claim(claim: &JobClaim) -> Self {
+        Self {
+            claim_token: claim.claim_token(),
+            lease_expires_at: claim.lease_expires_at(),
+        }
+    }
+
+    pub const fn claim_token(self) -> u32 {
+        self.claim_token
+    }
+
+    pub const fn lease_expires_at(self) -> JobTimestamp {
+        self.lease_expires_at
+    }
 }
 
 impl TypedJob {
@@ -2862,7 +3188,17 @@ impl TypedJob {
             job_type: RuntimeJobType::parse(record.job_type())?,
             work_ref: record.work_ref().to_owned(),
             created_at: record.created_at(),
+            claimed_at: None,
+            claim_fence: None,
         })
+    }
+
+    /// Construct a handler-visible job from the current fenced durable claim.
+    pub fn from_claimed(claimed: &ClaimedJob) -> Option<Self> {
+        let mut typed = Self::from_record(claimed.job())?;
+        typed.claimed_at = Some(claimed.claim().claimed_at());
+        typed.claim_fence = Some(JobClaimFence::from_claim(claimed.claim()));
+        Some(typed)
     }
 
     pub fn identity(&self) -> &str {
@@ -2879,6 +3215,21 @@ impl TypedJob {
 
     pub const fn created_at(&self) -> JobTimestamp {
         self.created_at
+    }
+
+    /// The durable claim timestamp when the dispatcher supplied one; compatibility test fixtures
+    /// built directly from a record fall back to the record creation time.
+    pub const fn claimed_at(&self) -> JobTimestamp {
+        match self.claimed_at {
+            Some(value) => value,
+            None => self.created_at,
+        }
+    }
+
+    /// The queue fence for a job dispatched from an active durable claim.
+    /// Compatibility fixtures built from records have no fence and cannot settle durable runs.
+    pub const fn claim_fence(&self) -> Option<JobClaimFence> {
+        self.claim_fence
     }
 }
 
@@ -3031,6 +3382,8 @@ impl fmt::Debug for JobHandlerFailure {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobHandlerResult {
     Succeeded,
+    /// Successful durable settlement with a fixed aggregate-only observation.
+    SucceededWithObservation(WorkerFailureCategory),
     Failed(JobHandlerFailure),
 }
 

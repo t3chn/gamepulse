@@ -13,14 +13,14 @@ use gamepulse_application::{
     RuntimeJobType, RuntimeJobTypeFilter, SourceIngestionJobSchedule,
 };
 use gamepulse_storage_sqlite::{
-    SqliteAcceptanceCycleStore, SqliteDailyCrawlStateStore, SqliteGameCatalogueReadStore,
-    SqliteJobStore, SqliteReadinessProbe, SqliteReviewSummaryStore,
+    SqliteAcceptanceCycleStore, SqliteGameCatalogueReadStore, SqliteJobStore, SqliteReadinessProbe,
+    SqliteReviewSummaryStore, SqliteRunProgressStore,
 };
 use gamepulse_worker_llm::{LocalExtractiveReviewSummarizer, ReviewSummaryHandler};
 use gamepulse_worker_source::{
-    HourlyDiscoveryHandler, MetacriticCanaryClient, MetacriticDailyCrawlSource,
-    MetacriticGameReviewSource, MetacriticPublicHtmlTransport, PublicHtmlCoverEnricher,
-    ReviewSourceIngestionHandler,
+    DurableRunDiscoveryHandler, DurableRunReviewSourceIngestionHandler, MetacriticCanaryClient,
+    MetacriticDailyCrawlSource, MetacriticGameReviewSource, MetacriticPublicHtmlTransport,
+    PublicHtmlCoverEnricher,
 };
 use observability::{LogFormat, ObservedJobHandler, ObservedPublicCoverEnricher};
 use runtime::{Runtime, RuntimeConfig, SystemRuntimeClock};
@@ -46,7 +46,7 @@ struct RuntimeEnvironment {
 
 struct RuntimeStorage {
     store: Arc<Mutex<SqliteJobStore>>,
-    daily_crawl_state: Arc<Mutex<SqliteDailyCrawlStateStore>>,
+    run_progress: Arc<Mutex<SqliteRunProgressStore>>,
     review_summaries: Arc<Mutex<SqliteReviewSummaryStore>>,
     catalogue: Arc<Mutex<SqliteGameCatalogueReadStore>>,
 }
@@ -56,7 +56,7 @@ impl RuntimeStorage {
         let path = path.as_ref();
         Ok(Self {
             store: Arc::new(Mutex::new(SqliteJobStore::open(path)?)),
-            daily_crawl_state: Arc::new(Mutex::new(SqliteDailyCrawlStateStore::open(path)?)),
+            run_progress: Arc::new(Mutex::new(SqliteRunProgressStore::open(path)?)),
             review_summaries: Arc::new(Mutex::new(SqliteReviewSummaryStore::open(path)?)),
             catalogue: Arc::new(Mutex::new(SqliteGameCatalogueReadStore::open(path)?)),
         })
@@ -226,20 +226,22 @@ fn compose_source_runtime(
     let source_port = MetacriticDailyCrawlSource::new(source_client.clone());
     let source_ingestion_schedule = SourceIngestionJobSchedule::new(3)?;
     let source_handler: Arc<dyn JobHandler> =
-        Arc::new(ObservedJobHandler::new(HourlyDiscoveryHandler::new(
-            storage.daily_crawl_state.clone(),
+        Arc::new(ObservedJobHandler::new(DurableRunDiscoveryHandler::new(
+            storage.run_progress.clone(),
             source_port,
             source_ingestion_schedule,
         )));
-    let ingestion_handler: Arc<dyn JobHandler> =
-        Arc::new(ObservedJobHandler::new(ReviewSourceIngestionHandler::new(
-            storage.review_summaries.clone(),
+    let ingestion_handler: Arc<dyn JobHandler> = Arc::new(ObservedJobHandler::new(
+        DurableRunReviewSourceIngestionHandler::new(
+            storage.run_progress.clone(),
             MetacriticGameReviewSource::with_public_cover_enricher(
                 source_client,
                 public_html_cover,
             ),
             review_summary_schedule,
-        )));
+            source_ingestion_schedule,
+        ),
+    ));
     let handlers = Arc::new(JobHandlerRegistry::new([
         source_handler,
         ingestion_handler,

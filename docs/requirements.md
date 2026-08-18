@@ -4,19 +4,20 @@ Status: captured from the received take-home assignment on 2026-08-14
 
 ## Mandatory processing
 
-The service runs once per hour and visits the Metacritic Games section. Each run
-selects 20 games that have not been processed during the current day and inserts
-or updates their information in the service database. A successful daily selection
-is exactly 20 eligible, unique games. If the first New Releases page is short
-after deduplication, the run continues through the bounded newest-first browse
-sequence. If that sequence cannot supply 20 games, the run fails closed: it
-records no partial daily selection and no successful discovery result.
+The service runs once per hour and visits the Metacritic Games section. Each
+durable run owns a target of 20 successful, eligible, unique games and advances
+one stable candidate at a time until that target succeeds. A candidate missing
+the mandatory video link is a terminal candidate rejection: it is not stored as
+a complete game, consumes no target quota, and is never retried within the run
+or after restart. The same run continues to later unique candidates. If bounded
+newest-first discovery is exhausted or the durable run deadline passes before
+20 successes, the run fails closed and is never reported as successful.
 
 Daily source sequence:
 
-1. The first daily selection uses the Games page New Releases section.
-2. Later selections use SEE ALL sorted by newest and may advance through browse
-   pages.
+1. A new day starts its run at the Games page New Releases section.
+2. Later run cycles use SEE ALL sorted by newest and may advance through browse
+   pages, with at most eight durable SEE ALL pages across restart.
 3. Each new day starts the sequence again from New Releases.
 
 Transient source failures use durable, deterministic retry eligibility and
@@ -130,9 +131,9 @@ report. It never starts the HTTP server, daemon, or hourly loop.
 
 The command schedules discovery once only. It does not create a second cycle,
 retry a failed job, or wait for optional work. It waits only for the mandatory
-source-ingestion and review-summary jobs created by its fresh cycle, subject to
-an explicit hard deadline. Success requires exactly the requested current
-mandatory target of stored records with video links and both persisted review
-summaries ready. The command neither removes nor overwrites a caller database;
+source-ingestion and review-summary jobs created by its fresh durable run,
+subject to an explicit hard deadline. Success requires one succeeded run with
+exactly the requested current mandatory target of stored records with video
+links and both persisted review summaries ready. The command neither removes nor overwrites a caller database;
 operators provide a fresh temporary path and remove it themselves after
 inspection.

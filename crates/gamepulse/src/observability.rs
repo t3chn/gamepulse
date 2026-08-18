@@ -265,7 +265,7 @@ where
 
 pub(crate) fn handler_outcome_category(outcome: &JobHandlerResult) -> &'static str {
     match outcome {
-        JobHandlerResult::Succeeded => "succeeded",
+        JobHandlerResult::Succeeded | JobHandlerResult::SucceededWithObservation(_) => "succeeded",
         JobHandlerResult::Failed(_) => "failed",
     }
 }

@@ -504,7 +504,7 @@ where
         attempt,
         "durable job claimed"
     );
-    let (outcome, worker_category) = if let Some(job) = TypedJob::from_record(claimed.job()) {
+    let (outcome, worker_category) = if let Some(job) = TypedJob::from_claimed(&claimed) {
         let Some(handler) = handlers.handler(job.job_type()) else {
             let outcome = settle_failure(
                 store,
@@ -528,6 +528,9 @@ where
 
         match handler.handle(job).await {
             JobHandlerResult::Succeeded => (settle_success(store, clock, claimed), None),
+            JobHandlerResult::SucceededWithObservation(observation) => {
+                (settle_success(store, clock, claimed), Some(observation))
+            }
             JobHandlerResult::Failed(error) => {
                 let observation = error.observation();
                 (
@@ -566,7 +569,7 @@ fn runtime_task_result(
     worker_category: Option<WorkerFailureCategory>,
 ) -> RuntimeTaskResult {
     let observation = match outcome {
-        RuntimeTaskOutcome::Succeeded => None,
+        RuntimeTaskOutcome::Succeeded => worker_category,
         RuntimeTaskOutcome::CompletionRejected
         | RuntimeTaskOutcome::FailureRejected
         | RuntimeTaskOutcome::ClockUnavailable

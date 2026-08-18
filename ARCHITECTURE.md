@@ -103,9 +103,12 @@ domain -----------------------------------> no workspace crate
 - **Prevents:** prunable job history becoming the UI source of truth or optional
   YouTube work holding a mandatory run open.
 - **Rule:** `runs` and `run_items` own batch and mandatory item progress;
-  `summaries` own visible freshness; `jobs` own retryable attempts. A run is
-  active only while mandatory discovery, ingestion, critic summary, or user
-  summary work is non-terminal. Optional media work never holds it open.
+  `summaries` own visible freshness; `jobs` own retryable attempts. A run can
+  succeed only at its exact accepted target. A missing mandatory video is a
+  closed, fixed-category `run_items` rejection, never a complete game or quota
+  increment; the run schedules the next unique candidate or bounded source
+  page. Other mandatory failures retain ordinary queue retry/fatal semantics.
+  Optional media work never holds a run open.
 
 ### AD-7 — Hide Metacritic behind a verified source port
 
@@ -349,11 +352,9 @@ consume the mandatory job lease. The HTML client has its own timeout, body cap,
 no redirects, and no retries. `403` and `429` latch the until-restart circuit
 from response headers before any body read; challenge-like read HTML does too.
 All optional failure paths store no URL and leave snapshot, review refresh,
-queue settlement, daily selection, and summary behavior unchanged. Because the
-current source handler cannot observe the completion of its fixed 20-item batch
-without introducing `runs`/`run_items`, the proposed more-than-four
-parse-or-validation-failure batch disablement remains an operational revisit
-condition rather than durable run state.
+queue settlement, daily selection, and summary behavior unchanged. The durable
+run boundary is independent of optional cover results; a cover failure neither
+changes candidate acceptance nor source progression.
 
 M021 renders a validated public cover URL only after source enrichment and SQLite snapshot
 persistence have carried it into the catalogue read model. Catalogue and detail templates use the
@@ -490,6 +491,28 @@ discovery invocation, no retry, exact target, cycle-scoped summary drain,
 deadline, job failure, target failure, and report privacy. A dedicated
 three-mutant offline harness exercises the one-shot termination decisions;
 normal source calls remain outside CI and this milestone.
+
+M054 replaces the superseded fixed-20-candidate settlement in the production
+source composition with one durable exact-target run. A forward SQLite
+migration adds `runs` (day, target, phase/cursor, durable eight-page browse
+bound, accepted count, deadline, and version/progress fence) and `run_items`
+(stable source identity, routing slug, discovery order, lifecycle, and the
+closed `missing_required_video` category). The source worker obtains one
+candidate job from this state at a time. A valid
+missing-video detail settles that candidate as rejected without any snapshot,
+review, summary, or quota write, then atomically schedules the next candidate
+or bounded browse page. A successful refresh persists the game/reviews and
+increments accepted count in one transaction; exactly target completes the
+run. The handler exposes the queue claim's bounded token/expiry fence; each
+run transaction validates the active queue state, matching fence, unexpired
+lease, and run deadline before it changes a page, item, game, or rejection.
+Item state plus job identity, run version, and progress fence make stale or
+replayed work idempotent and prevent overfill. Source exhaustion and deadline
+are durable failed run terminals whose current source job settles successfully,
+without a retry; fixed missing-video observations remain aggregate-only even
+on that successful settlement. The normal hourly runtime and acceptance
+composition share these handlers; legacy direct-handler fixtures remain only
+compatibility coverage, not a second production flow.
 
 ## Revisit conditions
 
