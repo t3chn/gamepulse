@@ -210,7 +210,11 @@ fn fixture_catalogue(database: &TemporaryDatabase) -> Arc<Mutex<SqliteGameCatalo
             ],
             &["Studio B"],
             false,
-        ),
+        )
+        .with_public_cover_url(Some(
+            GamePublicCoverUrl::new("https://www.metacritic.com/images/beta.jpg")
+                .expect("test public cover URL must be valid"),
+        )),
         snapshot(
             103,
             "Gamma",
@@ -502,9 +506,12 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
     assert!(all_games.contains("<ol class=\"game-grid\" aria-label=\"Stored games\">"));
     assert!(
         all_games.contains(
-            "<img class=\"cover-image\" src=\"/games/101/cover\" alt=\"Cover for Alpha\">"
+            "<img class=\"cover-image\" src=\"/games/101/cover\" alt=\"Cover for Alpha\" loading=\"lazy\" decoding=\"async\">"
         )
     );
+    assert!(all_games.contains(
+        "<img class=\"cover-image\" src=\"https://www.metacritic.com/images/beta.jpg\" alt=\"Cover for Beta\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\">"
+    ));
     assert!(all_games.contains("class=\"cover-placeholder\" aria-hidden=\"true\""));
     assert!(!all_games.contains("No local cover image stored"));
     assert!(all_games.contains("class=\"score-badge__label\">Best score"));
@@ -548,6 +555,8 @@ async fn renders_a_deterministic_offline_catalogue_from_accepted_snapshots() {
     assert!(detail.contains(
         "<img class=\"cover-image cover-image--large\" src=\"/games/101/cover\" alt=\"Cover for Alpha\">"
     ));
+    assert!(detail.contains("<div class=\"detail-column\">"));
+    assert!(!detail.contains("content-section--wide"));
     assert!(detail.contains("<caption>Stored score comparison by platform</caption>"));
     assert!(detail.contains("<th scope=\"col\">Userscore</th>"));
     assert!(detail.contains("<td>PC</td>"));
@@ -612,7 +621,7 @@ async fn renders_a_persisted_cover_through_a_gamepulse_local_route() {
     assert_eq!(status, StatusCode::OK);
     assert!(
         catalogue_html.contains(
-            "<img class=\"cover-image\" src=\"/games/101/cover\" alt=\"Cover for Alpha\">"
+            "<img class=\"cover-image\" src=\"/games/101/cover\" alt=\"Cover for Alpha\" loading=\"lazy\" decoding=\"async\">"
         )
     );
     assert!(!catalogue_html.contains("https://www.metacritic.com/images/example-game.jpg"));
@@ -641,7 +650,11 @@ async fn renders_a_persisted_cover_through_a_gamepulse_local_route() {
     let (status, missing_detail) =
         read_response(gamepulse_web::game_detail_response(Arc::clone(&catalogue), 102).await).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(missing_detail.contains("No stored cover image available."));
+    assert!(
+        missing_detail
+            .contains("src=\"https://www.metacritic.com/images/beta.jpg\" alt=\"Cover for Beta\"")
+    );
+    assert!(!missing_detail.contains("No stored cover image available."));
     assert!(!missing_detail.contains("/games/102/cover\" alt=\"Cover for Beta\""));
     let missing_cover = gamepulse_web::cover_image_response(catalogue, 102).await;
     assert_eq!(missing_cover.status(), StatusCode::NOT_FOUND);

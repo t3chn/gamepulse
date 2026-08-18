@@ -500,6 +500,7 @@ pub struct CatalogueGameCard {
     source_product_id: SourceProductId,
     title: String,
     has_local_cover: bool,
+    public_cover_url: Option<String>,
     highest_metascore: Option<u8>,
     platforms: Vec<String>,
     developers: Vec<String>,
@@ -510,6 +511,7 @@ impl CatalogueGameCard {
         source_product_id: SourceProductId,
         title: impl Into<String>,
         has_local_cover: bool,
+        public_cover_url: Option<String>,
         highest_metascore: Option<u8>,
         platforms: Vec<String>,
         developers: Vec<String>,
@@ -518,6 +520,7 @@ impl CatalogueGameCard {
             source_product_id,
             title: title.into(),
             has_local_cover,
+            public_cover_url,
             highest_metascore,
             platforms,
             developers,
@@ -534,6 +537,10 @@ impl CatalogueGameCard {
 
     pub const fn has_local_cover(&self) -> bool {
         self.has_local_cover
+    }
+
+    pub fn public_cover_url(&self) -> Option<&str> {
+        self.public_cover_url.as_deref()
     }
 
     pub const fn highest_metascore(&self) -> Option<u8> {
@@ -675,6 +682,7 @@ pub struct CatalogueGameDetail {
     description: String,
     cover: Option<CatalogueCoverDescriptor>,
     has_local_cover: bool,
+    public_cover_url: Option<String>,
     video_url: Option<String>,
     platform_scores: Vec<CataloguePlatformScore>,
     developers: Vec<String>,
@@ -692,6 +700,7 @@ impl CatalogueGameDetail {
         description: impl Into<String>,
         cover: Option<CatalogueCoverDescriptor>,
         has_local_cover: bool,
+        public_cover_url: Option<String>,
         video_url: Option<String>,
         platform_scores: Vec<CataloguePlatformScore>,
         developers: Vec<String>,
@@ -706,6 +715,7 @@ impl CatalogueGameDetail {
             description: description.into(),
             cover,
             has_local_cover,
+            public_cover_url,
             video_url,
             platform_scores,
             developers,
@@ -737,6 +747,10 @@ impl CatalogueGameDetail {
 
     pub const fn has_local_cover(&self) -> bool {
         self.has_local_cover
+    }
+
+    pub fn public_cover_url(&self) -> Option<&str> {
+        self.public_cover_url.as_deref()
     }
 
     pub fn video_url(&self) -> Option<&str> {

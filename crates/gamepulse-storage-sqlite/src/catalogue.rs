@@ -44,6 +44,7 @@ impl SqliteGameCatalogueReadStore {
                     SELECT
                         games.source_product_id,
                         games.title,
+                        games.public_cover_url,
                         EXISTS (
                             SELECT 1
                             FROM game_cover_assets AS cover_assets
@@ -74,7 +75,7 @@ impl SqliteGameCatalogueReadStore {
                           )
                       )
                 )
-                SELECT source_product_id, title, has_local_cover, selected_metascore
+                SELECT source_product_id, title, public_cover_url, has_local_cover, selected_metascore
                 FROM catalogue_rows
                 ORDER BY
                     selected_metascore IS NULL ASC,
@@ -91,20 +92,22 @@ impl SqliteGameCatalogueReadStore {
                     Ok((
                         decode_source_product_id(row.get::<_, i64>(0)?)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)? != 0,
-                        row.get::<_, Option<u8>>(3)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                        row.get::<_, Option<u8>>(4)?,
                     ))
                 },
             )
             .map_err(GameCatalogueReadStoreError::database)?;
         let mut games = Vec::new();
         for row in rows {
-            let (source_product_id, title, has_local_cover, highest_metascore) =
+            let (source_product_id, title, public_cover_url, has_local_cover, highest_metascore) =
                 row.map_err(GameCatalogueReadStoreError::database)?;
             games.push(CatalogueGameCard::new(
                 source_product_id,
                 title,
                 has_local_cover,
+                public_cover_url,
                 highest_metascore,
                 self.platform_slugs(source_product_id)?,
                 self.developers(source_product_id)?,
@@ -132,6 +135,7 @@ impl SqliteGameCatalogueReadStore {
                     cover_filename,
                     cover_kind,
                     video_url,
+                    public_cover_url,
                     EXISTS (
                         SELECT 1
                         FROM game_cover_assets AS cover_assets
@@ -162,6 +166,7 @@ impl SqliteGameCatalogueReadStore {
             stored_game.description,
             stored_game.cover,
             stored_game.has_local_cover,
+            stored_game.public_cover_url,
             stored_game.video_url,
             platforms,
             developers,
@@ -447,6 +452,7 @@ struct StoredGame {
     description: String,
     cover: Option<CatalogueCoverDescriptor>,
     video_url: Option<String>,
+    public_cover_url: Option<String>,
     has_local_cover: bool,
 }
 
@@ -475,7 +481,8 @@ fn read_stored_game(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredGame> {
         description: row.get(3)?,
         cover,
         video_url: row.get(8)?,
-        has_local_cover: row.get::<_, i64>(9)? != 0,
+        public_cover_url: row.get(9)?,
+        has_local_cover: row.get::<_, i64>(10)? != 0,
     })
 }
 

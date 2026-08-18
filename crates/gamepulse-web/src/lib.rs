@@ -89,12 +89,13 @@ h3 { margin: 0; font-size: 1.05rem; letter-spacing: -0.012em; }
 .primary-button:hover { border-color: var(--primary); background: var(--primary); color: var(--canvas); }
 .results-heading { display: flex; align-items: end; justify-content: space-between; gap: 1rem; margin-bottom: 1.2rem; }
 .results-heading p { margin: 0; color: var(--muted); font-size: 0.9rem; text-align: right; }
-.game-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 1rem; margin: 0; padding: 0; list-style: none; }
-.game-card { height: 100%; padding: 1rem; border: 1px solid var(--line); border-radius: 1rem; background: var(--surface); }
+.game-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 1rem; margin: 0; padding: 0; list-style: none; align-items: stretch; }
+.game-grid > li { display: flex; min-width: 0; }
+.game-card { display: flex; width: 100%; height: 100%; padding: 1rem; border: 1px solid var(--line); border-radius: 1rem; background: var(--surface); flex-direction: column; }
 .game-card:hover, .game-card:focus-within, .similar-card:hover, .similar-card:focus-within { border-color: var(--line-strong); }
 .game-card__top { display: grid; grid-template-columns: 4.25rem minmax(0, 1fr); gap: 0.6rem 0.85rem; align-content: start; }
 .game-card__top > .cover-image, .game-card__top > .cover-placeholder { grid-column: 1; grid-row: 1 / span 2; align-self: start; }
-.game-card__top > div:not(.cover-placeholder):not(.score-badge) { grid-column: 2; grid-row: 1; min-width: 0; }
+.game-card__top > div:not(.cover-placeholder):not(.score-badge) { grid-column: 2; grid-row: 1; min-width: 0; min-height: 4.4rem; }
 .game-card__top > .score-badge { grid-column: 2; grid-row: 2; justify-self: start; }
 .game-card h3 { overflow-wrap: break-word; hyphens: auto; text-wrap: pretty; }
 .cover-placeholder { display: grid; width: 100%; min-height: 5.25rem; place-items: center; border: 1px solid var(--line-strong); border-radius: 0.7rem; background: var(--surface-raised); color: var(--primary); font-size: 1.25rem; font-weight: 850; letter-spacing: -0.07em; }
@@ -114,6 +115,7 @@ h3 { margin: 0; font-size: 1.05rem; letter-spacing: -0.012em; }
 .chip { padding: 0.28rem 0.5rem; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 0.78rem; font-weight: 700; line-height: 1.2; }
 .chip--platform { border-color: oklch(0.46 0.065 140); color: var(--primary); }
 .metadata { margin: 1.1rem 0 0; color: var(--muted); font-size: 0.85rem; line-height: 1.5; }
+.game-card > .metadata:last-child { margin-top: auto; padding-top: 1.1rem; }
 .metadata strong { color: var(--ink); }
 .empty-state { max-width: 38rem; padding: clamp(1.5rem, 4vw, 2.5rem); border: 1px dashed var(--line-strong); border-radius: 1rem; background: var(--surface); }
 .empty-state h2 { margin-bottom: 0.65rem; }
@@ -126,9 +128,10 @@ h3 { margin: 0; font-size: 1.05rem; letter-spacing: -0.012em; }
 .detail-hero h1 { max-width: 16ch; }
 .detail-hero .chip-list { margin-top: 1.25rem; }
 .detail-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(17rem, 0.85fr); gap: 1rem; margin-top: 1rem; align-items: start; }
+.detail-column { display: grid; min-width: 0; gap: 1rem; align-content: start; }
+.detail-related { margin-top: 1rem; }
 .content-section { padding: 1.25rem; border: 1px solid var(--line); border-radius: 1rem; background: var(--surface); }
 .content-section h2 { margin-bottom: 1rem; }
-.content-section--wide { grid-row: span 2; }
 .table-scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; text-align: left; }
 caption { margin-bottom: 0.75rem; color: var(--muted); font-size: 0.85rem; text-align: left; }
@@ -162,7 +165,6 @@ td:first-child { color: var(--ink); font-weight: 750; }
   .catalogue-controls, .detail-grid { grid-template-columns: 1fr; }
   .detail-hero { grid-template-columns: 1fr; }
   .cover-placeholder--large, .cover-image--large { width: 100%; min-height: 8rem; }
-  .content-section--wide { grid-row: auto; }
   .results-heading { align-items: flex-start; flex-direction: column; }
   .results-heading p { text-align: left; }
 }
@@ -554,9 +556,14 @@ fn decode_hex(value: u8) -> Option<u8> {
           <article class="game-card">
             <div class="game-card__top">
               {% if game.has_local_cover %}
-              <img class="cover-image" src="/games/{{ game.source_product_id }}/cover" alt="Cover for {{ game.title }}">
+              <img class="cover-image" src="/games/{{ game.source_product_id }}/cover" alt="Cover for {{ game.title }}" loading="lazy" decoding="async">
               {% else %}
+              {% match game.public_cover_url %}
+              {% when Some with (cover_url) %}
+              <img class="cover-image" src="{{ cover_url }}" alt="Cover for {{ game.title }}" loading="lazy" decoding="async" referrerpolicy="no-referrer">
+              {% when None %}
               <div class="cover-placeholder" aria-hidden="true">GP</div>
+              {% endmatch %}
               {% endif %}
               <div>
                 <h3><a class="game-title" href="/games/{{ game.source_product_id }}">{{ game.title }}</a></h3>
@@ -641,6 +648,7 @@ impl CatalogueTemplate {
                     source_product_id: game.source_product_id().value(),
                     title: game.title().to_owned(),
                     has_local_cover: game.has_local_cover(),
+                    public_cover_url: safe_cover_url(game.public_cover_url()),
                     highest_metascore: game.highest_metascore(),
                     platforms: game
                         .platforms()
@@ -664,6 +672,7 @@ struct CatalogueGameCardView {
     source_product_id: u64,
     title: String,
     has_local_cover: bool,
+    public_cover_url: Option<String>,
     highest_metascore: Option<u8>,
     platforms: Vec<String>,
     developers: Vec<String>,
@@ -697,8 +706,13 @@ struct CatalogueGameCardView {
           {% if game.has_local_cover %}
           <img class="cover-image cover-image--large" src="/games/{{ game.source_product_id }}/cover" alt="Cover for {{ game.title }}">
           {% else %}
+          {% match game.public_cover_url %}
+          {% when Some with (cover_url) %}
+          <img class="cover-image cover-image--large" src="{{ cover_url }}" alt="Cover for {{ game.title }}" referrerpolicy="no-referrer">
+          {% when None %}
           <div class="cover-placeholder cover-placeholder--large" aria-hidden="true">GP</div>
           <p class="cover-status">No stored cover image available.</p>
+          {% endmatch %}
           {% endif %}
         </div>
         <div class="detail-hero__copy">
@@ -715,7 +729,8 @@ struct CatalogueGameCardView {
         </div>
       </header>
       <div class="detail-grid">
-        <section class="content-section content-section--wide" aria-labelledby="platform-scores-title">
+        <div class="detail-column">
+        <section class="content-section" aria-labelledby="platform-scores-title">
           <h2 id="platform-scores-title">Platform scores</h2>
           {% if game.platform_scores.len() == 0 %}
           <p class="status-copy">No platform scores stored for this game yet.</p>
@@ -737,6 +752,24 @@ struct CatalogueGameCardView {
           </div>
           {% endif %}
         </section>
+        <section class="content-section" aria-labelledby="users-title">
+          <h2 id="users-title">What players said</h2>
+          {% match game.user_summary %}
+          {% when Some with (summary) %}
+            {% match summary.status %}
+            {% when ReviewSummaryStatus::Pending %}<p class="status-copy">Summary pending for the current stored review refresh.</p>
+            {% when ReviewSummaryStatus::Unavailable %}<p class="status-copy">Unavailable: no stored user excerpts.</p>
+            {% when ReviewSummaryStatus::Available %}
+            {% if summary.likes.len() > 0 %}<div class="summary-group"><h3>Praise</h3><ul class="summary-list">{% for item in summary.likes %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+            {% if summary.dislikes.len() > 0 %}<div class="summary-group"><h3>Criticism</h3><ul class="summary-list">{% for item in summary.dislikes %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+            {% if summary.mixed.len() > 0 %}<div class="summary-group"><h3>Mixed</h3><ul class="summary-list">{% for item in summary.mixed %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+            {% if summary.likes.len() == 0 && summary.dislikes.len() == 0 && summary.mixed.len() == 0 %}<p class="status-copy">Reviews were stored, but no clear highlights were available.</p>{% endif %}
+            {% endmatch %}
+          {% when None %}<p class="status-copy">No stored user review summary.</p>
+          {% endmatch %}
+        </section>
+        </div>
+        <div class="detail-column">
         <section class="content-section" aria-labelledby="video-title">
           <h2 id="video-title">Stored video</h2>
           {% match game.video %}
@@ -768,23 +801,9 @@ struct CatalogueGameCardView {
           {% when None %}<p class="status-copy">No stored critic review summary.</p>
           {% endmatch %}
         </section>
-        <section class="content-section" aria-labelledby="users-title">
-          <h2 id="users-title">What players said</h2>
-          {% match game.user_summary %}
-          {% when Some with (summary) %}
-            {% match summary.status %}
-            {% when ReviewSummaryStatus::Pending %}<p class="status-copy">Summary pending for the current stored review refresh.</p>
-            {% when ReviewSummaryStatus::Unavailable %}<p class="status-copy">Unavailable: no stored user excerpts.</p>
-            {% when ReviewSummaryStatus::Available %}
-            {% if summary.likes.len() > 0 %}<div class="summary-group"><h3>Praise</h3><ul class="summary-list">{% for item in summary.likes %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
-            {% if summary.dislikes.len() > 0 %}<div class="summary-group"><h3>Criticism</h3><ul class="summary-list">{% for item in summary.dislikes %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
-            {% if summary.mixed.len() > 0 %}<div class="summary-group"><h3>Mixed</h3><ul class="summary-list">{% for item in summary.mixed %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
-            {% if summary.likes.len() == 0 && summary.dislikes.len() == 0 && summary.mixed.len() == 0 %}<p class="status-copy">Reviews were stored, but no clear highlights were available.</p>{% endif %}
-            {% endmatch %}
-          {% when None %}<p class="status-copy">No stored user review summary.</p>
-          {% endmatch %}
-        </section>
-        <section class="content-section content-section--wide" aria-labelledby="similar-title">
+        </div>
+      </div>
+        <section class="content-section detail-related" aria-labelledby="similar-title">
           <h2 id="similar-title">Other games in this catalogue</h2>
           <p class="status-copy">Matched on a shared platform or studio, so genres may vary.</p>
           {% if game.similar_games.len() == 0 %}
@@ -797,7 +816,6 @@ struct CatalogueGameCardView {
           </ul>
           {% endif %}
         </section>
-      </div>
     </article>
   </main>
 </body>
@@ -818,6 +836,7 @@ impl GameDetailTemplate {
                 title: game.title().to_owned(),
                 description: game.description().to_owned(),
                 has_local_cover: game.has_local_cover(),
+                public_cover_url: safe_cover_url(game.public_cover_url()),
                 video: game.video_url().map(|value| CatalogueVideoView {
                     value: value.to_owned(),
                     is_safe_href: is_safe_http_link(value),
@@ -856,11 +875,22 @@ fn is_safe_http_link(value: &str) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
 }
 
+fn safe_cover_url(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| {
+            value
+                .get(..8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        })
+        .map(str::to_owned)
+}
+
 struct CatalogueGameDetailView {
     source_product_id: u64,
     title: String,
     description: String,
     has_local_cover: bool,
+    public_cover_url: Option<String>,
     video: Option<CatalogueVideoView>,
     platform_scores: Vec<CataloguePlatformScoreView>,
     developers: Vec<String>,

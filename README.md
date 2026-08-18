@@ -39,7 +39,7 @@ a video link for 4 of them; an omitted source value is shown as unavailable.
 | Process 20 games not processed today | Each durable run targets exactly 20 successful unique games. Daily state and source identities survive restart. |
 | Start each day with New Releases | The first daily selection uses New Releases. Later selections use the newest-first SEE ALL feed and persisted pagination. A new UTC day resets the sequence. |
 | Insert or update games | SQLite upserts the current game snapshot and refreshes source-derived review data. |
-| Title, cover, platforms, scores, developer, description, video | Covers are served from persisted local SQLite assets on the catalogue/detail pages. Missing or unavailable cover assets remain explicitly unavailable. |
+| Title, cover, platforms, scores, developer, description, video | Covers prefer persisted local SQLite assets. When local bytes are unavailable, the UI uses the persisted, source-validated HTTPS cover URL; otherwise it shows an explicit placeholder. |
 | Separate critic and user summaries | Reviews are fetched and stored separately. A local deterministic summarizer produces independent likes/dislikes summaries. |
 | Catalogue and game page | Implemented as server-rendered pages with assets embedded in the binary. |
 | Search, platform filter, rating sort | Implemented from persisted SQLite data; page requests do not call Metacritic. |
