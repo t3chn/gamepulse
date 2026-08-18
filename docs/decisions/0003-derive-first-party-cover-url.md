@@ -51,6 +51,14 @@ route serves the persisted bytes and allowlisted content type without exposing
 a source URL or descriptor in HTML. Repeat only while the preceding aggregate
 report proves a stored asset; stop at zero progress, no candidates, or failure.
 
+The versioned aggregate report records an `unavailable` total and only bounded
+`unavailable_reasons`: descriptor rejection, unexpected HTTP status class,
+unsupported or missing content type, signature mismatch, and invalid body. The
+reason-counter sum is the top-level unavailable total. It contains no status
+code, source identity, descriptor, URL, header, body, or per-item record. These
+counters are diagnostic evidence, not permission to retry, widen the source
+boundary, or make another run.
+
 ## Rollback
 
 Stop running `cover-backfill`. Existing local assets remain durable and can be

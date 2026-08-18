@@ -16,15 +16,15 @@ use axum::body::to_bytes;
 use axum::http::StatusCode;
 use axum::response::Response;
 use gamepulse_application::{
-    AsyncCoverImageSourcePort, CoverBackfillCandidate, CoverBackfillPersistOutcome,
-    CoverBackfillStorePort, CoverImageContentType, GameCoverDescriptor, GameDeveloper,
-    GamePlatformScore, GamePublicCoverUrl, GameSnapshot, GameVideoLink, Metascore, SourceProductId,
-    StoredCoverImage, Userscore, execute_cover_backfill, upsert_game_snapshot,
+    AsyncCoverImageSourcePort, CoverBackfillCandidate, CoverBackfillFetchOutcome,
+    CoverBackfillPersistOutcome, CoverBackfillStorePort, CoverBackfillUnavailableReason,
+    CoverImageContentType, GameCoverDescriptor, GameDeveloper, GamePlatformScore,
+    GamePublicCoverUrl, GameSnapshot, GameVideoLink, Metascore, SourceProductId, StoredCoverImage,
+    Userscore, execute_cover_backfill, upsert_game_snapshot,
 };
 use gamepulse_storage_sqlite::{
     SqliteGameCatalogueReadStore, SqliteGameCoverAssetStore, SqliteGameSnapshotStore,
 };
-use gamepulse_worker_source::{decode_local_cover_image, resolve_local_cover_source_url};
 
 static NEXT_TEMPORARY_DATABASE: AtomicU64 = AtomicU64::new(0);
 static NEXT_BROWSER_SMOKE_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -44,37 +44,36 @@ struct FixtureCoverSource {
 
 enum FixtureCoverResponse {
     Valid,
-    Oversized,
-    Unavailable,
+    InvalidBody,
+    DescriptorRejected,
 }
 
 impl AsyncCoverImageSourcePort for FixtureCoverSource {
     type Error = ();
     type FetchFuture<'a>
-        = Ready<Result<Option<StoredCoverImage>, Self::Error>>
+        = Ready<Result<CoverBackfillFetchOutcome, Self::Error>>
     where
         Self: 'a;
 
-    fn fetch_cover(&self, candidate: &CoverBackfillCandidate) -> Self::FetchFuture<'_> {
+    fn fetch_cover(&self, _candidate: &CoverBackfillCandidate) -> Self::FetchFuture<'_> {
         let response = self
             .responses
             .lock()
             .expect("fixture source lock must hold")
             .pop_front()
             .expect("fixture source response must exist");
-        let cover =
-            resolve_local_cover_source_url(candidate.descriptor()).and_then(|_| match response {
-                FixtureCoverResponse::Valid => {
-                    decode_local_cover_image(CoverImageContentType::Png, TEST_COVER_PNG.to_vec())
-                }
-                FixtureCoverResponse::Oversized => {
-                    let mut bytes = vec![0_u8; StoredCoverImage::MAX_BYTES + 1];
-                    bytes[..8].copy_from_slice(&TEST_COVER_PNG[..8]);
-                    decode_local_cover_image(CoverImageContentType::Png, bytes)
-                }
-                FixtureCoverResponse::Unavailable => None,
-            });
-        ready(Ok(cover))
+        ready(Ok(match response {
+            FixtureCoverResponse::Valid => CoverBackfillFetchOutcome::Stored(
+                StoredCoverImage::new(CoverImageContentType::Png, TEST_COVER_PNG.to_vec())
+                    .expect("fixture cover must be valid"),
+            ),
+            FixtureCoverResponse::InvalidBody => {
+                CoverBackfillFetchOutcome::Unavailable(CoverBackfillUnavailableReason::InvalidBody)
+            }
+            FixtureCoverResponse::DescriptorRejected => CoverBackfillFetchOutcome::Unavailable(
+                CoverBackfillUnavailableReason::DescriptorRejected,
+            ),
+        }))
     }
 }
 
@@ -667,7 +666,7 @@ async fn fixture_cover_backfill_flows_through_application_sqlite_reopen_and_loca
     let initial_source = FixtureCoverSource {
         responses: Mutex::new(VecDeque::from([
             FixtureCoverResponse::Valid,
-            FixtureCoverResponse::Oversized,
+            FixtureCoverResponse::InvalidBody,
         ])),
     };
     let initial = execute_cover_backfill(&mut assets, &initial_source, 20)
@@ -717,7 +716,7 @@ async fn fixture_cover_backfill_flows_through_application_sqlite_reopen_and_loca
     let mut assets =
         SqliteGameCoverAssetStore::open(&database.path).expect("asset store must reopen");
     let repeated_source = FixtureCoverSource {
-        responses: Mutex::new(VecDeque::from([FixtureCoverResponse::Unavailable])),
+        responses: Mutex::new(VecDeque::from([FixtureCoverResponse::DescriptorRejected])),
     };
     let repeated = execute_cover_backfill(&mut assets, &repeated_source, 20)
         .await

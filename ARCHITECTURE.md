@@ -372,8 +372,10 @@ rechecks the selected descriptor in one SQLite transaction so a late fetch canno
 newer descriptor. The catalogue and detail templates render `/games/{id}/cover` only when that
 eligible asset exists; the endpoint serves the SQLite bytes and fixed allowlisted MIME type. Page
 reads never contact a source, source URLs and descriptor fields never enter evaluator-facing HTML,
-and absent/failed covers retain the safe GP placeholder. This command is operationally opt-in and
-remains outside mandatory run settlement.
+and absent/failed covers retain the safe GP placeholder. Its versioned report emits only aggregate
+unavailable reason counters; the top-level unavailable total is derived from that fixed closed
+set, with no source-derived diagnostics. This command is operationally opt-in and remains outside
+mandatory run settlement.
 
 M013 adds local delivery readiness without changing the one-binary,
 one-process topology. `gamepulse-web` owns `GET /health/live` and

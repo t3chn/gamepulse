@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use gamepulse_application::{CoverImageContentType, GameCoverDescriptor, StoredCoverImage};
+use gamepulse_application::{
+    CoverBackfillUnavailableReason, CoverImageContentType, GameCoverDescriptor, StoredCoverImage,
+};
 use gamepulse_worker_source::{decode_local_cover_image, resolve_local_cover_source_url};
 
 const ONE_PIXEL_PNG: &[u8] = &[
@@ -39,8 +41,9 @@ fn rejects_an_unsafe_descriptor_or_mismatched_content_type() {
     )
     .expect("fixture descriptor must be structurally valid");
     assert!(resolve_local_cover_source_url(&descriptor).is_none());
-    assert!(
-        decode_local_cover_image(CoverImageContentType::Jpeg, ONE_PIXEL_PNG.to_vec()).is_none()
+    assert_eq!(
+        decode_local_cover_image(CoverImageContentType::Jpeg, ONE_PIXEL_PNG.to_vec()),
+        Err(CoverBackfillUnavailableReason::SignatureMismatch)
     );
 }
 
@@ -60,5 +63,8 @@ fn rejects_percent_encoded_or_ambiguous_descriptor_segments_and_oversized_fixtur
 
     let mut oversized = vec![0_u8; StoredCoverImage::MAX_BYTES + 1];
     oversized[..8].copy_from_slice(&ONE_PIXEL_PNG[..8]);
-    assert!(decode_local_cover_image(CoverImageContentType::Png, oversized).is_none());
+    assert_eq!(
+        decode_local_cover_image(CoverImageContentType::Png, oversized),
+        Err(CoverBackfillUnavailableReason::InvalidBody)
+    );
 }

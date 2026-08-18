@@ -173,7 +173,9 @@ pub trait CoverBackfillStorePort {
 /// Application-owned asynchronous source boundary for one already-selected cover descriptor.
 pub trait AsyncCoverImageSourcePort: Send + Sync {
     type Error;
-    type FetchFuture<'a>: Future<Output = Result<Option<StoredCoverImage>, Self::Error>> + Send + 'a
+    type FetchFuture<'a>: Future<Output = Result<CoverBackfillFetchOutcome, Self::Error>>
+        + Send
+        + 'a
     where
         Self: 'a;
 
@@ -183,12 +185,166 @@ pub trait AsyncCoverImageSourcePort: Send + Sync {
 /// One opt-in invocation cannot issue more than this many source requests.
 pub const MAX_COVER_BACKFILL_CANDIDATES: usize = 20;
 
+/// Safe status-class grouping for a cover response that was not exactly HTTP 200.
+///
+/// The report deliberately retains no raw status code or response text. A non-200 2xx response is
+/// still an unavailable outcome because the bounded image protocol requires exactly HTTP 200.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverBackfillHttpStatusClass {
+    Informational,
+    SuccessfulOther,
+    Redirection,
+    ClientError,
+    ServerError,
+    Other,
+}
+
+impl CoverBackfillHttpStatusClass {
+    pub const fn from_status(status: u16) -> Self {
+        match status {
+            100..=199 => Self::Informational,
+            200..=299 => Self::SuccessfulOther,
+            300..=399 => Self::Redirection,
+            400..=499 => Self::ClientError,
+            500..=599 => Self::ServerError,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Closed, aggregate-safe reasons why a selected cover did not yield a durable local asset.
+///
+/// Source adapters may map their local observations into this enum, but the coordinator owns the
+/// resulting counters. No variant contains a descriptor, URL, header value, body, or identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverBackfillUnavailableReason {
+    DescriptorRejected,
+    UnexpectedHttpStatus(CoverBackfillHttpStatusClass),
+    UnsupportedContentType,
+    SignatureMismatch,
+    InvalidBody,
+}
+
+/// The only non-error result a cover source adapter may return for a selected candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoverBackfillFetchOutcome {
+    Stored(StoredCoverImage),
+    Unavailable(CoverBackfillUnavailableReason),
+}
+
+/// Stable aggregate-only diagnostics for all unavailable cover outcomes in one invocation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CoverBackfillUnavailableReasons {
+    descriptor_rejected: usize,
+    http_informational: usize,
+    http_successful_other: usize,
+    http_redirection: usize,
+    http_client_error: usize,
+    http_server_error: usize,
+    http_other: usize,
+    unsupported_content_type: usize,
+    signature_mismatch: usize,
+    invalid_body: usize,
+}
+
+impl CoverBackfillUnavailableReasons {
+    pub const fn descriptor_rejected(self) -> usize {
+        self.descriptor_rejected
+    }
+
+    pub const fn http_informational(self) -> usize {
+        self.http_informational
+    }
+
+    pub const fn http_successful_other(self) -> usize {
+        self.http_successful_other
+    }
+
+    pub const fn http_redirection(self) -> usize {
+        self.http_redirection
+    }
+
+    pub const fn http_client_error(self) -> usize {
+        self.http_client_error
+    }
+
+    pub const fn http_server_error(self) -> usize {
+        self.http_server_error
+    }
+
+    pub const fn http_other(self) -> usize {
+        self.http_other
+    }
+
+    pub const fn unsupported_content_type(self) -> usize {
+        self.unsupported_content_type
+    }
+
+    pub const fn signature_mismatch(self) -> usize {
+        self.signature_mismatch
+    }
+
+    pub const fn invalid_body(self) -> usize {
+        self.invalid_body
+    }
+
+    /// The top-level unavailable count is derived from these counters, so the public invariant
+    /// cannot drift as new branches are recorded.
+    pub const fn total(self) -> usize {
+        self.descriptor_rejected
+            .saturating_add(self.http_informational)
+            .saturating_add(self.http_successful_other)
+            .saturating_add(self.http_redirection)
+            .saturating_add(self.http_client_error)
+            .saturating_add(self.http_server_error)
+            .saturating_add(self.http_other)
+            .saturating_add(self.unsupported_content_type)
+            .saturating_add(self.signature_mismatch)
+            .saturating_add(self.invalid_body)
+    }
+
+    fn record(&mut self, reason: CoverBackfillUnavailableReason) {
+        match reason {
+            CoverBackfillUnavailableReason::DescriptorRejected => {
+                self.descriptor_rejected = self.descriptor_rejected.saturating_add(1)
+            }
+            CoverBackfillUnavailableReason::UnexpectedHttpStatus(
+                CoverBackfillHttpStatusClass::Informational,
+            ) => self.http_informational = self.http_informational.saturating_add(1),
+            CoverBackfillUnavailableReason::UnexpectedHttpStatus(
+                CoverBackfillHttpStatusClass::SuccessfulOther,
+            ) => self.http_successful_other = self.http_successful_other.saturating_add(1),
+            CoverBackfillUnavailableReason::UnexpectedHttpStatus(
+                CoverBackfillHttpStatusClass::Redirection,
+            ) => self.http_redirection = self.http_redirection.saturating_add(1),
+            CoverBackfillUnavailableReason::UnexpectedHttpStatus(
+                CoverBackfillHttpStatusClass::ClientError,
+            ) => self.http_client_error = self.http_client_error.saturating_add(1),
+            CoverBackfillUnavailableReason::UnexpectedHttpStatus(
+                CoverBackfillHttpStatusClass::ServerError,
+            ) => self.http_server_error = self.http_server_error.saturating_add(1),
+            CoverBackfillUnavailableReason::UnexpectedHttpStatus(
+                CoverBackfillHttpStatusClass::Other,
+            ) => self.http_other = self.http_other.saturating_add(1),
+            CoverBackfillUnavailableReason::UnsupportedContentType => {
+                self.unsupported_content_type = self.unsupported_content_type.saturating_add(1)
+            }
+            CoverBackfillUnavailableReason::SignatureMismatch => {
+                self.signature_mismatch = self.signature_mismatch.saturating_add(1)
+            }
+            CoverBackfillUnavailableReason::InvalidBody => {
+                self.invalid_body = self.invalid_body.saturating_add(1)
+            }
+        }
+    }
+}
+
 /// Aggregate-only result of one bounded local-cover refresh invocation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CoverBackfillReport {
     attempted: usize,
     stored: usize,
-    unavailable: usize,
+    unavailable_reasons: CoverBackfillUnavailableReasons,
     stale: usize,
     already_current: usize,
     failed: usize,
@@ -204,7 +360,11 @@ impl CoverBackfillReport {
     }
 
     pub const fn unavailable(self) -> usize {
-        self.unavailable
+        self.unavailable_reasons.total()
+    }
+
+    pub const fn unavailable_reasons(self) -> CoverBackfillUnavailableReasons {
+        self.unavailable_reasons
     }
 
     pub const fn stale(self) -> usize {
@@ -230,10 +390,30 @@ impl CoverBackfillReport {
 
     pub fn to_json(self) -> String {
         format!(
-            "{{\"schema_version\":\"gamepulse.cover_backfill.v2\",\"attempted\":{},\"stored\":{},\"unavailable\":{},\"stale\":{},\"already_current\":{},\"failed\":{},\"made_progress\":{}}}",
+            concat!(
+                "{{\"schema_version\":\"gamepulse.cover_backfill.v3\",",
+                "\"attempted\":{},\"stored\":{},\"unavailable\":{},",
+                "\"unavailable_reasons\":{{",
+                "\"descriptor_rejected\":{},",
+                "\"unexpected_http_status\":{{",
+                "\"informational\":{},\"successful_other\":{},\"redirection\":{},",
+                "\"client_error\":{},\"server_error\":{},\"other\":{}}},",
+                "\"unsupported_content_type\":{},\"signature_mismatch\":{},\"invalid_body\":{}}},",
+                "\"stale\":{},\"already_current\":{},\"failed\":{},\"made_progress\":{}}}"
+            ),
             self.attempted,
             self.stored,
-            self.unavailable,
+            self.unavailable(),
+            self.unavailable_reasons.descriptor_rejected,
+            self.unavailable_reasons.http_informational,
+            self.unavailable_reasons.http_successful_other,
+            self.unavailable_reasons.http_redirection,
+            self.unavailable_reasons.http_client_error,
+            self.unavailable_reasons.http_server_error,
+            self.unavailable_reasons.http_other,
+            self.unavailable_reasons.unsupported_content_type,
+            self.unavailable_reasons.signature_mismatch,
+            self.unavailable_reasons.invalid_body,
             self.stale,
             self.already_current,
             self.failed,
@@ -273,19 +453,23 @@ where
     for candidate in candidates {
         report.attempted = report.attempted.saturating_add(1);
         match source.fetch_cover(&candidate).await {
-            Ok(Some(cover)) => match store.store_cover_if_current(&candidate, &cover) {
-                Ok(CoverBackfillPersistOutcome::Stored) => {
-                    report.stored = report.stored.saturating_add(1)
+            Ok(CoverBackfillFetchOutcome::Stored(cover)) => {
+                match store.store_cover_if_current(&candidate, &cover) {
+                    Ok(CoverBackfillPersistOutcome::Stored) => {
+                        report.stored = report.stored.saturating_add(1)
+                    }
+                    Ok(CoverBackfillPersistOutcome::AlreadyCurrent) => {
+                        report.already_current = report.already_current.saturating_add(1)
+                    }
+                    Ok(CoverBackfillPersistOutcome::Stale) => {
+                        report.stale = report.stale.saturating_add(1)
+                    }
+                    Err(_) => report.failed = report.failed.saturating_add(1),
                 }
-                Ok(CoverBackfillPersistOutcome::AlreadyCurrent) => {
-                    report.already_current = report.already_current.saturating_add(1)
-                }
-                Ok(CoverBackfillPersistOutcome::Stale) => {
-                    report.stale = report.stale.saturating_add(1)
-                }
-                Err(_) => report.failed = report.failed.saturating_add(1),
-            },
-            Ok(None) => report.unavailable = report.unavailable.saturating_add(1),
+            }
+            Ok(CoverBackfillFetchOutcome::Unavailable(reason)) => {
+                report.unavailable_reasons.record(reason)
+            }
             Err(_) => report.failed = report.failed.saturating_add(1),
         }
     }
@@ -3780,13 +3964,13 @@ mod tests {
     }
 
     struct FixtureSource {
-        responses: Mutex<VecDeque<Result<Option<StoredCoverImage>, ()>>>,
+        responses: Mutex<VecDeque<Result<CoverBackfillFetchOutcome, ()>>>,
     }
 
     impl AsyncCoverImageSourcePort for FixtureSource {
         type Error = ();
         type FetchFuture<'a>
-            = Ready<Result<Option<StoredCoverImage>, Self::Error>>
+            = Ready<Result<CoverBackfillFetchOutcome, Self::Error>>
         where
             Self: 'a;
 
@@ -3827,31 +4011,126 @@ mod tests {
     }
 
     #[test]
-    fn bounded_cover_backfill_is_application_owned_and_reports_repeat_stop_condition() {
+    fn cover_backfill_report_counts_each_unavailable_reason_without_identity_leakage() {
         let image = StoredCoverImage::new(CoverImageContentType::Png, vec![1])
             .expect("test image must be valid");
         let mut store = FixtureStore {
-            candidates: vec![candidate(101, "a.png"), candidate(102, "b.png")],
-            outcomes: VecDeque::from([CoverBackfillPersistOutcome::Stored]),
+            candidates: (0..14)
+                .map(|offset| candidate(4_242 + offset, "private-cover-name.png"))
+                .collect(),
+            outcomes: VecDeque::from([
+                CoverBackfillPersistOutcome::Stored,
+                CoverBackfillPersistOutcome::Stale,
+                CoverBackfillPersistOutcome::AlreadyCurrent,
+            ]),
         };
         let source = FixtureSource {
-            responses: Mutex::new(VecDeque::from([Ok(Some(image)), Ok(None)])),
+            responses: Mutex::new(VecDeque::from([
+                Ok(CoverBackfillFetchOutcome::Stored(image.clone())),
+                Ok(CoverBackfillFetchOutcome::Unavailable(
+                    CoverBackfillUnavailableReason::DescriptorRejected,
+                )),
+                Ok(CoverBackfillFetchOutcome::Unavailable(
+                    CoverBackfillUnavailableReason::UnexpectedHttpStatus(
+                        CoverBackfillHttpStatusClass::Informational,
+                    ),
+                )),
+                Ok(CoverBackfillFetchOutcome::Unavailable(
+                    CoverBackfillUnavailableReason::UnexpectedHttpStatus(
+                        CoverBackfillHttpStatusClass::SuccessfulOther,
+                    ),
+                )),
+                Ok(CoverBackfillFetchOutcome::Unavailable(
+                    CoverBackfillUnavailableReason::UnexpectedHttpStatus(
+                        CoverBackfillHttpStatusClass::Redirection,
+                    ),
+                )),
+                Ok(CoverBackfillFetchOutcome::Unavailable(
+                    CoverBackfillUnavailableReason::UnexpectedHttpStatus(
+                        CoverBackfillHttpStatusClass::ClientError,
+                    ),
+                )),
+                Ok(CoverBackfillFetchOutcome::Unavailable(
+                    CoverBackfillUnavailableReason::UnexpectedHttpStatus(
+                        CoverBackfillHttpStatusClass::ServerError,
+                    ),
+                )),
+                Ok(CoverBackfillFetchOutcome::Unavailable(
+                    CoverBackfillUnavailableReason::UnexpectedHttpStatus(
+                        CoverBackfillHttpStatusClass::Other,
+                    ),
+                )),
+                Ok(CoverBackfillFetchOutcome::Unavailable(
+                    CoverBackfillUnavailableReason::UnsupportedContentType,
+                )),
+                Ok(CoverBackfillFetchOutcome::Unavailable(
+                    CoverBackfillUnavailableReason::SignatureMismatch,
+                )),
+                Ok(CoverBackfillFetchOutcome::Unavailable(
+                    CoverBackfillUnavailableReason::InvalidBody,
+                )),
+                Ok(CoverBackfillFetchOutcome::Stored(image.clone())),
+                Ok(CoverBackfillFetchOutcome::Stored(image)),
+                Err(()),
+            ])),
         };
 
         let report = block_on(execute_cover_backfill(&mut store, &source, 20))
             .expect("application coordinator must complete");
 
-        assert_eq!(report.attempted(), 2);
+        assert_eq!(report.attempted(), 14);
         assert_eq!(report.stored(), 1);
-        assert_eq!(report.unavailable(), 1);
-        assert_eq!(report.failed(), 0);
+        assert_eq!(report.unavailable(), 10);
+        assert_eq!(report.unavailable(), report.unavailable_reasons().total());
+        assert_eq!(report.stale(), 1);
+        assert_eq!(report.already_current(), 1);
+        assert_eq!(report.failed(), 1);
         assert!(report.made_progress());
-        assert_eq!(report.exit_code(), 0);
-        assert!(report.to_json().contains("\"made_progress\":true"));
+        assert_eq!(report.exit_code(), 1);
+        assert_eq!(
+            report.to_json(),
+            concat!(
+                "{\"schema_version\":\"gamepulse.cover_backfill.v3\",",
+                "\"attempted\":14,\"stored\":1,\"unavailable\":10,",
+                "\"unavailable_reasons\":{",
+                "\"descriptor_rejected\":1,",
+                "\"unexpected_http_status\":{",
+                "\"informational\":1,\"successful_other\":1,\"redirection\":1,",
+                "\"client_error\":1,\"server_error\":1,\"other\":1},",
+                "\"unsupported_content_type\":1,\"signature_mismatch\":1,\"invalid_body\":1},",
+                "\"stale\":1,\"already_current\":1,\"failed\":1,\"made_progress\":true}"
+            )
+        );
+        for prohibited in [
+            "4242",
+            "private-cover-name.png",
+            "/provider/",
+            "https://",
+            "metacritic.com",
+            "source_product_id",
+            "cookie",
+            "header",
+        ] {
+            assert!(!report.to_json().contains(prohibited));
+        }
+    }
 
+    #[test]
+    fn cover_backfill_reports_no_candidates_without_progress() {
+        let mut store = FixtureStore::default();
+        let source = FixtureSource {
+            responses: Mutex::new(VecDeque::new()),
+        };
         let repeated = block_on(execute_cover_backfill(&mut store, &source, 20))
             .expect("empty repeat must complete");
         assert_eq!(repeated.attempted(), 0);
+        assert_eq!(repeated.unavailable(), 0);
+        assert_eq!(
+            repeated.unavailable(),
+            repeated.unavailable_reasons().total()
+        );
+        assert_eq!(repeated.failed(), 0);
+        assert_eq!(repeated.exit_code(), 0);
         assert!(!repeated.made_progress());
     }
 

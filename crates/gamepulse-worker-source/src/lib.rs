@@ -23,8 +23,9 @@ use serde_json::Value;
 
 use gamepulse_application::{
     AsyncCoverImageSourcePort, AsyncDailyCrawlSourcePort, AsyncReviewSourceIngestionPort,
-    AsyncSourceIngestionPort, CoverBackfillCandidate, CoverImageContentType, CrawlDayKey,
-    CrawlDiscoveryRequest, DailyCrawlOutcome, DailyCrawlStatePort, DiscoveryCandidate,
+    AsyncSourceIngestionPort, CoverBackfillCandidate, CoverBackfillFetchOutcome,
+    CoverBackfillHttpStatusClass, CoverBackfillUnavailableReason, CoverImageContentType,
+    CrawlDayKey, CrawlDiscoveryRequest, DailyCrawlOutcome, DailyCrawlStatePort, DiscoveryCandidate,
     DiscoveryPage, DurableRunDiscovery, DurableRunProgressOutcome, DurableRunProgressStore,
     GameReviewRefresh, GameReviewRefreshStore, GameSnapshotStore, JobHandler, JobHandlerFailure,
     JobHandlerFuture, JobHandlerResult, ReviewInput, ReviewPolarity, ReviewSourceIngestion,
@@ -2361,14 +2362,17 @@ impl MetacriticCoverImageClient {
 
     /// Resolve and fetch one strictly allowlisted descriptor with no redirect or retry.
     ///
-    /// A malformed descriptor, non-success status, non-image content type, or invalid body is an
-    /// explicit optional absence. Transport failure is opaque to keep the command aggregate-only.
+    /// A malformed descriptor, non-200 status, unsupported content type, or invalid body maps to
+    /// one fixed application-owned unavailable reason. Transport and body-limit failures remain
+    /// opaque errors so the coordinator preserves their distinct `failed` semantics.
     async fn fetch(
         &self,
         descriptor: &GameCoverDescriptor,
-    ) -> Result<Option<StoredCoverImage>, CoverImageFetchError> {
+    ) -> Result<CoverBackfillFetchOutcome, CoverImageFetchError> {
         let Some(url) = resolve_local_cover_source_url(descriptor) else {
-            return Ok(None);
+            return Ok(CoverBackfillFetchOutcome::Unavailable(
+                CoverBackfillUnavailableReason::DescriptorRejected,
+            ));
         };
         let mut response = self
             .http
@@ -2377,15 +2381,18 @@ impl MetacriticCoverImageClient {
             .await
             .map_err(|_| CoverImageFetchError)?;
         if response.status() != StatusCode::OK {
-            return Ok(None);
+            return Ok(CoverBackfillFetchOutcome::Unavailable(
+                unexpected_cover_status_reason(response.status().as_u16()),
+            ));
         }
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_cover_content_type);
-        let Some(content_type) = content_type else {
-            return Ok(None);
+        let content_type = match parse_cover_content_type(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+        ) {
+            Ok(content_type) => content_type,
+            Err(reason) => return Ok(CoverBackfillFetchOutcome::Unavailable(reason)),
         };
         let capacity = match response.content_length() {
             Some(value) => usize::try_from(value)
@@ -2404,14 +2411,17 @@ impl MetacriticCoverImageClient {
             bytes.reserve(length.saturating_sub(bytes.len()));
             bytes.extend_from_slice(chunk.as_ref());
         }
-        Ok(decode_local_cover_image(content_type, bytes))
+        match decode_local_cover_image(content_type, bytes) {
+            Ok(cover) => Ok(CoverBackfillFetchOutcome::Stored(cover)),
+            Err(reason) => Ok(CoverBackfillFetchOutcome::Unavailable(reason)),
+        }
     }
 }
 
 impl AsyncCoverImageSourcePort for MetacriticCoverImageClient {
     type Error = CoverImageFetchError;
     type FetchFuture<'a>
-        = Pin<Box<dyn Future<Output = Result<Option<StoredCoverImage>, Self::Error>> + Send + 'a>>
+        = Pin<Box<dyn Future<Output = Result<CoverBackfillFetchOutcome, Self::Error>> + Send + 'a>>
     where
         Self: 'a;
 
@@ -2421,22 +2431,37 @@ impl AsyncCoverImageSourcePort for MetacriticCoverImageClient {
     }
 }
 
-fn parse_cover_content_type(value: &str) -> Option<CoverImageContentType> {
-    CoverImageContentType::parse(
-        value
-            .split(';')
-            .next()?
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-    )
+fn unexpected_cover_status_reason(status: u16) -> CoverBackfillUnavailableReason {
+    CoverBackfillUnavailableReason::UnexpectedHttpStatus(CoverBackfillHttpStatusClass::from_status(
+        status,
+    ))
+}
+
+fn parse_cover_content_type(
+    value: Option<&str>,
+) -> Result<CoverImageContentType, CoverBackfillUnavailableReason> {
+    value
+        .and_then(|value| {
+            CoverImageContentType::parse(
+                value
+                    .split(';')
+                    .next()?
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+            )
+        })
+        .ok_or(CoverBackfillUnavailableReason::UnsupportedContentType)
 }
 
 /// Accept a local asset only when its allowlisted declared type and file signature agree.
 pub fn decode_local_cover_image(
     content_type: CoverImageContentType,
     bytes: Vec<u8>,
-) -> Option<StoredCoverImage> {
+) -> Result<StoredCoverImage, CoverBackfillUnavailableReason> {
+    if bytes.is_empty() {
+        return Err(CoverBackfillUnavailableReason::InvalidBody);
+    }
     let signature_matches = match content_type {
         CoverImageContentType::Jpeg => bytes.starts_with(&[0xff, 0xd8, 0xff]),
         CoverImageContentType::Png => bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]),
@@ -2444,9 +2469,10 @@ pub fn decode_local_cover_image(
             bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice())
         }
     };
-    signature_matches
-        .then(|| StoredCoverImage::new(content_type, bytes))
-        .flatten()
+    if !signature_matches {
+        return Err(CoverBackfillUnavailableReason::SignatureMismatch);
+    }
+    StoredCoverImage::new(content_type, bytes).ok_or(CoverBackfillUnavailableReason::InvalidBody)
 }
 
 impl MetacriticPublicHtmlTransport {
@@ -3982,6 +4008,43 @@ mod tests {
         assert_eq!(
             classify_source_ingestion_handler_failure("untrusted diagnostic input"),
             SourceIngestionFailureCategory::OtherMandatoryStage
+        );
+    }
+
+    #[test]
+    fn local_cover_adapter_maps_only_bounded_unavailable_reasons() {
+        for (status, expected) in [
+            (100, CoverBackfillHttpStatusClass::Informational),
+            (204, CoverBackfillHttpStatusClass::SuccessfulOther),
+            (302, CoverBackfillHttpStatusClass::Redirection),
+            (404, CoverBackfillHttpStatusClass::ClientError),
+            (503, CoverBackfillHttpStatusClass::ServerError),
+            (0, CoverBackfillHttpStatusClass::Other),
+        ] {
+            assert_eq!(
+                unexpected_cover_status_reason(status),
+                CoverBackfillUnavailableReason::UnexpectedHttpStatus(expected)
+            );
+        }
+        assert_eq!(
+            parse_cover_content_type(None),
+            Err(CoverBackfillUnavailableReason::UnsupportedContentType)
+        );
+        assert_eq!(
+            parse_cover_content_type(Some("text/plain")),
+            Err(CoverBackfillUnavailableReason::UnsupportedContentType)
+        );
+        assert_eq!(
+            parse_cover_content_type(Some("image/png; charset=binary")),
+            Ok(CoverImageContentType::Png)
+        );
+        assert_eq!(
+            decode_local_cover_image(CoverImageContentType::Png, Vec::new()),
+            Err(CoverBackfillUnavailableReason::InvalidBody)
+        );
+        assert_eq!(
+            decode_local_cover_image(CoverImageContentType::Png, vec![1]),
+            Err(CoverBackfillUnavailableReason::SignatureMismatch)
         );
     }
 

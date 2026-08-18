@@ -133,7 +133,7 @@ Existing databases are upgraded forward without deleting game records. Covers
 are acquired only through the explicit, bounded operator command; normal page
 reads, the demo, and mandatory source runs never request an image. It attempts
 at most 20 existing valid cover descriptors, follows no redirects, retries
-nothing, and prints an aggregate-only report:
+nothing, and prints an aggregate-only v3 report:
 
 ```bash
 cargo run --locked --offline -p gamepulse -- cover-backfill \
@@ -146,7 +146,12 @@ catalogue and detail page show the accessible GP placeholder; stored assets are
 served through GamePulse and no upstream image URL or source descriptor is put
 in page HTML. Repeat only when the prior aggregate report has `stored > 0`.
 Stop when it reports no candidates, zero progress, or any failure; do not turn
-this into an automatic retry loop.
+this into an automatic retry loop. The nested `unavailable_reasons` counters
+separate descriptor rejection, bounded unexpected HTTP status classes,
+unsupported or missing content type, signature mismatch, and invalid body.
+They are aggregate diagnostic evidence only: they contain no per-game or
+source data and do not authorize a retry, a wider source allowlist, or a new
+run.
 
 Health endpoints:
 
