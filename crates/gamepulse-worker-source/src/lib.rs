@@ -2326,12 +2326,6 @@ pub struct MetacriticPublicHtmlResponse {
     response: Option<reqwest::Response>,
 }
 
-/// Bounded direct-image client used only by the explicit local-cover backfill command.
-#[derive(Clone)]
-pub struct MetacriticCoverImageClient {
-    http: Client,
-}
-
 #[derive(Debug)]
 pub struct CoverImageFetchError;
 
@@ -2343,7 +2337,123 @@ impl fmt::Display for CoverImageFetchError {
 
 impl std::error::Error for CoverImageFetchError {}
 
-impl MetacriticCoverImageClient {
+/// Header-first response boundary for the explicit bounded local-cover acquisition path.
+///
+/// Implementations must fail their body future before retaining more than
+/// `StoredCoverImage::MAX_BYTES`; the client repeats that limit check before decoding as a
+/// defense-in-depth boundary.
+pub trait CoverImageHttpResponse: Send {
+    type ReadBodyError;
+    type ReadBodyFuture<'a>: Future<Output = Result<Vec<u8>, Self::ReadBodyError>> + Send + 'a
+    where
+        Self: 'a;
+
+    fn status(&self) -> u16;
+
+    fn content_type(&self) -> Option<&str>;
+
+    fn content_length(&self) -> Option<u64>;
+
+    fn read_body(&mut self) -> Self::ReadBodyFuture<'_>;
+}
+
+/// Narrow transport boundary for deterministic cover response classification.
+///
+/// The source adapter supplies URLs only after its own descriptor resolver accepts them. The
+/// application never receives a URL, transport error detail, response body, or header value.
+pub trait CoverImageHttpTransport: Send + Sync {
+    type Error;
+    type Response: CoverImageHttpResponse<ReadBodyError = Self::Error>;
+    type FetchFuture<'a>: Future<Output = Result<Self::Response, Self::Error>> + Send + 'a
+    where
+        Self: 'a;
+
+    fn fetch_cover(&self, url: &GamePublicCoverUrl) -> Self::FetchFuture<'_>;
+
+    fn body_limit_error(&self) -> Self::Error;
+}
+
+/// Production no-redirect/no-retry transport for a strictly resolved cover image.
+#[derive(Clone)]
+pub struct ReqwestCoverImageTransport {
+    http: Client,
+}
+
+pub struct ReqwestCoverImageResponse {
+    response: reqwest::Response,
+}
+
+impl CoverImageHttpResponse for ReqwestCoverImageResponse {
+    type ReadBodyError = CoverImageFetchError;
+    type ReadBodyFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<Vec<u8>, Self::ReadBodyError>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn status(&self) -> u16 {
+        self.response.status().as_u16()
+    }
+
+    fn content_type(&self) -> Option<&str> {
+        self.response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    fn content_length(&self) -> Option<u64> {
+        self.response.content_length()
+    }
+
+    fn read_body(&mut self) -> Self::ReadBodyFuture<'_> {
+        Box::pin(async move {
+            let capacity = cover_image_body_capacity(self.response.content_length())?;
+            let mut bytes = Vec::with_capacity(capacity);
+            while let Some(chunk) = self
+                .response
+                .chunk()
+                .await
+                .map_err(|_| CoverImageFetchError)?
+            {
+                append_cover_image_chunk(&mut bytes, chunk.as_ref())?;
+            }
+            Ok(bytes)
+        })
+    }
+}
+
+impl CoverImageHttpTransport for ReqwestCoverImageTransport {
+    type Error = CoverImageFetchError;
+    type Response = ReqwestCoverImageResponse;
+    type FetchFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn fetch_cover(&self, url: &GamePublicCoverUrl) -> Self::FetchFuture<'_> {
+        let url = url.clone();
+        Box::pin(async move {
+            self.http
+                .get(url.as_str())
+                .send()
+                .await
+                .map(|response| ReqwestCoverImageResponse { response })
+                .map_err(|_| CoverImageFetchError)
+        })
+    }
+
+    fn body_limit_error(&self) -> Self::Error {
+        CoverImageFetchError
+    }
+}
+
+/// Bounded direct-image client used only by the explicit local-cover backfill command.
+#[derive(Clone)]
+pub struct MetacriticCoverImageClient<T = ReqwestCoverImageTransport> {
+    transport: T,
+}
+
+impl MetacriticCoverImageClient<ReqwestCoverImageTransport> {
     pub fn new() -> Result<Self, CoverImageFetchError> {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2357,7 +2467,16 @@ impl MetacriticCoverImageClient {
             .timeout(COVER_IMAGE_REQUEST_TIMEOUT)
             .build()
             .map_err(|_| CoverImageFetchError)?;
-        Ok(Self { http })
+        Ok(Self::with_transport(ReqwestCoverImageTransport { http }))
+    }
+}
+
+impl<T> MetacriticCoverImageClient<T>
+where
+    T: CoverImageHttpTransport,
+{
+    pub fn with_transport(transport: T) -> Self {
+        Self { transport }
     }
 
     /// Resolve and fetch one strictly allowlisted descriptor with no redirect or retry.
@@ -2368,48 +2487,28 @@ impl MetacriticCoverImageClient {
     async fn fetch(
         &self,
         descriptor: &GameCoverDescriptor,
-    ) -> Result<CoverBackfillFetchOutcome, CoverImageFetchError> {
+    ) -> Result<CoverBackfillFetchOutcome, T::Error> {
         let Some(url) = resolve_local_cover_source_url(descriptor) else {
             return Ok(CoverBackfillFetchOutcome::Unavailable(
                 CoverBackfillUnavailableReason::DescriptorRejected,
             ));
         };
-        let mut response = self
-            .http
-            .get(url.as_str())
-            .send()
-            .await
-            .map_err(|_| CoverImageFetchError)?;
-        if response.status() != StatusCode::OK {
+        let mut response = self.transport.fetch_cover(&url).await?;
+        if response.status() != StatusCode::OK.as_u16() {
             return Ok(CoverBackfillFetchOutcome::Unavailable(
-                unexpected_cover_status_reason(response.status().as_u16()),
+                unexpected_cover_status_reason(response.status()),
             ));
         }
-        let content_type = match parse_cover_content_type(
-            response
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-        ) {
+        let content_type = match parse_cover_content_type(response.content_type()) {
             Ok(content_type) => content_type,
             Err(reason) => return Ok(CoverBackfillFetchOutcome::Unavailable(reason)),
         };
-        let capacity = match response.content_length() {
-            Some(value) => usize::try_from(value)
-                .ok()
-                .filter(|value| *value <= StoredCoverImage::MAX_BYTES)
-                .ok_or(CoverImageFetchError)?,
-            None => 0,
-        };
-        let mut bytes = Vec::with_capacity(capacity);
-        while let Some(chunk) = response.chunk().await.map_err(|_| CoverImageFetchError)? {
-            let length = bytes
-                .len()
-                .checked_add(chunk.len())
-                .filter(|value| *value <= StoredCoverImage::MAX_BYTES)
-                .ok_or(CoverImageFetchError)?;
-            bytes.reserve(length.saturating_sub(bytes.len()));
-            bytes.extend_from_slice(chunk.as_ref());
+        if !cover_image_length_is_bounded(response.content_length()) {
+            return Err(self.transport.body_limit_error());
+        }
+        let bytes = response.read_body().await?;
+        if bytes.len() > StoredCoverImage::MAX_BYTES {
+            return Err(self.transport.body_limit_error());
         }
         match decode_local_cover_image(content_type, bytes) {
             Ok(cover) => Ok(CoverBackfillFetchOutcome::Stored(cover)),
@@ -2418,8 +2517,12 @@ impl MetacriticCoverImageClient {
     }
 }
 
-impl AsyncCoverImageSourcePort for MetacriticCoverImageClient {
-    type Error = CoverImageFetchError;
+impl<T> AsyncCoverImageSourcePort for MetacriticCoverImageClient<T>
+where
+    T: CoverImageHttpTransport + 'static,
+    T::Error: Send + 'static,
+{
+    type Error = T::Error;
     type FetchFuture<'a>
         = Pin<Box<dyn Future<Output = Result<CoverBackfillFetchOutcome, Self::Error>> + Send + 'a>>
     where
@@ -2429,6 +2532,35 @@ impl AsyncCoverImageSourcePort for MetacriticCoverImageClient {
         let descriptor = candidate.descriptor().clone();
         Box::pin(async move { self.fetch(&descriptor).await })
     }
+}
+
+fn cover_image_body_capacity(content_length: Option<u64>) -> Result<usize, CoverImageFetchError> {
+    let Some(content_length) = content_length else {
+        return Ok(0);
+    };
+    let content_length = usize::try_from(content_length).map_err(|_| CoverImageFetchError)?;
+    (content_length <= StoredCoverImage::MAX_BYTES)
+        .then_some(content_length)
+        .ok_or(CoverImageFetchError)
+}
+
+fn append_cover_image_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), CoverImageFetchError> {
+    let length = body
+        .len()
+        .checked_add(chunk.len())
+        .filter(|value| *value <= StoredCoverImage::MAX_BYTES)
+        .ok_or(CoverImageFetchError)?;
+    body.reserve(length.saturating_sub(body.len()));
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn cover_image_length_is_bounded(content_length: Option<u64>) -> bool {
+    content_length.is_none_or(|content_length| {
+        usize::try_from(content_length)
+            .ok()
+            .is_some_and(|content_length| content_length <= StoredCoverImage::MAX_BYTES)
+    })
 }
 
 fn unexpected_cover_status_reason(status: u16) -> CoverBackfillUnavailableReason {
@@ -2454,7 +2586,8 @@ fn parse_cover_content_type(
         .ok_or(CoverBackfillUnavailableReason::UnsupportedContentType)
 }
 
-/// Accept a local asset only when its allowlisted declared type and file signature agree.
+/// Accept a transport-size-bounded local asset only when its declared type and file signature
+/// agree. Oversized bodies must be rejected by the transport path before this helper is called.
 pub fn decode_local_cover_image(
     content_type: CoverImageContentType,
     bytes: Vec<u8>,
@@ -4046,6 +4179,15 @@ mod tests {
             decode_local_cover_image(CoverImageContentType::Png, vec![1]),
             Err(CoverBackfillUnavailableReason::SignatureMismatch)
         );
+        assert!(matches!(
+            cover_image_body_capacity(Some((StoredCoverImage::MAX_BYTES + 1) as u64)),
+            Err(CoverImageFetchError)
+        ));
+        let mut body = vec![0_u8; StoredCoverImage::MAX_BYTES];
+        assert!(matches!(
+            append_cover_image_chunk(&mut body, &[0]),
+            Err(CoverImageFetchError)
+        ));
     }
 
     fn assert_request(url: Url, expected_path: &str, expected_pairs: &[(&str, &str)]) {

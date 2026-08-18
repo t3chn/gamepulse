@@ -9,7 +9,7 @@ pub const COVER_BACKFILL_SUBCOMMAND: &str = "cover-backfill";
 pub const COVER_BACKFILL_HELP: &str = concat!(
     "Usage:\n",
     "  gamepulse cover-backfill --database <ABSOLUTE_DATABASE_PATH> [--limit 20]\n\n",
-    "Fetch at most 20 missing local cover assets from already persisted, validated source descriptors.\n",
+    "Select at most 20 persisted cover records; missing or rejected descriptors are reported without a request.\n",
     "The command never deletes database records, retries requests, or starts the HTTP server.\n\n",
     "Repeat only after a report with stored > 0; stop at zero progress, no candidates, or failure.\n\n",
     "Options:\n",

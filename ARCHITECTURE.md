@@ -362,12 +362,15 @@ run boundary is independent of optional cover results; a cover failure neither
 changes candidate acceptance nor source progression.
 
 Local cover delivery retains the source descriptor only as durable source data. The application
-owns the bounded `cover-backfill` coordinator, aggregate report, and exit policy; the binary only
-wires its SQLite and source adapters. It resolves the exact observed `catalog` / `cardImage` /
-`/provider/` descriptor shape, rejects encoded or ambiguous segments, fetches at most 20 missing
-or stale images with no redirect or retry, and persists only size-bounded JPEG/PNG/WebP bytes
-whose declared type matches their signature. Every local asset carries a versioned descriptor
-fingerprint. A snapshot replacement atomically invalidates a mismatched asset, and persistence
+owns the bounded `cover-backfill` selection outcomes, coordinator, aggregate report, and exit
+policy; the binary only wires its SQLite and source adapters. SQLite maps a selected missing or
+rejected descriptor to an identity-free unavailable outcome, so it consumes the bounded attempt
+without a source request. The source adapter resolves the exact observed `catalog` / `cardImage` /
+`/provider/` descriptor shape only for a fetchable candidate, rejects encoded or ambiguous path
+segments, fetches at most 20 missing or stale images with no redirect or retry, and persists only
+size-bounded JPEG/PNG/WebP bytes whose declared type matches their signature. Every local asset
+carries a versioned descriptor fingerprint. A snapshot replacement atomically invalidates a
+mismatched asset, and persistence
 rechecks the selected descriptor in one SQLite transaction so a late fetch cannot overwrite a
 newer descriptor. The catalogue and detail templates render `/games/{id}/cover` only when that
 eligible asset exists; the endpoint serves the SQLite bytes and fixed allowlisted MIME type. Page

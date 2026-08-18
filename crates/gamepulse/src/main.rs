@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use gamepulse_application::{
-    HourlyJobSchedule, JobClaimPacing, JobHandler, JobHandlerRegistry, ReviewSummaryJobSchedule,
-    RuntimeJobType, RuntimeJobTypeFilter, SourceIngestionJobSchedule, execute_cover_backfill,
+    CoverBackfillReport, HourlyJobSchedule, JobClaimPacing, JobHandler, JobHandlerRegistry,
+    ReviewSummaryJobSchedule, RuntimeJobType, RuntimeJobTypeFilter, SourceIngestionJobSchedule,
+    execute_cover_backfill,
 };
 use gamepulse_storage_sqlite::{
     SqliteAcceptanceCycleStore, SqliteGameCatalogueReadStore, SqliteGameCoverAssetStore,
@@ -157,11 +158,17 @@ async fn run_cover_backfill(command: covers::CoverBackfillCommand) -> i32 {
     };
     match execute_cover_backfill(&mut store, &client, command.limit()).await {
         Ok(report) => {
-            println!("{}", report.to_json());
-            report.exit_code()
+            let (output, exit_code) = render_cover_backfill_report(report);
+            println!("{output}");
+            exit_code
         }
         Err(_) => 1,
     }
+}
+
+/// The binary owns only aggregate JSON framing and the report's application-owned exit policy.
+fn render_cover_backfill_report(report: CoverBackfillReport) -> (String, i32) {
+    (report.to_json(), report.exit_code())
 }
 
 /// The composition root owns concrete SQLite, clock, scheduler, and source-lane wiring.
@@ -434,4 +441,312 @@ async fn serve_unready_http(
         observability::process_stopped();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::fs;
+    use std::future::{Future, Ready, ready};
+    use std::path::PathBuf;
+    use std::process;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+
+    use gamepulse_application::{
+        GameCoverDescriptor, GameSnapshot, MAX_COVER_BACKFILL_CANDIDATES, SourceProductId,
+        StoredCoverImage, execute_cover_backfill, upsert_game_snapshot,
+    };
+    use gamepulse_storage_sqlite::{SqliteGameCoverAssetStore, SqliteGameSnapshotStore};
+    use gamepulse_worker_source::{
+        CoverImageHttpResponse, CoverImageHttpTransport, MetacriticCoverImageClient,
+    };
+    use rusqlite::Connection;
+
+    use super::render_cover_backfill_report;
+
+    const PNG_SIGNATURE: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10];
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FixtureTransportError {
+        BodyLimit,
+    }
+
+    struct FixtureCoverResponse {
+        status: u16,
+        content_type: Option<String>,
+        content_length: Option<u64>,
+        body: Option<Result<Vec<u8>, FixtureTransportError>>,
+    }
+
+    impl FixtureCoverResponse {
+        fn new(
+            status: u16,
+            content_type: Option<&str>,
+            content_length: Option<u64>,
+            body: Vec<u8>,
+        ) -> Self {
+            Self {
+                status,
+                content_type: content_type.map(str::to_owned),
+                content_length,
+                body: Some(Ok(body)),
+            }
+        }
+    }
+
+    impl CoverImageHttpResponse for FixtureCoverResponse {
+        type ReadBodyError = FixtureTransportError;
+        type ReadBodyFuture<'a>
+            = Ready<Result<Vec<u8>, Self::ReadBodyError>>
+        where
+            Self: 'a;
+
+        fn status(&self) -> u16 {
+            self.status
+        }
+
+        fn content_type(&self) -> Option<&str> {
+            self.content_type.as_deref()
+        }
+
+        fn content_length(&self) -> Option<u64> {
+            self.content_length
+        }
+
+        fn read_body(&mut self) -> Self::ReadBodyFuture<'_> {
+            ready(
+                self.body
+                    .take()
+                    .expect("fixture response body must be read at most once"),
+            )
+        }
+    }
+
+    struct FixtureCoverTransport {
+        responses: Mutex<VecDeque<Result<FixtureCoverResponse, FixtureTransportError>>>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl CoverImageHttpTransport for FixtureCoverTransport {
+        type Error = FixtureTransportError;
+        type Response = FixtureCoverResponse;
+        type FetchFuture<'a>
+            = Ready<Result<Self::Response, Self::Error>>
+        where
+            Self: 'a;
+
+        fn fetch_cover(
+            &self,
+            _url: &gamepulse_application::GamePublicCoverUrl,
+        ) -> Self::FetchFuture<'_> {
+            *self
+                .calls
+                .lock()
+                .expect("fixture transport calls must not poison") += 1;
+            ready(
+                self.responses
+                    .lock()
+                    .expect("fixture transport responses must not poison")
+                    .pop_front()
+                    .expect("fixture transport needs one response per fetch"),
+            )
+        }
+
+        fn body_limit_error(&self) -> Self::Error {
+            FixtureTransportError::BodyLimit
+        }
+    }
+
+    struct TemporaryDatabase {
+        path: PathBuf,
+    }
+
+    impl TemporaryDatabase {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "gamepulse-cover-backfill-binary-{}.sqlite3",
+                process::id()
+            ));
+            let _ = fs::remove_file(&path);
+            Self { path }
+        }
+    }
+
+    impl Drop for TemporaryDatabase {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(self.path.with_extension("sqlite3-shm"));
+            let _ = fs::remove_file(self.path.with_extension("sqlite3-wal"));
+        }
+    }
+
+    fn snapshot(source_product_id: u64, descriptor: Option<GameCoverDescriptor>) -> GameSnapshot {
+        GameSnapshot::new(
+            SourceProductId::new(source_product_id).expect("fixture identity must be valid"),
+            format!("private-slug-{source_product_id}"),
+            "Private title",
+            "Private fixture description",
+            descriptor,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("fixture snapshot must be valid")
+    }
+
+    fn descriptor(filename: &str) -> GameCoverDescriptor {
+        GameCoverDescriptor::new(
+            format!("/provider/7/2/{filename}"),
+            "catalog",
+            filename,
+            "cardImage",
+        )
+        .expect("fixture descriptor must be valid")
+    }
+
+    fn resolver_rejected_descriptor() -> GameCoverDescriptor {
+        GameCoverDescriptor::new(
+            "/provider/7/../private-rejected.png",
+            "catalog",
+            "private-rejected.png",
+            "cardImage",
+        )
+        .expect("fixture descriptor must remain structurally valid")
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_cover_backfill_fixture_uses_the_real_adapter_classifier_and_binary_report() {
+        let database = TemporaryDatabase::new();
+        let mut snapshots =
+            SqliteGameSnapshotStore::open(&database.path).expect("snapshot store must open");
+        upsert_game_snapshot(&mut snapshots, &snapshot(7_001, None))
+            .expect("missing descriptor snapshot must persist");
+        upsert_game_snapshot(
+            &mut snapshots,
+            &snapshot(7_002, Some(resolver_rejected_descriptor())),
+        )
+        .expect("resolver-rejected descriptor snapshot must persist");
+        for source_product_id in 7_003..=7_012 {
+            upsert_game_snapshot(
+                &mut snapshots,
+                &snapshot(
+                    source_product_id,
+                    Some(descriptor(&format!(
+                        "private-cover-{source_product_id}.png"
+                    ))),
+                ),
+            )
+            .expect("fetchable descriptor snapshot must persist");
+        }
+        drop(snapshots);
+
+        let transport = FixtureCoverTransport {
+            responses: Mutex::new(VecDeque::from([
+                Ok(FixtureCoverResponse::new(
+                    200,
+                    Some("image/png"),
+                    Some(PNG_SIGNATURE.len() as u64),
+                    PNG_SIGNATURE.to_vec(),
+                )),
+                Ok(FixtureCoverResponse::new(100, None, None, Vec::new())),
+                Ok(FixtureCoverResponse::new(204, None, None, Vec::new())),
+                Ok(FixtureCoverResponse::new(302, None, None, Vec::new())),
+                Ok(FixtureCoverResponse::new(404, None, None, Vec::new())),
+                Ok(FixtureCoverResponse::new(503, None, None, Vec::new())),
+                Ok(FixtureCoverResponse::new(200, None, None, Vec::new())),
+                Ok(FixtureCoverResponse::new(
+                    200,
+                    Some("image/png"),
+                    Some(27),
+                    b"private-response-payload".to_vec(),
+                )),
+                Ok(FixtureCoverResponse::new(
+                    200,
+                    Some("image/png"),
+                    Some(0),
+                    Vec::new(),
+                )),
+                Ok(FixtureCoverResponse::new(
+                    200,
+                    Some("image/png"),
+                    Some((StoredCoverImage::MAX_BYTES + 1) as u64),
+                    Vec::new(),
+                )),
+            ])),
+            calls: Arc::new(Mutex::new(0)),
+        };
+        let calls = Arc::clone(&transport.calls);
+        let client = MetacriticCoverImageClient::with_transport(transport);
+        let mut assets =
+            SqliteGameCoverAssetStore::open(&database.path).expect("asset store must open");
+
+        let report = block_on(execute_cover_backfill(&mut assets, &client, 20))
+            .expect("mixed local cover backfill must complete");
+        assert_eq!(report.attempted(), 12);
+        assert!(report.attempted() <= MAX_COVER_BACKFILL_CANDIDATES);
+        assert_eq!(report.stored(), 1);
+        assert_eq!(report.unavailable(), 10);
+        assert_eq!(report.unavailable(), report.unavailable_reasons().total());
+        assert_eq!(report.failed(), 1);
+        assert!(report.made_progress());
+        assert_eq!(*calls.lock().expect("fixture call count must load"), 10);
+        drop(assets);
+
+        let connection = Connection::open(&database.path).expect("verification database must open");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM game_cover_assets", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("stored asset count must load"),
+            1
+        );
+
+        let (output, exit_code) = render_cover_backfill_report(report);
+        assert_eq!(exit_code, 1);
+        assert_eq!(
+            output,
+            concat!(
+                "{\"schema_version\":\"gamepulse.cover_backfill.v3\",",
+                "\"attempted\":12,\"stored\":1,\"unavailable\":10,",
+                "\"unavailable_reasons\":{",
+                "\"descriptor_rejected\":2,",
+                "\"unexpected_http_status\":{",
+                "\"informational\":1,\"successful_other\":1,\"redirection\":1,",
+                "\"client_error\":1,\"server_error\":1,\"other\":0},",
+                "\"unsupported_content_type\":1,\"signature_mismatch\":1,\"invalid_body\":1},",
+                "\"stale\":0,\"already_current\":0,\"failed\":1,\"made_progress\":true}"
+            )
+        );
+        for prohibited in [
+            "7001",
+            "7002",
+            "Private title",
+            "private-slug",
+            "private-cover",
+            "/provider/",
+            "https://",
+            "metacritic.com",
+            "filename",
+            "host",
+            "header",
+            "private-response-payload",
+            "/tmp/",
+        ] {
+            assert!(!output.contains(prohibited));
+        }
+    }
 }

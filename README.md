@@ -131,9 +131,10 @@ catalogue always reads only persisted data.
 
 Existing databases are upgraded forward without deleting game records. Covers
 are acquired only through the explicit, bounded operator command; normal page
-reads, the demo, and mandatory source runs never request an image. It attempts
-at most 20 existing valid cover descriptors, follows no redirects, retries
-nothing, and prints an aggregate-only v3 report:
+reads, the demo, and mandatory source runs never request an image. It selects
+at most 20 persisted cover records, follows no redirects, retries nothing, and
+prints an aggregate-only v3 report. A missing or rejected descriptor consumes
+one selected attempt and is reported as unavailable without an image request:
 
 ```bash
 cargo run --locked --offline -p gamepulse -- cover-backfill \

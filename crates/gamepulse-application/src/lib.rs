@@ -145,6 +145,17 @@ impl CoverBackfillCandidate {
     }
 }
 
+/// One bounded selection outcome before any cover source request is attempted.
+///
+/// A rejected descriptor is intentionally represented without an identity or a placeholder
+/// descriptor. It still consumes one bounded attempt and contributes to the aggregate report, but
+/// the coordinator must not call the source adapter for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoverBackfillSelection {
+    Candidate(CoverBackfillCandidate),
+    Unavailable(CoverBackfillUnavailableReason),
+}
+
 /// The only conditional persistence outcomes allowed by the local-cover workflow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoverBackfillPersistOutcome {
@@ -158,10 +169,10 @@ pub enum CoverBackfillPersistOutcome {
 pub trait CoverBackfillStorePort {
     type Error;
 
-    fn cover_backfill_candidates(
+    fn cover_backfill_selections(
         &mut self,
         limit: usize,
-    ) -> Result<Vec<CoverBackfillCandidate>, Self::Error>;
+    ) -> Result<Vec<CoverBackfillSelection>, Self::Error>;
 
     fn store_cover_if_current(
         &mut self,
@@ -446,31 +457,38 @@ where
     if !(1..=MAX_COVER_BACKFILL_CANDIDATES).contains(&limit) {
         return Err(CoverBackfillExecutionError::InvalidLimit);
     }
-    let candidates = store
-        .cover_backfill_candidates(limit)
+    let selections = store
+        .cover_backfill_selections(limit)
         .map_err(CoverBackfillExecutionError::Selection)?;
     let mut report = CoverBackfillReport::default();
-    for candidate in candidates {
+    for selection in selections {
         report.attempted = report.attempted.saturating_add(1);
-        match source.fetch_cover(&candidate).await {
-            Ok(CoverBackfillFetchOutcome::Stored(cover)) => {
-                match store.store_cover_if_current(&candidate, &cover) {
-                    Ok(CoverBackfillPersistOutcome::Stored) => {
-                        report.stored = report.stored.saturating_add(1)
+        match selection {
+            CoverBackfillSelection::Unavailable(reason) => {
+                report.unavailable_reasons.record(reason)
+            }
+            CoverBackfillSelection::Candidate(candidate) => {
+                match source.fetch_cover(&candidate).await {
+                    Ok(CoverBackfillFetchOutcome::Stored(cover)) => {
+                        match store.store_cover_if_current(&candidate, &cover) {
+                            Ok(CoverBackfillPersistOutcome::Stored) => {
+                                report.stored = report.stored.saturating_add(1)
+                            }
+                            Ok(CoverBackfillPersistOutcome::AlreadyCurrent) => {
+                                report.already_current = report.already_current.saturating_add(1)
+                            }
+                            Ok(CoverBackfillPersistOutcome::Stale) => {
+                                report.stale = report.stale.saturating_add(1)
+                            }
+                            Err(_) => report.failed = report.failed.saturating_add(1),
+                        }
                     }
-                    Ok(CoverBackfillPersistOutcome::AlreadyCurrent) => {
-                        report.already_current = report.already_current.saturating_add(1)
-                    }
-                    Ok(CoverBackfillPersistOutcome::Stale) => {
-                        report.stale = report.stale.saturating_add(1)
+                    Ok(CoverBackfillFetchOutcome::Unavailable(reason)) => {
+                        report.unavailable_reasons.record(reason)
                     }
                     Err(_) => report.failed = report.failed.saturating_add(1),
                 }
             }
-            Ok(CoverBackfillFetchOutcome::Unavailable(reason)) => {
-                report.unavailable_reasons.record(reason)
-            }
-            Err(_) => report.failed = report.failed.saturating_add(1),
         }
     }
     Ok(report)
@@ -3936,19 +3954,19 @@ mod tests {
 
     #[derive(Default)]
     struct FixtureStore {
-        candidates: Vec<CoverBackfillCandidate>,
+        selections: Vec<CoverBackfillSelection>,
         outcomes: VecDeque<CoverBackfillPersistOutcome>,
     }
 
     impl CoverBackfillStorePort for FixtureStore {
         type Error = ();
 
-        fn cover_backfill_candidates(
+        fn cover_backfill_selections(
             &mut self,
             limit: usize,
-        ) -> Result<Vec<CoverBackfillCandidate>, Self::Error> {
-            assert!(self.candidates.len() <= limit);
-            Ok(std::mem::take(&mut self.candidates))
+        ) -> Result<Vec<CoverBackfillSelection>, Self::Error> {
+            assert!(self.selections.len() <= limit);
+            Ok(std::mem::take(&mut self.selections))
         }
 
         fn store_cover_if_current(
@@ -3965,6 +3983,16 @@ mod tests {
 
     struct FixtureSource {
         responses: Mutex<VecDeque<Result<CoverBackfillFetchOutcome, ()>>>,
+        calls: Mutex<usize>,
+    }
+
+    impl FixtureSource {
+        fn calls(&self) -> usize {
+            *self
+                .calls
+                .lock()
+                .expect("fixture source calls must not poison")
+        }
     }
 
     impl AsyncCoverImageSourcePort for FixtureSource {
@@ -3975,6 +4003,10 @@ mod tests {
             Self: 'a;
 
         fn fetch_cover(&self, _candidate: &CoverBackfillCandidate) -> Self::FetchFuture<'_> {
+            *self
+                .calls
+                .lock()
+                .expect("fixture source calls must not poison") += 1;
             ready(
                 self.responses
                     .lock()
@@ -4015,9 +4047,16 @@ mod tests {
         let image = StoredCoverImage::new(CoverImageContentType::Png, vec![1])
             .expect("test image must be valid");
         let mut store = FixtureStore {
-            candidates: (0..14)
-                .map(|offset| candidate(4_242 + offset, "private-cover-name.png"))
-                .collect(),
+            selections: std::iter::once(CoverBackfillSelection::Unavailable(
+                CoverBackfillUnavailableReason::DescriptorRejected,
+            ))
+            .chain((0..13).map(|offset| {
+                CoverBackfillSelection::Candidate(candidate(
+                    4_242 + offset,
+                    "private-cover-name.png",
+                ))
+            }))
+            .collect(),
             outcomes: VecDeque::from([
                 CoverBackfillPersistOutcome::Stored,
                 CoverBackfillPersistOutcome::Stale,
@@ -4027,9 +4066,6 @@ mod tests {
         let source = FixtureSource {
             responses: Mutex::new(VecDeque::from([
                 Ok(CoverBackfillFetchOutcome::Stored(image.clone())),
-                Ok(CoverBackfillFetchOutcome::Unavailable(
-                    CoverBackfillUnavailableReason::DescriptorRejected,
-                )),
                 Ok(CoverBackfillFetchOutcome::Unavailable(
                     CoverBackfillUnavailableReason::UnexpectedHttpStatus(
                         CoverBackfillHttpStatusClass::Informational,
@@ -4073,6 +4109,7 @@ mod tests {
                 Ok(CoverBackfillFetchOutcome::Stored(image)),
                 Err(()),
             ])),
+            calls: Mutex::new(0),
         };
 
         let report = block_on(execute_cover_backfill(&mut store, &source, 20))
@@ -4085,6 +4122,7 @@ mod tests {
         assert_eq!(report.stale(), 1);
         assert_eq!(report.already_current(), 1);
         assert_eq!(report.failed(), 1);
+        assert_eq!(source.calls(), 13);
         assert!(report.made_progress());
         assert_eq!(report.exit_code(), 1);
         assert_eq!(
@@ -4120,6 +4158,7 @@ mod tests {
         let mut store = FixtureStore::default();
         let source = FixtureSource {
             responses: Mutex::new(VecDeque::new()),
+            calls: Mutex::new(0),
         };
         let repeated = block_on(execute_cover_backfill(&mut store, &source, 20))
             .expect("empty repeat must complete");
@@ -4131,7 +4170,40 @@ mod tests {
         );
         assert_eq!(repeated.failed(), 0);
         assert_eq!(repeated.exit_code(), 0);
+        assert_eq!(source.calls(), 0);
         assert!(!repeated.made_progress());
+    }
+
+    #[test]
+    fn selected_descriptor_rejections_are_unavailable_without_a_source_call() {
+        let mut store = FixtureStore {
+            selections: vec![
+                CoverBackfillSelection::Unavailable(
+                    CoverBackfillUnavailableReason::DescriptorRejected,
+                ),
+                CoverBackfillSelection::Unavailable(
+                    CoverBackfillUnavailableReason::DescriptorRejected,
+                ),
+            ],
+            outcomes: VecDeque::new(),
+        };
+        let source = FixtureSource {
+            responses: Mutex::new(VecDeque::new()),
+            calls: Mutex::new(0),
+        };
+
+        let report = block_on(execute_cover_backfill(&mut store, &source, 20))
+            .expect("descriptor rejections must complete");
+
+        assert_eq!(report.attempted(), 2);
+        assert_eq!(report.stored(), 0);
+        assert_eq!(report.unavailable(), 2);
+        assert_eq!(report.unavailable_reasons().descriptor_rejected(), 2);
+        assert_eq!(report.unavailable(), report.unavailable_reasons().total());
+        assert_eq!(report.failed(), 0);
+        assert_eq!(source.calls(), 0);
+        assert!(!report.made_progress());
+        assert_eq!(report.exit_code(), 0);
     }
 
     #[test]
@@ -4154,6 +4226,7 @@ mod tests {
         let mut store = FixtureStore::default();
         let source = FixtureSource {
             responses: Mutex::new(VecDeque::new()),
+            calls: Mutex::new(0),
         };
         assert!(matches!(
             block_on(execute_cover_backfill(

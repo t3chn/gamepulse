@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use gamepulse_application::{
-    CoverBackfillUnavailableReason, CoverImageContentType, GameCoverDescriptor, StoredCoverImage,
+    CoverBackfillUnavailableReason, CoverImageContentType, GameCoverDescriptor,
 };
 use gamepulse_worker_source::{decode_local_cover_image, resolve_local_cover_source_url};
 
@@ -48,7 +48,7 @@ fn rejects_an_unsafe_descriptor_or_mismatched_content_type() {
 }
 
 #[test]
-fn rejects_percent_encoded_or_ambiguous_descriptor_segments_and_oversized_fixture_body() {
+fn rejects_percent_encoded_or_ambiguous_descriptor_segments() {
     for (path, filename) in [
         ("/provider/7/%2e%2e/escape.png", "escape.png"),
         ("/provider/7//double.png", "double.png"),
@@ -60,11 +60,4 @@ fn rejects_percent_encoded_or_ambiguous_descriptor_segments_and_oversized_fixtur
             .expect("untrusted fixture descriptor remains structurally valid");
         assert!(resolve_local_cover_source_url(&descriptor).is_none());
     }
-
-    let mut oversized = vec![0_u8; StoredCoverImage::MAX_BYTES + 1];
-    oversized[..8].copy_from_slice(&ONE_PIXEL_PNG[..8]);
-    assert_eq!(
-        decode_local_cover_image(CoverImageContentType::Png, oversized),
-        Err(CoverBackfillUnavailableReason::InvalidBody)
-    );
 }

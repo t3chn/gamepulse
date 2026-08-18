@@ -2,8 +2,9 @@ use std::fmt;
 use std::path::Path;
 
 use gamepulse_application::{
-    CoverBackfillCandidate, CoverBackfillPersistOutcome, CoverBackfillStorePort,
-    GameCoverDescriptor, SourceProductId, StoredCoverImage,
+    CoverBackfillCandidate, CoverBackfillPersistOutcome, CoverBackfillSelection,
+    CoverBackfillStorePort, CoverBackfillUnavailableReason, GameCoverDescriptor, SourceProductId,
+    StoredCoverImage,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -21,10 +22,10 @@ impl SqliteGameCoverAssetStore {
         Ok(Self { connection })
     }
 
-    fn cover_backfill_candidates(
+    fn cover_backfill_selections(
         &mut self,
         limit: usize,
-    ) -> Result<Vec<CoverBackfillCandidate>, GameCoverAssetStoreError> {
+    ) -> Result<Vec<CoverBackfillSelection>, GameCoverAssetStoreError> {
         let limit = i64::try_from(limit).map_err(|_| GameCoverAssetStoreError::invalid_input())?;
         let mut statement = self
             .connection
@@ -37,12 +38,12 @@ impl SqliteGameCoverAssetStore {
                  FROM games
                  LEFT JOIN game_cover_assets
                    ON game_cover_assets.game_source_product_id = games.source_product_id
-                 WHERE games.cover_bucket_path IS NOT NULL
-                   AND games.cover_bucket_type IS NOT NULL
-                   AND games.cover_filename IS NOT NULL
-                   AND games.cover_kind IS NOT NULL
-                   AND (
+                 WHERE (
                        game_cover_assets.game_source_product_id IS NULL
+                       OR games.cover_bucket_path IS NULL
+                       OR games.cover_bucket_type IS NULL
+                       OR games.cover_filename IS NULL
+                       OR games.cover_kind IS NULL
                        OR game_cover_assets.descriptor_fingerprint <> (
                            'v1:' || length(CAST(games.cover_bucket_path AS BLOB)) || ':' || lower(hex(games.cover_bucket_path)) ||
                            ':' || length(CAST(games.cover_bucket_type AS BLOB)) || ':' || lower(hex(games.cover_bucket_type)) ||
@@ -57,14 +58,25 @@ impl SqliteGameCoverAssetStore {
         let rows = statement
             .query_map(params![limit], |row| {
                 let product_id = decode_source_product_id(row.get::<_, i64>(0)?)?;
-                let descriptor = GameCoverDescriptor::new(
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                )
-                .map_err(|_| rusqlite::Error::InvalidQuery)?;
-                Ok(CoverBackfillCandidate::new(product_id, descriptor))
+                let descriptor = match (
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ) {
+                    (Some(bucket_path), Some(bucket_type), Some(filename), Some(kind)) => {
+                        GameCoverDescriptor::new(bucket_path, bucket_type, filename, kind).ok()
+                    }
+                    _ => None,
+                };
+                Ok(match descriptor {
+                    Some(descriptor) => CoverBackfillSelection::Candidate(
+                        CoverBackfillCandidate::new(product_id, descriptor),
+                    ),
+                    None => CoverBackfillSelection::Unavailable(
+                        CoverBackfillUnavailableReason::DescriptorRejected,
+                    ),
+                })
             })
             .map_err(GameCoverAssetStoreError::database)?;
         rows.map(|row| row.map_err(GameCoverAssetStoreError::database))
@@ -152,11 +164,11 @@ impl SqliteGameCoverAssetStore {
 impl CoverBackfillStorePort for SqliteGameCoverAssetStore {
     type Error = GameCoverAssetStoreError;
 
-    fn cover_backfill_candidates(
+    fn cover_backfill_selections(
         &mut self,
         limit: usize,
-    ) -> Result<Vec<CoverBackfillCandidate>, GameCoverAssetStoreError> {
-        self.cover_backfill_candidates(limit)
+    ) -> Result<Vec<CoverBackfillSelection>, GameCoverAssetStoreError> {
+        self.cover_backfill_selections(limit)
     }
 
     fn store_cover_if_current(
@@ -298,12 +310,19 @@ mod tests {
     }
 
     fn snapshot(descriptor: GameCoverDescriptor) -> GameSnapshot {
+        snapshot_with_descriptor(101, Some(descriptor))
+    }
+
+    fn snapshot_with_descriptor(
+        source_product_id: u64,
+        descriptor: Option<GameCoverDescriptor>,
+    ) -> GameSnapshot {
         GameSnapshot::new(
-            SourceProductId::new(101).expect("test identity must be valid"),
-            "example-game",
-            "Example",
+            SourceProductId::new(source_product_id).expect("test identity must be valid"),
+            format!("fixture-game-{source_product_id}"),
+            "Fixture",
             "Stored game",
-            Some(descriptor),
+            descriptor,
             None,
             Vec::new(),
             Vec::new(),
@@ -317,6 +336,15 @@ mod tests {
             vec![137, 80, 78, 71, 13, 10, 26, 10],
         )
         .expect("test cover must be valid")
+    }
+
+    fn selected_candidate(selection: CoverBackfillSelection) -> CoverBackfillCandidate {
+        match selection {
+            CoverBackfillSelection::Candidate(candidate) => candidate,
+            CoverBackfillSelection::Unavailable(_) => {
+                panic!("fixture must select a fetchable cover candidate")
+            }
+        }
     }
 
     #[test]
@@ -501,11 +529,13 @@ mod tests {
 
         let mut assets =
             SqliteGameCoverAssetStore::open(&database.path).expect("asset store must open");
-        let candidate_a = assets
-            .cover_backfill_candidates(20)
-            .expect("candidate selection must work")
-            .pop()
-            .expect("descriptor A must be selected");
+        let candidate_a = selected_candidate(
+            assets
+                .cover_backfill_selections(20)
+                .expect("candidate selection must work")
+                .pop()
+                .expect("descriptor A must be selected"),
+        );
         assert_eq!(
             assets
                 .store_cover_if_current(&candidate_a, &png())
@@ -528,11 +558,13 @@ mod tests {
                 .expect("late A persistence must settle"),
             CoverBackfillPersistOutcome::Stale
         );
-        let candidate_b = assets
-            .cover_backfill_candidates(20)
-            .expect("B must be selected after refresh")
-            .pop()
-            .expect("descriptor B must be stale/missing");
+        let candidate_b = selected_candidate(
+            assets
+                .cover_backfill_selections(20)
+                .expect("B must be selected after refresh")
+                .pop()
+                .expect("descriptor B must be stale/missing"),
+        );
         assert_eq!(candidate_b.descriptor(), &descriptor_b);
         assert_eq!(
             assets
@@ -542,9 +574,107 @@ mod tests {
         );
         assert!(
             assets
-                .cover_backfill_candidates(20)
+                .cover_backfill_selections(20)
                 .expect("repeated selection must work")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn missing_descriptors_are_bounded_selected_outcomes_not_silent_no_candidates() {
+        let database = TemporaryDatabase::new();
+        let mut snapshots = super::super::SqliteGameSnapshotStore::open(&database.path)
+            .expect("snapshot store must open");
+        for source_product_id in 101..=121 {
+            upsert_game_snapshot(
+                &mut snapshots,
+                &snapshot_with_descriptor(source_product_id, None),
+            )
+            .expect("missing descriptor snapshot must persist");
+        }
+        drop(snapshots);
+
+        let mut assets =
+            SqliteGameCoverAssetStore::open(&database.path).expect("asset store must open");
+        let limited = assets
+            .cover_backfill_selections(2)
+            .expect("limited missing selections must load");
+        assert_eq!(
+            limited,
+            vec![
+                CoverBackfillSelection::Unavailable(
+                    CoverBackfillUnavailableReason::DescriptorRejected,
+                ),
+                CoverBackfillSelection::Unavailable(
+                    CoverBackfillUnavailableReason::DescriptorRejected,
+                ),
+            ]
+        );
+        let all_missing = assets
+            .cover_backfill_selections(20)
+            .expect("all missing selections must load");
+        assert_eq!(all_missing.len(), 20);
+        assert!(all_missing.iter().all(|selection| {
+            matches!(
+                selection,
+                CoverBackfillSelection::Unavailable(
+                    CoverBackfillUnavailableReason::DescriptorRejected
+                )
+            )
+        }));
+        assert_eq!(
+            assets
+                .cover_backfill_selections(20)
+                .expect("repeated missing selections must load"),
+            all_missing
+        );
+    }
+
+    #[test]
+    fn mixed_descriptor_selection_keeps_stable_order_and_the_hard_limit() {
+        let database = TemporaryDatabase::new();
+        let mut snapshots = super::super::SqliteGameSnapshotStore::open(&database.path)
+            .expect("snapshot store must open");
+        upsert_game_snapshot(&mut snapshots, &snapshot_with_descriptor(101, None))
+            .expect("first missing descriptor snapshot must persist");
+        upsert_game_snapshot(
+            &mut snapshots,
+            &snapshot_with_descriptor(102, Some(descriptor("valid.png"))),
+        )
+        .expect("valid descriptor snapshot must persist");
+        upsert_game_snapshot(&mut snapshots, &snapshot_with_descriptor(103, None))
+            .expect("second missing descriptor snapshot must persist");
+        drop(snapshots);
+
+        let mut assets =
+            SqliteGameCoverAssetStore::open(&database.path).expect("asset store must open");
+        let limited = assets
+            .cover_backfill_selections(2)
+            .expect("mixed limited selections must load");
+        assert_eq!(limited.len(), 2);
+        assert!(matches!(
+            limited[0],
+            CoverBackfillSelection::Unavailable(CoverBackfillUnavailableReason::DescriptorRejected)
+        ));
+        assert!(matches!(limited[1], CoverBackfillSelection::Candidate(_)));
+        let full = assets
+            .cover_backfill_selections(20)
+            .expect("mixed full selections must load");
+        assert_eq!(full.len(), 3);
+        assert!(matches!(
+            full[0],
+            CoverBackfillSelection::Unavailable(CoverBackfillUnavailableReason::DescriptorRejected)
+        ));
+        assert!(matches!(full[1], CoverBackfillSelection::Candidate(_)));
+        assert!(matches!(
+            full[2],
+            CoverBackfillSelection::Unavailable(CoverBackfillUnavailableReason::DescriptorRejected)
+        ));
+        assert_eq!(
+            assets
+                .cover_backfill_selections(20)
+                .expect("repeated mixed selections must load"),
+            full
         );
     }
 }
