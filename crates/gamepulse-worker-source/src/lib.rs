@@ -22,14 +22,14 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use gamepulse_application::{
-    AsyncDailyCrawlSourcePort, AsyncReviewSourceIngestionPort, AsyncSourceIngestionPort,
-    CoverImageContentType, CrawlDayKey, CrawlDiscoveryRequest, DailyCrawlOutcome,
-    DailyCrawlStatePort, DiscoveryCandidate, DiscoveryPage, DurableRunDiscovery,
-    DurableRunProgressOutcome, DurableRunProgressStore, GameReviewRefresh, GameReviewRefreshStore,
-    GameSnapshotStore, JobHandler, JobHandlerFailure, JobHandlerFuture, JobHandlerResult,
-    ReviewInput, ReviewPolarity, ReviewSourceIngestion, ReviewSourceIngestionError,
-    ReviewSummaryJobSchedule, RunSourceIngestionRequest, RuntimeJobType,
-    SourceIngestionJobSchedule, SourceIngestionRequest, StoredCoverImage, TypedJob,
+    AsyncCoverImageSourcePort, AsyncDailyCrawlSourcePort, AsyncReviewSourceIngestionPort,
+    AsyncSourceIngestionPort, CoverBackfillCandidate, CoverImageContentType, CrawlDayKey,
+    CrawlDiscoveryRequest, DailyCrawlOutcome, DailyCrawlStatePort, DiscoveryCandidate,
+    DiscoveryPage, DurableRunDiscovery, DurableRunProgressOutcome, DurableRunProgressStore,
+    GameReviewRefresh, GameReviewRefreshStore, GameSnapshotStore, JobHandler, JobHandlerFailure,
+    JobHandlerFuture, JobHandlerResult, ReviewInput, ReviewPolarity, ReviewSourceIngestion,
+    ReviewSourceIngestionError, ReviewSummaryJobSchedule, RunSourceIngestionRequest,
+    RuntimeJobType, SourceIngestionJobSchedule, SourceIngestionRequest, StoredCoverImage, TypedJob,
     WorkerFailureCategory, execute_async_daily_crawl_with_source_ingestion_jobs,
     execute_async_review_source_ingestion, execute_async_source_ingestion,
     persist_game_review_refresh, upsert_game_snapshot,
@@ -1477,17 +1477,21 @@ pub fn resolve_local_cover_source_url(
     }
     let path = descriptor.bucket_path().strip_prefix("/provider/")?;
     if path.is_empty()
-        || path.contains("..")
-        || path.contains(['\\', '?', '#'])
+        || path.contains(['%', '\\', '?', '#'])
+        || path.split('/').any(|segment| {
+            segment.is_empty() || segment == "." || segment == ".." || segment.contains(['%', '\\'])
+        })
         || descriptor.filename().is_empty()
-        || descriptor.filename().contains(['/', '\\', '?', '#'])
+        || descriptor.filename().contains(['%', '/', '\\', '?', '#'])
         || !path.ends_with(&format!("/{}", descriptor.filename()))
     {
         return None;
     }
-    validate_public_cover_url(&format!(
-        "https://www.metacritic.com/a/img/catalog/provider/{path}"
-    ))
+    let expected_path = format!("/a/img/catalog/provider/{path}");
+    let url = validate_public_cover_url(&format!("https://www.metacritic.com{expected_path}"))?;
+    (url.as_str().strip_prefix("https://www.metacritic.com")? == expected_path
+        && expected_path.starts_with("/a/img/catalog/provider/"))
+    .then_some(url)
 }
 
 fn derive_public_cover_url(image: &ImageDescriptor) -> Option<GamePublicCoverUrl> {
@@ -2359,7 +2363,7 @@ impl MetacriticCoverImageClient {
     ///
     /// A malformed descriptor, non-success status, non-image content type, or invalid body is an
     /// explicit optional absence. Transport failure is opaque to keep the command aggregate-only.
-    pub async fn fetch(
+    async fn fetch(
         &self,
         descriptor: &GameCoverDescriptor,
     ) -> Result<Option<StoredCoverImage>, CoverImageFetchError> {
@@ -2401,6 +2405,19 @@ impl MetacriticCoverImageClient {
             bytes.extend_from_slice(chunk.as_ref());
         }
         Ok(decode_local_cover_image(content_type, bytes))
+    }
+}
+
+impl AsyncCoverImageSourcePort for MetacriticCoverImageClient {
+    type Error = CoverImageFetchError;
+    type FetchFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<Option<StoredCoverImage>, Self::Error>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn fetch_cover(&self, candidate: &CoverBackfillCandidate) -> Self::FetchFuture<'_> {
+        let descriptor = candidate.descriptor().clone();
+        Box::pin(async move { self.fetch(&descriptor).await })
     }
 }
 

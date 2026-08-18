@@ -226,6 +226,7 @@ where
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness::<R>))
         .route("/games", get(database_unavailable))
+        .route("/games/{id}/cover", get(database_unavailable))
         .route("/games/{id}", get(database_unavailable))
         .with_state(ReadinessState {
             readiness: readiness_probe,
@@ -274,6 +275,11 @@ where
 }
 
 async fn database_unavailable() -> Response {
+    database_unavailable_response().await
+}
+
+/// The fixed database-unavailable response shared by every database-backed route.
+async fn database_unavailable_response() -> Response {
     StatusCode::SERVICE_UNAVAILABLE.into_response()
 }
 

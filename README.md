@@ -144,7 +144,9 @@ cargo run --locked --offline -p gamepulse -- cover-backfill \
 Run it only when source access is appropriate. Until an asset is stored, the
 catalogue and detail page show the accessible GP placeholder; stored assets are
 served through GamePulse and no upstream image URL or source descriptor is put
-in page HTML.
+in page HTML. Repeat only when the prior aggregate report has `stored > 0`.
+Stop when it reports no candidates, zero progress, or any failure; do not turn
+this into an automatic retry loop.
 
 Health endpoints:
 

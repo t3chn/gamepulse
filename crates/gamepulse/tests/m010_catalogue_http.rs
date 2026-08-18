@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::fs;
+use std::future::{Ready, ready};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -14,13 +16,15 @@ use axum::body::to_bytes;
 use axum::http::StatusCode;
 use axum::response::Response;
 use gamepulse_application::{
-    CoverImageContentType, GameCoverDescriptor, GameDeveloper, GamePlatformScore,
-    GamePublicCoverUrl, GameSnapshot, GameVideoLink, Metascore, SourceProductId, StoredCoverImage,
-    Userscore, upsert_game_snapshot,
+    AsyncCoverImageSourcePort, CoverBackfillCandidate, CoverBackfillPersistOutcome,
+    CoverBackfillStorePort, CoverImageContentType, GameCoverDescriptor, GameDeveloper,
+    GamePlatformScore, GamePublicCoverUrl, GameSnapshot, GameVideoLink, Metascore, SourceProductId,
+    StoredCoverImage, Userscore, execute_cover_backfill, upsert_game_snapshot,
 };
 use gamepulse_storage_sqlite::{
     SqliteGameCatalogueReadStore, SqliteGameCoverAssetStore, SqliteGameSnapshotStore,
 };
+use gamepulse_worker_source::{decode_local_cover_image, resolve_local_cover_source_url};
 
 static NEXT_TEMPORARY_DATABASE: AtomicU64 = AtomicU64::new(0);
 static NEXT_BROWSER_SMOKE_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +37,46 @@ const TEST_COVER_PNG: &[u8] = &[
     0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 8, 29, 99, 248, 207, 192, 240, 31, 0, 5,
     128, 2, 63, 73, 194, 253, 97, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
+
+struct FixtureCoverSource {
+    responses: Mutex<VecDeque<FixtureCoverResponse>>,
+}
+
+enum FixtureCoverResponse {
+    Valid,
+    Oversized,
+    Unavailable,
+}
+
+impl AsyncCoverImageSourcePort for FixtureCoverSource {
+    type Error = ();
+    type FetchFuture<'a>
+        = Ready<Result<Option<StoredCoverImage>, Self::Error>>
+    where
+        Self: 'a;
+
+    fn fetch_cover(&self, candidate: &CoverBackfillCandidate) -> Self::FetchFuture<'_> {
+        let response = self
+            .responses
+            .lock()
+            .expect("fixture source lock must hold")
+            .pop_front()
+            .expect("fixture source response must exist");
+        let cover =
+            resolve_local_cover_source_url(candidate.descriptor()).and_then(|_| match response {
+                FixtureCoverResponse::Valid => {
+                    decode_local_cover_image(CoverImageContentType::Png, TEST_COVER_PNG.to_vec())
+                }
+                FixtureCoverResponse::Oversized => {
+                    let mut bytes = vec![0_u8; StoredCoverImage::MAX_BYTES + 1];
+                    bytes[..8].copy_from_slice(&TEST_COVER_PNG[..8]);
+                    decode_local_cover_image(CoverImageContentType::Png, bytes)
+                }
+                FixtureCoverResponse::Unavailable => None,
+            });
+        ready(Ok(cover))
+    }
+}
 
 struct TemporaryDatabase {
     path: PathBuf,
@@ -123,6 +167,28 @@ fn snapshot(
     }))
 }
 
+fn backfill_snapshot(source_product_id: u64, title: &str, filename: &str) -> GameSnapshot {
+    GameSnapshot::new(
+        SourceProductId::new(source_product_id).expect("test source identity must be valid"),
+        format!("game-{source_product_id}"),
+        title,
+        "Stored local-cover fixture",
+        Some(
+            GameCoverDescriptor::new(
+                format!("/provider/7/2/{filename}"),
+                "catalog",
+                filename,
+                "cardImage",
+            )
+            .expect("fixture descriptor must be valid"),
+        ),
+        None,
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("fixture snapshot must be valid")
+}
+
 fn fixture_catalogue(database: &TemporaryDatabase) -> Arc<Mutex<SqliteGameCatalogueReadStore>> {
     let mut snapshots =
         SqliteGameSnapshotStore::open(&database.path).expect("snapshot store must open");
@@ -185,13 +251,18 @@ fn fixture_catalogue(database: &TemporaryDatabase) -> Arc<Mutex<SqliteGameCatalo
 
     let mut covers =
         SqliteGameCoverAssetStore::open(&database.path).expect("cover asset store must open");
-    covers
-        .store_cover(
-            SourceProductId::new(101).expect("test source identity must be valid"),
+    let outcome = covers
+        .store_cover_if_current(
+            &CoverBackfillCandidate::new(
+                SourceProductId::new(101).expect("test source identity must be valid"),
+                GameCoverDescriptor::new("products/example", "image", "cover.jpg", "cardImage")
+                    .expect("test cover descriptor must be valid"),
+            ),
             &StoredCoverImage::new(CoverImageContentType::Png, TEST_COVER_PNG.to_vec())
                 .expect("test cover must be valid"),
         )
         .expect("cover asset must persist");
+    assert_eq!(outcome, CoverBackfillPersistOutcome::Stored);
     drop(covers);
 
     let catalogue =
@@ -575,4 +646,84 @@ async fn renders_a_persisted_cover_through_a_gamepulse_local_route() {
     assert!(!missing_detail.contains("/games/102/cover\" alt=\"Cover for Beta\""));
     let missing_cover = gamepulse_web::cover_image_response(catalogue, 102).await;
     assert_eq!(missing_cover.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn fixture_cover_backfill_flows_through_application_sqlite_reopen_and_local_web_delivery() {
+    let database = TemporaryDatabase::new();
+    let mut snapshots =
+        SqliteGameSnapshotStore::open(&database.path).expect("snapshot store must open");
+    upsert_game_snapshot(
+        &mut snapshots,
+        &backfill_snapshot(101, "Alpha", "alpha.png"),
+    )
+    .expect("Alpha fixture must persist");
+    upsert_game_snapshot(&mut snapshots, &backfill_snapshot(102, "Beta", "beta.png"))
+        .expect("Beta fixture must persist");
+    drop(snapshots);
+
+    let mut assets =
+        SqliteGameCoverAssetStore::open(&database.path).expect("asset store must open");
+    let initial_source = FixtureCoverSource {
+        responses: Mutex::new(VecDeque::from([
+            FixtureCoverResponse::Valid,
+            FixtureCoverResponse::Oversized,
+        ])),
+    };
+    let initial = execute_cover_backfill(&mut assets, &initial_source, 20)
+        .await
+        .expect("fixture coordinator must complete");
+    assert_eq!(initial.attempted(), 2);
+    assert_eq!(initial.stored(), 1);
+    assert_eq!(initial.unavailable(), 1);
+    assert!(initial.made_progress());
+    drop(assets);
+
+    let catalogue = Arc::new(Mutex::new(
+        SqliteGameCatalogueReadStore::open(&database.path)
+            .expect("reopened catalogue must read assets"),
+    ));
+    let (status, catalogue_html) =
+        read_response(gamepulse_web::catalogue_response(Arc::clone(&catalogue), None).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(catalogue_html.contains("src=\"/games/101/cover\" alt=\"Cover for Alpha\""));
+    assert!(!catalogue_html.contains("/games/102/cover\" alt=\"Cover for Beta\""));
+    assert!(!catalogue_html.contains("metacritic.com"));
+
+    let (status, detail_html) =
+        read_response(gamepulse_web::game_detail_response(Arc::clone(&catalogue), 101).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(detail_html.contains("src=\"/games/101/cover\" alt=\"Cover for Alpha\""));
+    assert!(!detail_html.contains("/provider/7/2/alpha.png"));
+
+    let cover = gamepulse_web::cover_image_response(Arc::clone(&catalogue), 101).await;
+    assert_eq!(cover.status(), StatusCode::OK);
+    assert_eq!(
+        cover
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    assert_eq!(
+        to_bytes(cover.into_body(), usize::MAX)
+            .await
+            .expect("cover body must collect")
+            .as_ref(),
+        TEST_COVER_PNG
+    );
+    drop(catalogue);
+
+    let mut assets =
+        SqliteGameCoverAssetStore::open(&database.path).expect("asset store must reopen");
+    let repeated_source = FixtureCoverSource {
+        responses: Mutex::new(VecDeque::from([FixtureCoverResponse::Unavailable])),
+    };
+    let repeated = execute_cover_backfill(&mut assets, &repeated_source, 20)
+        .await
+        .expect("repeat must complete");
+    assert_eq!(repeated.attempted(), 1);
+    assert_eq!(repeated.stored(), 0);
+    assert_eq!(repeated.unavailable(), 1);
+    assert!(!repeated.made_progress());
 }

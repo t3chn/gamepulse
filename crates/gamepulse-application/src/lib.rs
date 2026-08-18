@@ -3,7 +3,7 @@
 //! Application use cases and ports for GamePulse.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -84,6 +84,212 @@ impl StoredCoverImage {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+}
+
+/// A collision-free, versioned representation of the exact source descriptor that selected a
+/// local cover asset. It is intentionally derived in application code so every durable adapter
+/// compares the same stable identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoverDescriptorFingerprint(String);
+
+impl CoverDescriptorFingerprint {
+    pub fn from_descriptor(descriptor: &GameCoverDescriptor) -> Self {
+        let mut value = String::from("v1");
+        for component in [
+            descriptor.bucket_path(),
+            descriptor.bucket_type(),
+            descriptor.filename(),
+            descriptor.kind(),
+        ] {
+            let _ = write!(value, ":{}:", component.len());
+            for byte in component.bytes() {
+                let _ = write!(value, "{byte:02x}");
+            }
+        }
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One persisted source descriptor selected for the bounded local-cover refresh workflow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoverBackfillCandidate {
+    source_product_id: SourceProductId,
+    descriptor: GameCoverDescriptor,
+    descriptor_fingerprint: CoverDescriptorFingerprint,
+}
+
+impl CoverBackfillCandidate {
+    pub fn new(source_product_id: SourceProductId, descriptor: GameCoverDescriptor) -> Self {
+        let descriptor_fingerprint = CoverDescriptorFingerprint::from_descriptor(&descriptor);
+        Self {
+            source_product_id,
+            descriptor,
+            descriptor_fingerprint,
+        }
+    }
+
+    pub const fn source_product_id(&self) -> SourceProductId {
+        self.source_product_id
+    }
+
+    pub fn descriptor(&self) -> &GameCoverDescriptor {
+        &self.descriptor
+    }
+
+    pub fn descriptor_fingerprint(&self) -> &CoverDescriptorFingerprint {
+        &self.descriptor_fingerprint
+    }
+}
+
+/// The only conditional persistence outcomes allowed by the local-cover workflow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverBackfillPersistOutcome {
+    Stored,
+    AlreadyCurrent,
+    Stale,
+}
+
+/// Application-owned durable boundary for selecting stale local assets and conditionally storing
+/// one fetched cover only while its descriptor remains current.
+pub trait CoverBackfillStorePort {
+    type Error;
+
+    fn cover_backfill_candidates(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<CoverBackfillCandidate>, Self::Error>;
+
+    fn store_cover_if_current(
+        &mut self,
+        candidate: &CoverBackfillCandidate,
+        cover: &StoredCoverImage,
+    ) -> Result<CoverBackfillPersistOutcome, Self::Error>;
+}
+
+/// Application-owned asynchronous source boundary for one already-selected cover descriptor.
+pub trait AsyncCoverImageSourcePort: Send + Sync {
+    type Error;
+    type FetchFuture<'a>: Future<Output = Result<Option<StoredCoverImage>, Self::Error>> + Send + 'a
+    where
+        Self: 'a;
+
+    fn fetch_cover(&self, candidate: &CoverBackfillCandidate) -> Self::FetchFuture<'_>;
+}
+
+/// One opt-in invocation cannot issue more than this many source requests.
+pub const MAX_COVER_BACKFILL_CANDIDATES: usize = 20;
+
+/// Aggregate-only result of one bounded local-cover refresh invocation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CoverBackfillReport {
+    attempted: usize,
+    stored: usize,
+    unavailable: usize,
+    stale: usize,
+    already_current: usize,
+    failed: usize,
+}
+
+impl CoverBackfillReport {
+    pub const fn attempted(self) -> usize {
+        self.attempted
+    }
+
+    pub const fn stored(self) -> usize {
+        self.stored
+    }
+
+    pub const fn unavailable(self) -> usize {
+        self.unavailable
+    }
+
+    pub const fn stale(self) -> usize {
+        self.stale
+    }
+
+    pub const fn already_current(self) -> usize {
+        self.already_current
+    }
+
+    pub const fn failed(self) -> usize {
+        self.failed
+    }
+
+    /// A repeat is safe only while the preceding invocation made durable progress.
+    pub const fn made_progress(self) -> bool {
+        self.stored > 0
+    }
+
+    pub const fn exit_code(self) -> i32 {
+        if self.failed == 0 { 0 } else { 1 }
+    }
+
+    pub fn to_json(self) -> String {
+        format!(
+            "{{\"schema_version\":\"gamepulse.cover_backfill.v2\",\"attempted\":{},\"stored\":{},\"unavailable\":{},\"stale\":{},\"already_current\":{},\"failed\":{},\"made_progress\":{}}}",
+            self.attempted,
+            self.stored,
+            self.unavailable,
+            self.stale,
+            self.already_current,
+            self.failed,
+            self.made_progress(),
+        )
+    }
+}
+
+/// Only an invalid caller limit or initial candidate-selection failure prevents a report.
+#[derive(Debug)]
+pub enum CoverBackfillExecutionError<StoreError> {
+    InvalidLimit,
+    Selection(StoreError),
+}
+
+/// Fetch and conditionally persist a bounded set of missing or stale local cover assets.
+///
+/// The coordinator deliberately holds no durable store lock while a source future is pending.
+/// Repeated calls are deterministic by candidate order; a descriptor refresh between selection and
+/// persistence is reported as stale rather than overwriting the newer source state.
+pub async fn execute_cover_backfill<S, P>(
+    store: &mut S,
+    source: &P,
+    limit: usize,
+) -> Result<CoverBackfillReport, CoverBackfillExecutionError<S::Error>>
+where
+    S: CoverBackfillStorePort,
+    P: AsyncCoverImageSourcePort,
+{
+    if !(1..=MAX_COVER_BACKFILL_CANDIDATES).contains(&limit) {
+        return Err(CoverBackfillExecutionError::InvalidLimit);
+    }
+    let candidates = store
+        .cover_backfill_candidates(limit)
+        .map_err(CoverBackfillExecutionError::Selection)?;
+    let mut report = CoverBackfillReport::default();
+    for candidate in candidates {
+        report.attempted = report.attempted.saturating_add(1);
+        match source.fetch_cover(&candidate).await {
+            Ok(Some(cover)) => match store.store_cover_if_current(&candidate, &cover) {
+                Ok(CoverBackfillPersistOutcome::Stored) => {
+                    report.stored = report.stored.saturating_add(1)
+                }
+                Ok(CoverBackfillPersistOutcome::AlreadyCurrent) => {
+                    report.already_current = report.already_current.saturating_add(1)
+                }
+                Ok(CoverBackfillPersistOutcome::Stale) => {
+                    report.stale = report.stale.saturating_add(1)
+                }
+                Err(_) => report.failed = report.failed.saturating_add(1),
+            },
+            Ok(None) => report.unavailable = report.unavailable.saturating_add(1),
+            Err(_) => report.failed = report.failed.saturating_add(1),
+        }
+    }
+    Ok(report)
 }
 
 /// The compact fields rendered on a catalogue card.
@@ -3534,3 +3740,149 @@ impl fmt::Display for JobHandlerRegistryError {
 }
 
 impl std::error::Error for JobHandlerRegistryError {}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::future::{Future, Ready, ready};
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct FixtureStore {
+        candidates: Vec<CoverBackfillCandidate>,
+        outcomes: VecDeque<CoverBackfillPersistOutcome>,
+    }
+
+    impl CoverBackfillStorePort for FixtureStore {
+        type Error = ();
+
+        fn cover_backfill_candidates(
+            &mut self,
+            limit: usize,
+        ) -> Result<Vec<CoverBackfillCandidate>, Self::Error> {
+            assert!(self.candidates.len() <= limit);
+            Ok(std::mem::take(&mut self.candidates))
+        }
+
+        fn store_cover_if_current(
+            &mut self,
+            _candidate: &CoverBackfillCandidate,
+            _cover: &StoredCoverImage,
+        ) -> Result<CoverBackfillPersistOutcome, Self::Error> {
+            Ok(self
+                .outcomes
+                .pop_front()
+                .expect("fixture persistence outcome must exist"))
+        }
+    }
+
+    struct FixtureSource {
+        responses: Mutex<VecDeque<Result<Option<StoredCoverImage>, ()>>>,
+    }
+
+    impl AsyncCoverImageSourcePort for FixtureSource {
+        type Error = ();
+        type FetchFuture<'a>
+            = Ready<Result<Option<StoredCoverImage>, Self::Error>>
+        where
+            Self: 'a;
+
+        fn fetch_cover(&self, _candidate: &CoverBackfillCandidate) -> Self::FetchFuture<'_> {
+            ready(
+                self.responses
+                    .lock()
+                    .expect("fixture source lock must hold")
+                    .pop_front()
+                    .expect("fixture source response must exist"),
+            )
+        }
+    }
+
+    fn candidate(source_product_id: u64, filename: &str) -> CoverBackfillCandidate {
+        CoverBackfillCandidate::new(
+            SourceProductId::new(source_product_id).expect("test identity must be valid"),
+            GameCoverDescriptor::new(
+                format!("/provider/7/2/{filename}"),
+                "catalog",
+                filename,
+                "cardImage",
+            )
+            .expect("test descriptor must be valid"),
+        )
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_cover_backfill_is_application_owned_and_reports_repeat_stop_condition() {
+        let image = StoredCoverImage::new(CoverImageContentType::Png, vec![1])
+            .expect("test image must be valid");
+        let mut store = FixtureStore {
+            candidates: vec![candidate(101, "a.png"), candidate(102, "b.png")],
+            outcomes: VecDeque::from([CoverBackfillPersistOutcome::Stored]),
+        };
+        let source = FixtureSource {
+            responses: Mutex::new(VecDeque::from([Ok(Some(image)), Ok(None)])),
+        };
+
+        let report = block_on(execute_cover_backfill(&mut store, &source, 20))
+            .expect("application coordinator must complete");
+
+        assert_eq!(report.attempted(), 2);
+        assert_eq!(report.stored(), 1);
+        assert_eq!(report.unavailable(), 1);
+        assert_eq!(report.failed(), 0);
+        assert!(report.made_progress());
+        assert_eq!(report.exit_code(), 0);
+        assert!(report.to_json().contains("\"made_progress\":true"));
+
+        let repeated = block_on(execute_cover_backfill(&mut store, &source, 20))
+            .expect("empty repeat must complete");
+        assert_eq!(repeated.attempted(), 0);
+        assert!(!repeated.made_progress());
+    }
+
+    #[test]
+    fn descriptor_fingerprint_is_stable_and_component_unambiguous() {
+        let first = candidate(101, "a.png");
+        let second = candidate(101, "a.png");
+        let different = candidate(101, "b.png");
+        assert_eq!(
+            first.descriptor_fingerprint(),
+            second.descriptor_fingerprint()
+        );
+        assert_ne!(
+            first.descriptor_fingerprint(),
+            different.descriptor_fingerprint()
+        );
+    }
+
+    #[test]
+    fn application_rejects_a_cover_backfill_limit_above_the_source_budget() {
+        let mut store = FixtureStore::default();
+        let source = FixtureSource {
+            responses: Mutex::new(VecDeque::new()),
+        };
+        assert!(matches!(
+            block_on(execute_cover_backfill(
+                &mut store,
+                &source,
+                MAX_COVER_BACKFILL_CANDIDATES + 1
+            )),
+            Err(CoverBackfillExecutionError::InvalidLimit)
+        ));
+    }
+}

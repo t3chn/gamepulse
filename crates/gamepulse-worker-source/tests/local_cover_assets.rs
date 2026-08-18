@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use gamepulse_application::{CoverImageContentType, GameCoverDescriptor};
+use gamepulse_application::{CoverImageContentType, GameCoverDescriptor, StoredCoverImage};
 use gamepulse_worker_source::{decode_local_cover_image, resolve_local_cover_source_url};
 
 const ONE_PIXEL_PNG: &[u8] = &[
@@ -42,4 +42,23 @@ fn rejects_an_unsafe_descriptor_or_mismatched_content_type() {
     assert!(
         decode_local_cover_image(CoverImageContentType::Jpeg, ONE_PIXEL_PNG.to_vec()).is_none()
     );
+}
+
+#[test]
+fn rejects_percent_encoded_or_ambiguous_descriptor_segments_and_oversized_fixture_body() {
+    for (path, filename) in [
+        ("/provider/7/%2e%2e/escape.png", "escape.png"),
+        ("/provider/7//double.png", "double.png"),
+        ("/provider/7/./dot.png", "dot.png"),
+        ("/provider/7/2/encoded%2fname.png", "encoded%2fname.png"),
+        ("/provider/7/2/space name.png", "space name.png"),
+    ] {
+        let descriptor = GameCoverDescriptor::new(path, "catalog", filename, "cardImage")
+            .expect("untrusted fixture descriptor remains structurally valid");
+        assert!(resolve_local_cover_source_url(&descriptor).is_none());
+    }
+
+    let mut oversized = vec![0_u8; StoredCoverImage::MAX_BYTES + 1];
+    oversized[..8].copy_from_slice(&ONE_PIXEL_PNG[..8]);
+    assert!(decode_local_cover_image(CoverImageContentType::Png, oversized).is_none());
 }

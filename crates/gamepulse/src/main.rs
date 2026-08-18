@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use gamepulse_application::{
     HourlyJobSchedule, JobClaimPacing, JobHandler, JobHandlerRegistry, ReviewSummaryJobSchedule,
-    RuntimeJobType, RuntimeJobTypeFilter, SourceIngestionJobSchedule,
+    RuntimeJobType, RuntimeJobTypeFilter, SourceIngestionJobSchedule, execute_cover_backfill,
 };
 use gamepulse_storage_sqlite::{
     SqliteAcceptanceCycleStore, SqliteGameCatalogueReadStore, SqliteGameCoverAssetStore,
@@ -151,32 +151,17 @@ async fn run_cover_backfill(command: covers::CoverBackfillCommand) -> i32 {
         Ok(store) => store,
         Err(_) => return 1,
     };
-    let candidates = match store.missing_cover_candidates(command.limit()) {
-        Ok(candidates) => candidates,
-        Err(_) => return 1,
-    };
     let client = match MetacriticCoverImageClient::new() {
         Ok(client) => client,
         Err(_) => return 1,
     };
-    let mut stored = 0_usize;
-    let mut unavailable = 0_usize;
-    let mut failed = 0_usize;
-    for candidate in candidates {
-        match client.fetch(candidate.descriptor()).await {
-            Ok(Some(cover)) => match store.store_cover(candidate.source_product_id(), &cover) {
-                Ok(()) => stored += 1,
-                Err(_) => failed += 1,
-            },
-            Ok(None) => unavailable += 1,
-            Err(_) => failed += 1,
+    match execute_cover_backfill(&mut store, &client, command.limit()).await {
+        Ok(report) => {
+            println!("{}", report.to_json());
+            report.exit_code()
         }
+        Err(_) => 1,
     }
-    println!(
-        "{{\"schema_version\":\"gamepulse.cover_backfill.v1\",\"attempted\":{},\"stored\":{stored},\"unavailable\":{unavailable},\"failed\":{failed}}}",
-        stored + unavailable + failed
-    );
-    if failed == 0 { 0 } else { 1 }
 }
 
 /// The composition root owns concrete SQLite, clock, scheduler, and source-lane wiring.

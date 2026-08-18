@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::Path;
 
-use gamepulse_application::{GameSnapshot, GameSnapshotStore};
+use gamepulse_application::{CoverDescriptorFingerprint, GameSnapshot, GameSnapshotStore};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 /// A durable SQLite implementation of the application-owned game snapshot upsert port.
@@ -100,6 +100,27 @@ pub(crate) fn upsert_snapshot_in_transaction(
             ],
         )
         .map_err(GameSnapshotStoreError::database)?;
+    match cover {
+        Some(cover) => {
+            let fingerprint = CoverDescriptorFingerprint::from_descriptor(cover);
+            transaction
+                .execute(
+                    "DELETE FROM game_cover_assets
+                     WHERE game_source_product_id = ?1
+                       AND descriptor_fingerprint <> ?2",
+                    params![source_product_id, fingerprint.as_str()],
+                )
+                .map_err(GameSnapshotStoreError::database)?;
+        }
+        None => {
+            transaction
+                .execute(
+                    "DELETE FROM game_cover_assets WHERE game_source_product_id = ?1",
+                    params![source_product_id],
+                )
+                .map_err(GameSnapshotStoreError::database)?;
+        }
+    }
     transaction
         .execute(
             "DELETE FROM game_platform_scores WHERE game_source_product_id = ?1",

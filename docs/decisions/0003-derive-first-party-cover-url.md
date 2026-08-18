@@ -38,12 +38,18 @@ must not erase it. Web reads never derive URLs or fetch upstream images.
 
 `cover-backfill` is the sole acquisition path for existing records. It accepts
 an existing absolute SQLite path and a hard limit of 1–20, resolves only the
-validated descriptor shape, makes no redirect or retry, accepts only
-JPEG/PNG/WebP with a matching file signature and a 2 MiB cap, and writes bytes
-to `game_cover_assets`. It never deletes game data or starts the service. The
-server-rendered pages refer only to `/games/{id}/cover`; that route serves the
-persisted bytes and allowlisted content type without exposing a source URL or
-descriptor in HTML.
+validated descriptor shape, rejects percent-encoded or ambiguous path segments,
+makes no redirect or retry, accepts only JPEG/PNG/WebP with a matching file
+signature and a 2 MiB cap, and writes bytes to `game_cover_assets`. The
+application-owned coordinator, rather than the binary entrypoint, owns
+candidate selection, source outcomes, conditional persistence, reporting, and
+exit policy. Each asset is bound to a versioned descriptor fingerprint; a
+snapshot replacement invalidates mismatched bytes and a stale fetch cannot
+replace the current descriptor. It never deletes game data or starts the
+service. The server-rendered pages refer only to `/games/{id}/cover`; that
+route serves the persisted bytes and allowlisted content type without exposing
+a source URL or descriptor in HTML. Repeat only while the preceding aggregate
+report proves a stored asset; stop at zero progress, no candidates, or failure.
 
 ## Rollback
 

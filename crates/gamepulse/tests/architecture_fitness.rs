@@ -106,6 +106,14 @@ fn optional_worker_to_worker_dependency_is_rejected() {
 }
 
 #[test]
+fn application_to_storage_adapter_dependency_is_rejected() {
+    assert_rejected(
+        "forbidden-application-adapter-edge.json",
+        "unexpected internal edge: gamepulse-application -> gamepulse-storage-sqlite",
+    );
+}
+
+#[test]
 fn second_binary_is_rejected() {
     assert_rejected(
         "second-binary.json",

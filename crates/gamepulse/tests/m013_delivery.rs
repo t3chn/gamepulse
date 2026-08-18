@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::to_bytes;
-use axum::http::StatusCode;
+use axum::http::{Request, StatusCode};
 use gamepulse_application::ServiceReadinessPort;
 use gamepulse_storage_sqlite::{SqliteJobStore, SqliteReadinessProbe};
+use tower::ServiceExt;
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
 
@@ -98,4 +99,35 @@ async fn readiness_requires_the_current_sqlite_schema_and_returns_no_operational
         response_status_and_body(gamepulse_web::readiness_response(&probe).await).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.is_empty());
+}
+
+#[tokio::test]
+async fn unavailable_cover_handler_has_the_same_503_contract_as_other_database_routes() {
+    let router =
+        gamepulse_web::unavailable_service_router(std::sync::Arc::new(UnavailableReadiness));
+    for uri in ["/games", "/games/101", "/games/101/cover"] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .expect("test request must build"),
+            )
+            .await
+            .expect("unavailable router must respond");
+        let (status, body) = response_status_and_body(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "route {uri}");
+        assert!(body.is_empty(), "route {uri}");
+    }
+}
+
+struct UnavailableReadiness;
+
+impl ServiceReadinessPort for UnavailableReadiness {
+    type Error = ();
+
+    fn check_readiness(&self) -> Result<(), Self::Error> {
+        Err(())
+    }
 }

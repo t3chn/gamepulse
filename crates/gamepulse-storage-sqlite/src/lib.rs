@@ -25,9 +25,7 @@ use rusqlite::{
 
 pub use acceptance_cycle::{AcceptanceCycleReadStoreError, SqliteAcceptanceCycleStore};
 pub use catalogue::{GameCatalogueReadStoreError, SqliteGameCatalogueReadStore};
-pub use cover_assets::{
-    CoverBackfillCandidate, GameCoverAssetStoreError, SqliteGameCoverAssetStore,
-};
+pub use cover_assets::{GameCoverAssetStoreError, SqliteGameCoverAssetStore};
 pub use game_snapshot::{GameSnapshotStoreError, SqliteGameSnapshotStore};
 pub use job_queue::{JobStoreError, SqliteJobStore};
 pub use review_summary::{ReviewSummaryStoreError, SqliteReviewSummaryStore};
@@ -43,7 +41,8 @@ const RETRY_BACKOFF_AND_SOURCE_PACING_SCHEMA_VERSION: i64 = 7;
 const DURABLE_RUNS_SCHEMA_VERSION: i64 = 8;
 const PREVIOUS_SCHEMA_VERSION: i64 = 9;
 const LOCAL_COVER_ASSETS_SCHEMA_VERSION: i64 = 10;
-const SCHEMA_VERSION: i64 = LOCAL_COVER_ASSETS_SCHEMA_VERSION;
+const COVER_ASSET_FINGERPRINT_SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = COVER_ASSET_FINGERPRINT_SCHEMA_VERSION;
 const DAILY_CRAWL_MIGRATION_0001: &str = include_str!("../migrations/0001_daily_crawl_state.sql");
 const JOB_QUEUE_MIGRATION_0002: &str = include_str!("../migrations/0002_job_queue.sql");
 const GAME_SNAPSHOT_MIGRATION_0003: &str = include_str!("../migrations/0003_game_snapshots.sql");
@@ -62,6 +61,8 @@ const SOURCE_UNAVAILABLE_REJECTION_MIGRATION_0009: &str =
     include_str!("../migrations/0009_source_unavailable_rejection.sql");
 const LOCAL_COVER_ASSETS_MIGRATION_0010: &str =
     include_str!("../migrations/0010_local_cover_assets.sql");
+const COVER_ASSET_FINGERPRINT_MIGRATION_0011: &str =
+    include_str!("../migrations/0011_cover_asset_fingerprint.sql");
 
 /// Read-only SQLite readiness adapter for the configured persistent database.
 ///
@@ -586,23 +587,39 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .execute_batch(SOURCE_UNAVAILABLE_REJECTION_MIGRATION_0009)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
-                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .pragma_update(None, "user_version", PREVIOUS_SCHEMA_VERSION)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .commit()
                 .map_err(DailyCrawlStateStoreError::database)
         }
-        PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION => Ok(()),
+        PREVIOUS_SCHEMA_VERSION | LOCAL_COVER_ASSETS_SCHEMA_VERSION | SCHEMA_VERSION => Ok(()),
         other => Err(DailyCrawlStateStoreError::malformed(format!(
             "unsupported schema version {other}"
         ))),
     }?;
-    if version != SCHEMA_VERSION {
+    let local_cover_assets_missing = version == LOCAL_COVER_ASSETS_SCHEMA_VERSION
+        && !table_exists(connection, "game_cover_assets")?;
+    if version < LOCAL_COVER_ASSETS_SCHEMA_VERSION || local_cover_assets_missing {
         let transaction = connection
             .transaction()
             .map_err(DailyCrawlStateStoreError::database)?;
         transaction
             .execute_batch(LOCAL_COVER_ASSETS_MIGRATION_0010)
+            .map_err(DailyCrawlStateStoreError::database)?;
+        transaction
+            .pragma_update(None, "user_version", LOCAL_COVER_ASSETS_SCHEMA_VERSION)
+            .map_err(DailyCrawlStateStoreError::database)?;
+        transaction
+            .commit()
+            .map_err(DailyCrawlStateStoreError::database)?;
+    }
+    if version < COVER_ASSET_FINGERPRINT_SCHEMA_VERSION {
+        let transaction = connection
+            .transaction()
+            .map_err(DailyCrawlStateStoreError::database)?;
+        transaction
+            .execute_batch(COVER_ASSET_FINGERPRINT_MIGRATION_0011)
             .map_err(DailyCrawlStateStoreError::database)?;
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -612,6 +629,21 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
             .map_err(DailyCrawlStateStoreError::database)?;
     }
     validate_owned_schema(connection)
+}
+
+fn table_exists(
+    connection: &Connection,
+    table_name: &str,
+) -> Result<bool, DailyCrawlStateStoreError> {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table_name],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|value| value.is_some())
+        .map_err(DailyCrawlStateStoreError::database)
 }
 
 fn validate_owned_schema(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError> {
@@ -659,6 +691,7 @@ fn validate_local_cover_assets_schema_structure(
             ("game_source_product_id", "INTEGER", 1, 1),
             ("content_type", "TEXT", 1, 0),
             ("content", "BLOB", 1, 0),
+            ("descriptor_fingerprint", "TEXT", 1, 0),
         ],
     )?;
     validate_table_layout(connection, "game_cover_assets", true)?;

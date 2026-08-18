@@ -194,7 +194,7 @@ by the binary rather than imported by workers or web.
 | State | Owner | Purpose |
 | --- | --- | --- |
 | Games, platform scores, and validated public cover URL | `games`, `game_platform_scores` | Current source data |
-| Local cover bytes and allowlisted MIME type | `game_cover_assets` | Offline-first cover delivery |
+| Local cover bytes, allowlisted MIME type, and descriptor fingerprint | `game_cover_assets` | Offline-first cover delivery |
 | Review source snapshots | `review_snapshots` | Summary inputs and hashes |
 | Summary freshness and output | `summaries` | UI-visible LLM state |
 | Daily crawl progression | `crawl_days` | New Releases then browse ordering |
@@ -214,8 +214,9 @@ support reliably:
 - the complete declared internal Cargo dependency graph, including optional and
   non-normal dependency kinds, matches the adopted allowlist;
 - metadata-shaped sabotage fixtures reject a forbidden worker-to-worker edge,
-  a second binary, a missing member, an extra ninth member, an extra library
-  target, and a retyped library target.
+  a forbidden application-to-storage adapter edge, a second binary, a missing
+  member, an extra ninth member, an extra library target, and a retyped library
+  target.
 
 `mise run architecture` runs this gate against live `cargo metadata --no-deps`.
 `--no-deps` intentionally avoids resolving external transitive packages while
@@ -360,14 +361,19 @@ queue settlement, daily selection, and summary behavior unchanged. The durable
 run boundary is independent of optional cover results; a cover failure neither
 changes candidate acceptance nor source progression.
 
-Local cover delivery retains the source descriptor only as durable source data. The explicit
-`cover-backfill` command resolves the exact observed `catalog` / `cardImage` / `/provider/`
-descriptor shape, fetches at most 20 missing images with no redirect or retry, and persists only
-size-bounded JPEG/PNG/WebP bytes whose declared type matches their signature. The catalogue and
-detail templates render `/games/{id}/cover` only when that asset exists; the endpoint serves the
-SQLite bytes and fixed allowlisted MIME type. Page reads never contact a source, source URLs and
-descriptor fields never enter evaluator-facing HTML, and absent/failed covers retain the safe GP
-placeholder. This command is operationally opt-in and remains outside mandatory run settlement.
+Local cover delivery retains the source descriptor only as durable source data. The application
+owns the bounded `cover-backfill` coordinator, aggregate report, and exit policy; the binary only
+wires its SQLite and source adapters. It resolves the exact observed `catalog` / `cardImage` /
+`/provider/` descriptor shape, rejects encoded or ambiguous segments, fetches at most 20 missing
+or stale images with no redirect or retry, and persists only size-bounded JPEG/PNG/WebP bytes
+whose declared type matches their signature. Every local asset carries a versioned descriptor
+fingerprint. A snapshot replacement atomically invalidates a mismatched asset, and persistence
+rechecks the selected descriptor in one SQLite transaction so a late fetch cannot overwrite a
+newer descriptor. The catalogue and detail templates render `/games/{id}/cover` only when that
+eligible asset exists; the endpoint serves the SQLite bytes and fixed allowlisted MIME type. Page
+reads never contact a source, source URLs and descriptor fields never enter evaluator-facing HTML,
+and absent/failed covers retain the safe GP placeholder. This command is operationally opt-in and
+remains outside mandatory run settlement.
 
 M013 adds local delivery readiness without changing the one-binary,
 one-process topology. `gamepulse-web` owns `GET /health/live` and
