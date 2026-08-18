@@ -700,7 +700,10 @@ async fn fixture_cover_backfill_flows_through_application_sqlite_reopen_and_loca
     assert_eq!(status, StatusCode::OK);
     assert!(catalogue_html.contains("src=\"/games/101/cover\" alt=\"Cover for Alpha\""));
     assert!(!catalogue_html.contains("/games/102/cover\" alt=\"Cover for Beta\""));
-    assert!(!catalogue_html.contains("metacritic.com"));
+    assert!(catalogue_html.contains(
+        "src=\"https://www.metacritic.com/a/img/catalog/provider/7/2/beta.png\" alt=\"Cover for Beta\""
+    ));
+    assert!(!catalogue_html.contains("/a/img/catalog/provider/7/2/alpha.png"));
 
     let (status, detail_html) =
         read_response(gamepulse_web::game_detail_response(Arc::clone(&catalogue), 101).await).await;

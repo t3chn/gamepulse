@@ -45,6 +45,10 @@ impl SqliteGameCatalogueReadStore {
                         games.source_product_id,
                         games.title,
                         games.public_cover_url,
+                        games.cover_bucket_path,
+                        games.cover_bucket_type,
+                        games.cover_filename,
+                        games.cover_kind,
                         EXISTS (
                             SELECT 1
                             FROM game_cover_assets AS cover_assets
@@ -75,7 +79,9 @@ impl SqliteGameCatalogueReadStore {
                           )
                       )
                 )
-                SELECT source_product_id, title, public_cover_url, has_local_cover, selected_metascore
+                SELECT source_product_id, title, public_cover_url,
+                       cover_bucket_path, cover_bucket_type, cover_filename, cover_kind,
+                       has_local_cover, selected_metascore
                 FROM catalogue_rows
                 ORDER BY
                     selected_metascore IS NULL ASC,
@@ -93,16 +99,37 @@ impl SqliteGameCatalogueReadStore {
                         decode_source_product_id(row.get::<_, i64>(0)?)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
-                        row.get::<_, i64>(3)? != 0,
-                        row.get::<_, Option<u8>>(4)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)? != 0,
+                        row.get::<_, Option<u8>>(8)?,
                     ))
                 },
             )
             .map_err(GameCatalogueReadStoreError::database)?;
         let mut games = Vec::new();
         for row in rows {
-            let (source_product_id, title, public_cover_url, has_local_cover, highest_metascore) =
-                row.map_err(GameCatalogueReadStoreError::database)?;
+            let (
+                source_product_id,
+                title,
+                public_cover_url,
+                cover_bucket_path,
+                cover_bucket_type,
+                cover_filename,
+                cover_kind,
+                has_local_cover,
+                highest_metascore,
+            ) = row.map_err(GameCatalogueReadStoreError::database)?;
+            let public_cover_url = public_cover_url.or_else(|| {
+                derive_public_cover_url(
+                    cover_bucket_path.as_deref(),
+                    cover_bucket_type.as_deref(),
+                    cover_filename.as_deref(),
+                    cover_kind.as_deref(),
+                )
+            });
             games.push(CatalogueGameCard::new(
                 source_product_id,
                 title,
@@ -158,6 +185,16 @@ impl SqliteGameCatalogueReadStore {
         let critic_summary =
             self.review_summary(stored_game.source_product_id, ReviewKind::Critic)?;
         let user_summary = self.review_summary(stored_game.source_product_id, ReviewKind::User)?;
+        let public_cover_url = stored_game.public_cover_url.clone().or_else(|| {
+            stored_game.cover.as_ref().and_then(|cover| {
+                derive_public_cover_url(
+                    Some(cover.bucket_path()),
+                    Some(cover.bucket_type()),
+                    Some(cover.filename()),
+                    Some(cover.kind()),
+                )
+            })
+        });
 
         Ok(Some(CatalogueGameDetail::new(
             stored_game.source_product_id,
@@ -166,7 +203,7 @@ impl SqliteGameCatalogueReadStore {
             stored_game.description,
             stored_game.cover,
             stored_game.has_local_cover,
-            stored_game.public_cover_url,
+            public_cover_url,
             stored_game.video_url,
             platforms,
             developers,
@@ -493,6 +530,33 @@ fn decode_source_product_id(value: i64) -> rusqlite::Result<SourceProductId> {
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value as i64))
 }
 
+fn derive_public_cover_url(
+    bucket_path: Option<&str>,
+    bucket_type: Option<&str>,
+    filename: Option<&str>,
+    kind: Option<&str>,
+) -> Option<String> {
+    if bucket_type? != "catalog" || kind? != "cardImage" {
+        return None;
+    }
+    let path = bucket_path?.strip_prefix("/provider/")?;
+    let filename = filename?;
+    if path.is_empty()
+        || path.contains(['%', '\\', '?', '#'])
+        || path.split('/').any(|segment| {
+            segment.is_empty() || segment == "." || segment == ".." || segment.contains(['%', '\\'])
+        })
+        || filename.is_empty()
+        || filename.contains(['%', '/', '\\', '?', '#'])
+        || !path.ends_with(&format!("/{filename}"))
+    {
+        return None;
+    }
+    Some(format!(
+        "https://www.metacritic.com/a/img/catalog/provider/{path}"
+    ))
+}
+
 fn sqlite_identifier(
     source_product_id: SourceProductId,
 ) -> Result<i64, GameCatalogueReadStoreError> {
@@ -547,8 +611,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use gamepulse_application::{
-        CatalogueQuery, GameDeveloper, GamePlatformScore, GameSnapshot, GameVideoLink, Metascore,
-        SourceProductId, upsert_game_snapshot,
+        CatalogueQuery, GameCoverDescriptor, GameDeveloper, GamePlatformScore, GameSnapshot,
+        GameVideoLink, Metascore, SourceProductId, upsert_game_snapshot,
     };
 
     use super::*;
@@ -679,5 +743,67 @@ mod tests {
                 .collect::<Vec<_>>(),
             [104, 102, 103]
         );
+    }
+
+    #[test]
+    fn reconstructs_only_the_validated_first_party_cover_for_legacy_snapshots() {
+        let database = TemporaryDatabase::new();
+        let snapshot = GameSnapshot::new(
+            SourceProductId::new(201).expect("test source identity must be valid"),
+            "legacy-cover",
+            "Legacy cover",
+            "Stored fixture description",
+            Some(
+                GameCoverDescriptor::new(
+                    "/provider/7/2/7-legacy-cover.jpg",
+                    "catalog",
+                    "7-legacy-cover.jpg",
+                    "cardImage",
+                )
+                .expect("test cover descriptor must be valid"),
+            ),
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("test snapshot must be valid");
+        let mut snapshots =
+            SqliteGameSnapshotStore::open(&database.path).expect("snapshot store must open");
+        upsert_game_snapshot(&mut snapshots, &snapshot).expect("fixture snapshot must persist");
+        drop(snapshots);
+
+        let mut catalogue =
+            SqliteGameCatalogueReadStore::open(&database.path).expect("catalogue must open");
+        let page = catalogue
+            .list_catalogue(&CatalogueQuery::default())
+            .expect("catalogue query must succeed");
+        assert_eq!(
+            page.games()[0].public_cover_url(),
+            Some("https://www.metacritic.com/a/img/catalog/provider/7/2/7-legacy-cover.jpg")
+        );
+        let detail = catalogue
+            .game_detail(SourceProductId::new(201).expect("test identity must be valid"))
+            .expect("detail query must succeed")
+            .expect("stored game must be found");
+        assert_eq!(
+            detail.public_cover_url(),
+            page.games()[0].public_cover_url()
+        );
+
+        for invalid_path in [
+            "/provider/7/../7-legacy-cover.jpg",
+            "/provider/7/2/other.jpg",
+            "/provider/7/2/7-legacy-cover.jpg?large",
+        ] {
+            assert_eq!(
+                derive_public_cover_url(
+                    Some(invalid_path),
+                    Some("catalog"),
+                    Some("7-legacy-cover.jpg"),
+                    Some("cardImage"),
+                ),
+                None
+            );
+        }
     }
 }

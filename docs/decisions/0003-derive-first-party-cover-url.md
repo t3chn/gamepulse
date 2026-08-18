@@ -32,9 +32,13 @@ The source adapter may derive a public cover URL only when all of these hold:
 - the resulting URL passes the existing exact HTTPS `www.metacritic.com`
   validation.
 
-The derived URL remains source-adapter data. Optional HTML enrichment may
-replace it with another validated first-party URL, but a missing HTML result
-must not erase it. Web reads never derive URLs or fetch upstream images.
+The derived URL normally remains source-adapter data. Optional HTML enrichment
+may replace it with another validated first-party URL, but a missing HTML result
+must not erase it. For legacy snapshots that predate `public_cover_url`, the
+SQLite read adapter may reconstruct the same exact first-party URL from the
+persisted descriptor using the identical validation rules. This fallback is
+request-free and does not mutate stored data. The web layer accepts only HTTPS
+fallbacks and never renders the raw descriptor.
 
 `cover-backfill` is the sole acquisition path for existing records. It accepts
 an existing absolute SQLite path and a hard limit of 1–20. Selection maps a
@@ -48,10 +52,11 @@ entrypoint, owns selection outcomes, source outcomes, conditional persistence,
 reporting, and exit policy. Each asset is bound to a versioned descriptor
 fingerprint; a snapshot replacement invalidates mismatched bytes and a stale fetch cannot
 replace the current descriptor. It never deletes game data or starts the
-service. The server-rendered pages refer only to `/games/{id}/cover`; that
-route serves the persisted bytes and allowlisted content type without exposing
-a source URL or descriptor in HTML. Repeat only while the preceding aggregate
-report proves a stored asset; stop at zero progress, no candidates, or failure.
+service. The server-rendered pages prefer `/games/{id}/cover`; that route serves
+the persisted bytes and allowlisted content type. When no local asset exists,
+they may render the validated first-party URL reconstructed above. Repeat
+acquisition only while the preceding aggregate report proves a stored asset;
+stop at zero progress, no candidates, or failure.
 
 The versioned aggregate report records an `unavailable` total and only bounded
 `unavailable_reasons`: descriptor rejection, unexpected HTTP status class,
