@@ -310,7 +310,7 @@ async fn dispatch_one(runtime: &mut Runtime<SqliteJobStore, SharedClock>) -> Fai
 }
 
 #[tokio::test]
-async fn missing_video_is_a_terminal_rejection_and_later_candidates_fill_exact_target() {
+async fn legacy_missing_video_rejection_can_still_advance_existing_runs() {
     let database = TemporaryDatabase::new();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let clock = SharedClock::new(1);

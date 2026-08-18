@@ -118,15 +118,11 @@ Platform entries use a numeric `id`, `slug`, release date, and optional
 `criticScoreSummary.score`. Developer names are the `production.companies`
 entries whose `typeName` is `Developer`.
 
-An absent `video` remains structurally valid source data. M054 applies the
-assignment eligibility rule at mandatory source-ingestion time: it closes that
-run item before persistence under the fixed private
-`missing_required_video` rejection category. The candidate does not create a
-game, review input, summary, or summary job and does not consume run quota; the
-same run advances to the next unique newest-first candidate. This does not
-change direct-HTTP parsing or expose source values through diagnostics. The
-successful terminal queue settlement retains only the aggregate
-`missing_required_video` observation.
+An absent `video` remains structurally valid source data and is persisted as
+explicitly unavailable. It does not disqualify an otherwise valid game from
+the assignment's 20-game batch. This keeps selection faithful to the requested
+newest games rather than silently replacing source records based on source
+completeness.
 
 The endpoint does not attach every platform's Userscore to its platform array.
 Fetch it separately for each platform slug:

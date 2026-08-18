@@ -4,8 +4,9 @@
 
 The one-shot evaluator report needs aggregate visibility into a small set of
 failure causes, while durable job errors are already part of the queue
-compatibility contract. A missing mandatory video is fatal and must continue to
-persist as `other_mandatory_stage`.
+compatibility contract. Source-omitted video is not a failure; the historical
+fixed observation category remains only for compatibility with existing report
+and database shapes.
 
 ## Options
 

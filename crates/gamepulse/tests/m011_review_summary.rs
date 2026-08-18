@@ -24,10 +24,9 @@ use gamepulse_storage_sqlite::{
 };
 use gamepulse_worker_llm::{LocalExtractiveReviewSummarizer, ReviewSummaryHandler};
 use gamepulse_worker_source::{
-    GameDetail, GameIdentity, GameIngestionTransport, MetacriticGameReviewError,
-    MetacriticGameReviewSource, PlatformDetail, PlatformUserScore, ReviewPage,
-    ReviewSourceIngestionHandler, SourceIngestionFailureCategory, parse_game_detail,
-    parse_platform_user_score_for_snapshot, parse_review_page,
+    GameDetail, GameIdentity, GameIngestionTransport, MetacriticGameReviewSource, PlatformDetail,
+    PlatformUserScore, ReviewPage, ReviewSourceIngestionHandler, SourceIngestionFailureCategory,
+    parse_game_detail, parse_platform_user_score_for_snapshot, parse_review_page,
 };
 use runtime::{Runtime, RuntimeClock, RuntimeClockError, RuntimeConfig, RuntimeTaskOutcome};
 use rusqlite::{Connection, params};
@@ -604,7 +603,7 @@ async fn source_review_continuation_failure_is_durable_and_leaves_no_partial_ref
 }
 
 #[tokio::test]
-async fn valid_missing_video_fixture_reaches_missing_required_video_not_identity_mismatch() {
+async fn valid_missing_video_fixture_remains_ingestible() {
     let transport = FixtureTransport::with_missing_video();
     let source = MetacriticGameReviewSource::new(transport.clone());
     let outcome = source
@@ -614,25 +613,22 @@ async fn valid_missing_video_fixture_reaches_missing_required_video_not_identity
         )
         .await;
 
-    assert!(
-        matches!(
-            &outcome,
-            Err(MetacriticGameReviewError::MissingRequiredVideo)
-        ),
-        "valid fixture must reach MissingRequiredVideo"
+    let ingested = outcome.expect("source-omitted video must not reject a valid game");
+    assert!(ingested.snapshot().video().is_none());
+    assert_eq!(
+        transport.calls(),
+        [
+            "detail:example-game",
+            "score:pc",
+            "score:console",
+            "review:critic:0:20",
+            "review:user:0:20",
+        ]
     );
-    assert!(
-        !matches!(
-            &outcome,
-            Err(MetacriticGameReviewError::MismatchedGameIdentity)
-        ),
-        "valid fixture must not fail as MismatchedGameIdentity"
-    );
-    assert_eq!(transport.calls(), ["detail:example-game"]);
 }
 
 #[tokio::test]
-async fn missing_required_video_fails_without_persisting_or_enqueuing_summaries() {
+async fn source_omitted_video_persists_and_enqueues_summaries() {
     let database = TemporaryDatabase::new();
     let queue = Arc::new(Mutex::new(
         SqliteJobStore::open(&database.path).expect("queue database must open"),
@@ -675,25 +671,20 @@ async fn missing_required_video_fails_without_persisting_or_enqueuing_summaries(
         1
     );
     let settled = runtime.join_all().await.expect("source task must join");
-    assert_eq!(
-        settled.settled,
-        [RuntimeTaskOutcome::Failed(
-            gamepulse_application::JobFailureResult::Failed
-        )]
-    );
-    assert_eq!(settled.observed_failures.missing_required_video(), 1);
+    assert_eq!(settled.settled, [RuntimeTaskOutcome::Succeeded]);
+    assert_eq!(settled.observed_failures.missing_required_video(), 0);
     drop(runtime);
     drop(queue);
     drop(reviews);
 
     let reopened = rusqlite::Connection::open(&database.path).expect("database must reopen");
-    for table in ["games", "review_inputs", "review_summaries"] {
+    for (table, expected) in [("games", 1), ("review_inputs", 2), ("review_summaries", 2)] {
         let count = reopened
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                 row.get::<_, i64>(0)
             })
             .expect("count must load");
-        assert_eq!(count, 0, "{table} must remain empty after a missing video");
+        assert_eq!(count, expected, "{table} must persist source data");
     }
     let summary_jobs = reopened
         .query_row(
@@ -702,7 +693,7 @@ async fn missing_required_video_fails_without_persisting_or_enqueuing_summaries(
             |row| row.get::<_, i64>(0),
         )
         .expect("summary job count must load");
-    assert_eq!(summary_jobs, 0);
+    assert_eq!(summary_jobs, 2);
     let mut attempts = SqliteJobStore::open(&database.path).expect("queue database must reopen");
     assert_eq!(
         attempts
@@ -710,7 +701,7 @@ async fn missing_required_video_fails_without_persisting_or_enqueuing_summaries(
             .expect("source job must load")
             .expect("source job must exist")
             .status(),
-        JobStatus::Failed
+        JobStatus::Succeeded
     );
     assert_eq!(
         attempts
@@ -719,13 +710,13 @@ async fn missing_required_video_fails_without_persisting_or_enqueuing_summaries(
             .as_slice()
             .first()
             .and_then(gamepulse_application::JobAttempt::error),
-        Some("other_mandatory_stage")
+        None
     );
-    assert_eq!(transport.calls(), ["detail:example-game"]);
+    assert_eq!(transport.calls().len(), 5);
 }
 
 #[tokio::test]
-async fn m043_reuses_m047_missing_video_fixture_twice_without_changing_fatal_outcomes() {
+async fn source_omitted_video_is_consistently_ingestible() {
     let mut observed = FailureCategoryCounts::zero();
     for _ in 0..2 {
         let database = TemporaryDatabase::new();
@@ -770,14 +761,9 @@ async fn m043_reuses_m047_missing_video_fixture_twice_without_changing_fatal_out
             1
         );
         let settled = runtime.join_all().await.expect("source task must join");
-        assert_eq!(
-            settled.settled,
-            [RuntimeTaskOutcome::Failed(
-                gamepulse_application::JobFailureResult::Failed
-            )]
-        );
+        assert_eq!(settled.settled, [RuntimeTaskOutcome::Succeeded]);
         observed.merge(settled.observed_failures);
-        assert_eq!(transport.calls(), ["detail:example-game"]);
+        assert_eq!(transport.calls().len(), 5);
 
         drop(runtime);
         drop(queue);
@@ -787,17 +773,17 @@ async fn m043_reuses_m047_missing_video_fixture_twice_without_changing_fatal_out
             .job("m035-source-missing-video")
             .expect("source job must load")
             .expect("source job must exist");
-        assert_eq!(record.status(), JobStatus::Failed);
+        assert_eq!(record.status(), JobStatus::Succeeded);
         assert_eq!(
             attempts
                 .attempts("m035-source-missing-video")
                 .expect("attempt history must load")
                 .first()
                 .and_then(gamepulse_application::JobAttempt::error),
-            Some("other_mandatory_stage")
+            None
         );
     }
-    assert_eq!(observed.missing_required_video(), 2);
+    assert_eq!(observed.missing_required_video(), 0);
 }
 
 #[test]

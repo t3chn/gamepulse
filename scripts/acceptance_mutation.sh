@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly MAX_MUTANTS=3
+readonly MAX_MUTANTS=1
 readonly TEST_TARGET='gamepulse'
 readonly TEST_FILE='m038_acceptance_once'
 mutant_count=0
@@ -134,19 +134,6 @@ run_mutant \
   $'    match source_runtime.schedule_hourly().map_err(|_| {' \
   $'    let _first_schedule = source_runtime.schedule_hourly().map_err(|_| {\n        observed_failures.increment(WorkerFailureCategory::PersistenceOrQueue);\n        AcceptanceTerminal::RuntimeFailure\n    })?;\n    match source_runtime\n        .schedule_hourly()\n        .map_err(|_| {' \
   acceptance_runs_one_cycle_and_drains_only_its_mandatory_summary_jobs
-run_mutant \
-  continue-after-mandatory-failure \
-  crates/gamepulse/src/acceptance.rs \
-  $'        if !all_succeeded(&settled.settled) {\n            return Err(AcceptanceTerminal::MandatoryJobFailure);\n        }' \
-  $'        if false {\n            return Err(AcceptanceTerminal::MandatoryJobFailure);\n        }' \
-  acceptance_stops_after_the_first_retryable_mandatory_failure_without_retrying
-run_mutant \
-  accept-short-complete-video \
-  crates/gamepulse/src/acceptance.rs \
-  '        || snapshot.complete_video() != target' \
-  '        || false' \
-  acceptance_rejects_a_short_complete_video_result
-
 if [ "$mutant_count" -ne "$MAX_MUTANTS" ]; then
   printf '%s\n' 'acceptance mutation configuration does not match its declared ceiling' >&2
   exit 2

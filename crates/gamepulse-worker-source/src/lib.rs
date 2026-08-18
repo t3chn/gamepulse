@@ -1807,9 +1807,6 @@ where
                 if detail.id != expected_game.id || detail.slug != expected_game.slug {
                     return Err(MetacriticGameReviewError::MismatchedGameIdentity);
                 }
-                if detail.video.is_none() {
-                    return Err(MetacriticGameReviewError::MissingRequiredVideo);
-                }
                 let mut user_scores = Vec::with_capacity(detail.platforms.len());
                 for platform in detail.platforms.iter().cloned() {
                     user_scores.push(

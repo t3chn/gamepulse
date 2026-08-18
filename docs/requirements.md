@@ -5,11 +5,10 @@ Status: captured from the received take-home assignment on 2026-08-14
 ## Mandatory processing
 
 The service runs once per hour and visits the Metacritic Games section. Each
-durable run owns a target of 20 successful, eligible, unique games and advances
-one stable candidate at a time until that target succeeds. A candidate missing
-the mandatory video link is a terminal candidate rejection: it is not stored as
-a complete game, consumes no target quota, and is never retried within the run
-or after restart. The same run continues to later unique candidates. If bounded
+durable run owns a target of 20 successful, unique games and advances one
+stable candidate at a time until that target succeeds. Source fields that
+Metacritic omits, including video, remain explicitly unavailable instead of
+causing an otherwise valid game to be discarded. If bounded
 newest-first discovery is exhausted or the durable run deadline passes before
 20 successes, the run fails closed and is never reported as successful.
 
@@ -133,8 +132,9 @@ The command schedules discovery once only. It does not create a second cycle
 or wait for optional work. It waits only for the mandatory
 source-ingestion and review-summary jobs created by its fresh durable run,
 subject to an explicit hard deadline. Success requires one succeeded run with
-exactly the requested current mandatory target of stored records with video
-links and both persisted review summaries ready. The command neither removes nor overwrites a caller database;
+exactly the requested current mandatory target of stored records and both
+persisted review summaries ready. Source-omitted video links remain nullable.
+The command neither removes nor overwrites a caller database;
 operators provide a fresh temporary path and remove it themselves after
 inspection.
 

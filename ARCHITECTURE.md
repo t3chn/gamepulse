@@ -104,10 +104,10 @@ domain -----------------------------------> no workspace crate
   YouTube work holding a mandatory run open.
 - **Rule:** `runs` and `run_items` own batch and mandatory item progress;
   `summaries` own visible freshness; `jobs` own retryable attempts. A run can
-  succeed only at its exact accepted target. A missing mandatory video is a
-  closed, fixed-category `run_items` rejection, never a complete game or quota
-  increment; the run schedules the next unique candidate or bounded source
-  page. Other mandatory failures retain ordinary queue retry/fatal semantics.
+  succeed only at its exact accepted target. Source-omitted optional fields,
+  including video, remain explicit on the stored game and do not replace one
+  of the newest 20 candidates. Mandatory source failures retain ordinary queue
+  retry/fatal semantics and advance to the next unique candidate when terminal.
   Optional media work never holds a run open.
 
 ### AD-7 — Hide Metacritic behind a verified source port
@@ -500,12 +500,10 @@ M054 replaces the superseded fixed-20-candidate settlement in the production
 source composition with one durable exact-target run. A forward SQLite
 migration adds `runs` (day, target, phase/cursor, durable eight-page browse
 bound, accepted count, deadline, and version/progress fence) and `run_items`
-(stable source identity, routing slug, discovery order, lifecycle, and the
-closed `missing_required_video` category). The source worker obtains one
-candidate job from this state at a time. A valid
-missing-video detail settles that candidate as rejected without any snapshot,
-review, summary, or quota write, then atomically schedules the next candidate
-or bounded browse page. A successful refresh persists the game/reviews and
+(stable source identity, routing slug, discovery order, lifecycle, and legacy
+rejection categories retained for schema compatibility). The source worker
+obtains one candidate job from this state at a time. A successful refresh,
+including one whose source video is absent, persists the game/reviews and
 increments accepted count in one transaction; exactly target completes the
 run. The handler exposes the queue claim's bounded token/expiry fence; each
 run transaction validates the active queue state, matching fence, unexpired

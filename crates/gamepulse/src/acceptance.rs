@@ -408,7 +408,6 @@ where
         || snapshot.summaries().total() != summary_target
         || snapshot.summaries().succeeded() != summary_target
         || snapshot.persisted() != target
-        || snapshot.complete_video() != target
         || snapshot.summaries_ready() != target
         || snapshot.summaries_pending_or_missing() != 0
     {

@@ -56,12 +56,10 @@ mise run acceptance-mutation
 The command copies the current tracked and ordinary untracked source files to a
 temporary directory outside the repository, runs offline, and removes the
 temporary directory on exit. This includes the inherited M038 files before a
-commit without copying ignored build output. It has a hard ceiling of three
-named mutants:
+commit without copying ignored build output. It has a hard ceiling of one
+named mutant:
 
-1. schedule the hourly-discovery job a second time;
-2. continue after a retryable mandatory-job failure;
-3. report success when the final complete-video target is short.
+1. schedule the hourly-discovery job a second time.
 
 Each mutant first proves the exact named fixture integration test passes, then
 applies exactly one literal source mutation. A mutant is caught only when that

@@ -729,7 +729,7 @@ async fn acceptance_hard_deadline_aborts_the_pending_first_cycle() {
 }
 
 #[tokio::test]
-async fn acceptance_rejects_a_short_complete_video_result() {
+async fn acceptance_allows_source_omitted_video() {
     let database = TemporaryDatabase::new("target");
     let discovery = FixtureDailySource::complete();
     let reviews = FixtureReviewSource::new(FixtureReviewMode::AlwaysValid);
@@ -744,7 +744,7 @@ async fn acceptance_rejects_a_short_complete_video_result() {
     )
     .await;
 
-    assert_eq!(report.terminal(), AcceptanceTerminal::TargetFailure);
+    assert_eq!(report.terminal(), AcceptanceTerminal::Complete);
     assert_eq!(report.snapshot().complete_video(), 19);
 }
 
