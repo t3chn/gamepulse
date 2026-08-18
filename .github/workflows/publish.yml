@@ -22,6 +22,9 @@ jobs:
       - name: Install project toolchain
         uses: jdx/mise-action@v3
 
+      - name: Install rustfmt
+        run: rustup component add --toolchain 1.97.1 rustfmt
+
       - name: Verify architecture
         run: mise run architecture
 
