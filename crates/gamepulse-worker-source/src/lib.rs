@@ -1996,9 +1996,9 @@ where
 /// Source-lane handler for a run-owned mandatory candidate.
 ///
 /// The candidate's complete refresh and accepted-count transition share one SQLite transaction.
-/// `MissingRequiredVideo` instead records the fixed terminal rejection and schedules the next
-/// candidate or page in that same transaction; it is therefore not retried and cannot consume
-/// quota.
+/// `MissingRequiredVideo` records an immediate terminal rejection. Other source failures use the
+/// durable retry budget first; the final failed attempt records `source_unavailable`. Both
+/// rejection paths schedule the next candidate or page atomically and cannot consume quota.
 pub struct DurableRunReviewSourceIngestionHandler<S, P> {
     run_store: Arc<Mutex<S>>,
     source_port: Arc<P>,
@@ -2128,6 +2128,25 @@ where
                                 now,
                             ),
                             Some(WorkerFailureCategory::MissingRequiredVideo),
+                        ),
+                        Err(_) => JobHandlerResult::Failed(JobHandlerFailure::new(
+                            DURABLE_RUN_INGESTION_FAILURE,
+                        )),
+                    }
+                }
+                Err(error) if job.is_final_attempt() => {
+                    let observation = source_port.observation_category(&error);
+                    match run_store.lock() {
+                        Ok(mut store) => durable_run_ingestion_settlement(
+                            store.reject_source_unavailable(
+                                &request,
+                                job.identity(),
+                                source_ingestion_schedule,
+                                job.created_at(),
+                                claim_fence,
+                                now,
+                            ),
+                            Some(observation),
                         ),
                         Err(_) => JobHandlerResult::Failed(JobHandlerFailure::new(
                             DURABLE_RUN_INGESTION_FAILURE,

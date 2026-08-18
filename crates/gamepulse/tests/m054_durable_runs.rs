@@ -32,6 +32,7 @@ use rusqlite::Connection;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FixtureError {
     MissingVideo,
+    Transport,
 }
 
 impl std::fmt::Display for FixtureError {
@@ -95,11 +96,12 @@ impl AsyncDailyCrawlSourcePort for ExhaustedDiscovery {
 #[derive(Clone)]
 struct FixtureReviews {
     calls: Arc<Mutex<Vec<u64>>>,
+    first_error: FixtureError,
 }
 
 impl FixtureReviews {
-    fn new(calls: Arc<Mutex<Vec<u64>>>) -> Self {
-        Self { calls }
+    fn new(calls: Arc<Mutex<Vec<u64>>>, first_error: FixtureError) -> Self {
+        Self { calls, first_error }
     }
 }
 
@@ -118,7 +120,7 @@ impl AsyncReviewSourceIngestionPort for FixtureReviews {
                 .expect("fixture calls lock must be available")
                 .push(request.source_product_id().value());
             if request.source_product_id().value() == 1 {
-                return Err(FixtureError::MissingVideo);
+                return Err(self.first_error);
             }
             let source_product_id = request.source_product_id();
             let snapshot = GameSnapshot::new(
@@ -182,6 +184,7 @@ impl ReviewSourceFailureClassifier for FixtureReviews {
     fn observation_category(&self, error: &Self::Error) -> WorkerFailureCategory {
         match error {
             FixtureError::MissingVideo => WorkerFailureCategory::MissingRequiredVideo,
+            FixtureError::Transport => WorkerFailureCategory::SourceTransportOrContract,
         }
     }
 }
@@ -214,6 +217,7 @@ fn source_runtime(
     path: &std::path::Path,
     clock: SharedClock,
     calls: Arc<Mutex<Vec<u64>>>,
+    first_error: FixtureError,
 ) -> Runtime<SqliteJobStore, SharedClock> {
     let queue = Arc::new(Mutex::new(
         SqliteJobStore::open(path).expect("queue must open"),
@@ -233,7 +237,7 @@ fn source_runtime(
             )) as Arc<dyn gamepulse_application::JobHandler>,
             Arc::new(DurableRunReviewSourceIngestionHandler::with_clock(
                 run_store,
-                FixtureReviews::new(calls),
+                FixtureReviews::new(calls, first_error),
                 ReviewSummaryJobSchedule::new(1).expect("summary schedule must be valid"),
                 source_schedule,
                 clock.clone(),
@@ -310,7 +314,12 @@ async fn missing_video_is_a_terminal_rejection_and_later_candidates_fill_exact_t
     let database = TemporaryDatabase::new();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let clock = SharedClock::new(1);
-    let mut runtime = source_runtime(&database.path, clock.clone(), calls.clone());
+    let mut runtime = source_runtime(
+        &database.path,
+        clock.clone(),
+        calls.clone(),
+        FixtureError::MissingVideo,
+    );
     assert_eq!(
         runtime.schedule_hourly().expect("hourly job must schedule"),
         runtime::SchedulerOutcome::Enqueued
@@ -349,7 +358,12 @@ async fn missing_video_is_a_terminal_rejection_and_later_candidates_fill_exact_t
     );
     drop(runtime);
 
-    let mut restarted = source_runtime(&database.path, clock, calls.clone());
+    let mut restarted = source_runtime(
+        &database.path,
+        clock,
+        calls.clone(),
+        FixtureError::MissingVideo,
+    );
     for _ in 0..20 {
         observations.merge(dispatch_one(&mut restarted).await);
     }
@@ -403,6 +417,43 @@ async fn missing_video_is_a_terminal_rejection_and_later_candidates_fill_exact_t
             )
             .expect("pending schedule count must load"),
         0
+    );
+}
+
+#[tokio::test]
+async fn terminal_source_failure_rejects_candidate_and_schedules_the_next_one() {
+    let database = TemporaryDatabase::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let clock = SharedClock::new(1);
+    let mut runtime = source_runtime(&database.path, clock, calls, FixtureError::Transport);
+    assert_eq!(
+        runtime.schedule_hourly().expect("hourly job must schedule"),
+        runtime::SchedulerOutcome::Enqueued
+    );
+    let _ = dispatch_one(&mut runtime).await;
+    let observations = dispatch_one(&mut runtime).await;
+    assert_eq!(observations.source_transport_or_contract(), 1);
+
+    let connection = Connection::open(&database.path).expect("inspection connection must open");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT rejection_category FROM run_items WHERE source_product_id = '1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("rejection category must load"),
+        "source_unavailable"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM run_items WHERE state = 'scheduled' AND source_product_id <> '1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("next scheduled candidate count must load"),
+        1
     );
 }
 

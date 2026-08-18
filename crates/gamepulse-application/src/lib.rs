@@ -1460,6 +1460,16 @@ pub trait DurableRunProgressStore {
         claim_fence: JobClaimFence,
         now: JobTimestamp,
     ) -> Result<DurableRunProgressOutcome, Self::Error>;
+
+    fn reject_source_unavailable(
+        &mut self,
+        request: &RunSourceIngestionRequest,
+        job_identity: &str,
+        schedule: SourceIngestionJobSchedule,
+        created_at: JobTimestamp,
+        claim_fence: JobClaimFence,
+        now: JobTimestamp,
+    ) -> Result<DurableRunProgressOutcome, Self::Error>;
 }
 
 /// The sole persistence boundary for this milestone.
@@ -3152,6 +3162,8 @@ pub struct TypedJob {
     created_at: JobTimestamp,
     claimed_at: Option<JobTimestamp>,
     claim_fence: Option<JobClaimFence>,
+    max_attempts: u32,
+    attempt_count: u32,
 }
 
 /// The bounded portion of a queue claim that a handler may present to another durable adapter.
@@ -3190,6 +3202,8 @@ impl TypedJob {
             created_at: record.created_at(),
             claimed_at: None,
             claim_fence: None,
+            max_attempts: record.max_attempts(),
+            attempt_count: record.attempt_count(),
         })
     }
 
@@ -3211,6 +3225,10 @@ impl TypedJob {
 
     pub fn work_ref(&self) -> &str {
         &self.work_ref
+    }
+
+    pub const fn is_final_attempt(&self) -> bool {
+        self.attempt_count >= self.max_attempts
     }
 
     pub const fn created_at(&self) -> JobTimestamp {

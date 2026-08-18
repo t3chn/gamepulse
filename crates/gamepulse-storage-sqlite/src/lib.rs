@@ -36,7 +36,8 @@ const REVIEW_SUMMARY_SCHEMA_VERSION: i64 = 4;
 const PUBLIC_COVER_URL_SCHEMA_VERSION: i64 = 5;
 const REVIEW_EXCERPT_POLARITY_SCHEMA_VERSION: i64 = 6;
 const RETRY_BACKOFF_AND_SOURCE_PACING_SCHEMA_VERSION: i64 = 7;
-const SCHEMA_VERSION: i64 = 8;
+const DURABLE_RUNS_SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const DAILY_CRAWL_MIGRATION_0001: &str = include_str!("../migrations/0001_daily_crawl_state.sql");
 const JOB_QUEUE_MIGRATION_0002: &str = include_str!("../migrations/0002_job_queue.sql");
 const GAME_SNAPSHOT_MIGRATION_0003: &str = include_str!("../migrations/0003_game_snapshots.sql");
@@ -47,7 +48,12 @@ const REVIEW_EXCERPT_POLARITY_MIGRATION_0006: &str =
     include_str!("../migrations/0006_review_excerpt_polarity.sql");
 const RETRY_BACKOFF_AND_SOURCE_PACING_MIGRATION_0007: &str =
     include_str!("../migrations/0007_retry_backoff_and_source_pacing.sql");
-const DURABLE_RUNS_MIGRATION_0008: &str = include_str!("../migrations/0008_durable_runs.sql");
+const DURABLE_RUNS_MIGRATION_0008: &str = concat!(
+    include_str!("../migrations/0008_durable_runs.sql"),
+    include_str!("../migrations/0009_source_unavailable_rejection.sql")
+);
+const SOURCE_UNAVAILABLE_REJECTION_MIGRATION_0009: &str =
+    include_str!("../migrations/0009_source_unavailable_rejection.sql");
 
 /// Read-only SQLite readiness adapter for the configured persistent database.
 ///
@@ -555,6 +561,21 @@ fn migrate(connection: &mut Connection) -> Result<(), DailyCrawlStateStoreError>
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .execute_batch(DURABLE_RUNS_MIGRATION_0008)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .commit()
+                .map_err(DailyCrawlStateStoreError::database)
+        }
+        DURABLE_RUNS_SCHEMA_VERSION => {
+            validate_owned_schema(connection)?;
+            let transaction = connection
+                .transaction()
+                .map_err(DailyCrawlStateStoreError::database)?;
+            transaction
+                .execute_batch(SOURCE_UNAVAILABLE_REJECTION_MIGRATION_0009)
                 .map_err(DailyCrawlStateStoreError::database)?;
             transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)

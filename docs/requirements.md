@@ -129,8 +129,8 @@ mandatory 20-game target, performs one persistence cycle through the ordinary
 application ports and worker lanes, and exits with one aggregate-safe machine
 report. It never starts the HTTP server, daemon, or hourly loop.
 
-The command schedules discovery once only. It does not create a second cycle,
-retry a failed job, or wait for optional work. It waits only for the mandatory
+The command schedules discovery once only. It does not create a second cycle
+or wait for optional work. It waits only for the mandatory
 source-ingestion and review-summary jobs created by its fresh durable run,
 subject to an explicit hard deadline. Success requires one succeeded run with
 exactly the requested current mandatory target of stored records with video
@@ -148,3 +148,7 @@ Retryable source failures retain the queue's existing bounded attempt budget
 and persisted backoff. The acceptance coordinator may reclaim them only after
 that durable eligibility and only within its hard deadline; terminal failures
 remain fail-closed.
+
+When a candidate exhausts that durable source retry budget, the run records a
+`source_unavailable` rejection and atomically schedules the next candidate.
+The rejected candidate does not consume the exact target of 20.

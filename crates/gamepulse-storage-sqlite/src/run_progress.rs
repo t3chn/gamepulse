@@ -13,6 +13,7 @@ use crate::job_queue::enqueue_derived_request;
 use crate::review_summary::persist_review_refresh_in_transaction;
 
 const MISSING_REQUIRED_VIDEO: &str = "missing_required_video";
+const SOURCE_UNAVAILABLE: &str = "source_unavailable";
 const SOURCE_PROGRESS_MAX_ATTEMPTS: u32 = 3;
 const MAX_BROWSE_PAGES: i64 = 8;
 
@@ -327,6 +328,7 @@ impl DurableRunProgressStore for SqliteRunProgressStore {
             request,
             job_identity,
             Some(refresh),
+            None,
             schedule,
             created_at,
             claim_fence,
@@ -348,6 +350,29 @@ impl DurableRunProgressStore for SqliteRunProgressStore {
             request,
             job_identity,
             None,
+            Some(MISSING_REQUIRED_VIDEO),
+            schedule,
+            created_at,
+            claim_fence,
+            now,
+        )
+    }
+
+    fn reject_source_unavailable(
+        &mut self,
+        request: &RunSourceIngestionRequest,
+        job_identity: &str,
+        schedule: SourceIngestionJobSchedule,
+        created_at: JobTimestamp,
+        claim_fence: JobClaimFence,
+        now: JobTimestamp,
+    ) -> Result<DurableRunProgressOutcome, RunProgressStoreError> {
+        settle_item(
+            &mut self.connection,
+            request,
+            job_identity,
+            None,
+            Some(SOURCE_UNAVAILABLE),
             schedule,
             created_at,
             claim_fence,
@@ -362,6 +387,7 @@ fn settle_item(
     request: &RunSourceIngestionRequest,
     job_identity: &str,
     refresh: Option<&GameReviewRefresh>,
+    rejection_category: Option<&str>,
     schedule: SourceIngestionJobSchedule,
     created_at: JobTimestamp,
     claim_fence: JobClaimFence,
@@ -437,11 +463,13 @@ fn settle_item(
             )
             .map_err(RunProgressStoreError::database)?;
     } else {
+        let rejection_category = rejection_category
+            .ok_or_else(|| RunProgressStoreError::malformed("rejection category"))?;
         transaction
             .execute(
                 "UPDATE run_items SET state = 'rejected', rejection_category = ?1
                  WHERE run_id = ?2 AND source_product_id = ?3 AND state = 'scheduled' AND job_identity = ?4",
-                params![MISSING_REQUIRED_VIDEO, request.run_id(), request.source().source_product_id().value().to_string(), job_identity],
+                params![rejection_category, request.run_id(), request.source().source_product_id().value().to_string(), job_identity],
             )
             .map_err(RunProgressStoreError::database)?;
         transaction
