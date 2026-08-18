@@ -10,7 +10,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/t3chn/gamepulse
+  IMAGE: ghcr.io/t3chn/gamepulse-app
 
 jobs:
   verify-and-publish:
