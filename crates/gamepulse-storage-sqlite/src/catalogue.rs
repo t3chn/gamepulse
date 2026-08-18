@@ -4,7 +4,8 @@ use std::path::Path;
 use gamepulse_application::{
     CatalogueCoverDescriptor, CatalogueGameCard, CatalogueGameDetail, CataloguePage,
     CataloguePlatformFilter, CataloguePlatformScore, CatalogueQuery, CatalogueReviewSummary,
-    GameCatalogueReadPort, ReviewKind, SimilarCatalogueGame, SourceProductId,
+    CoverImageContentType, GameCatalogueReadPort, ReviewKind, SimilarCatalogueGame,
+    SourceProductId, StoredCoverImage,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -43,7 +44,11 @@ impl SqliteGameCatalogueReadStore {
                     SELECT
                         games.source_product_id,
                         games.title,
-                        games.public_cover_url,
+                        EXISTS (
+                            SELECT 1
+                            FROM game_cover_assets AS cover_assets
+                            WHERE cover_assets.game_source_product_id = games.source_product_id
+                        ) AS has_local_cover,
                         CASE
                             WHEN ?2 IS NULL THEN (
                                 SELECT MAX(platform_scores.metascore)
@@ -69,7 +74,7 @@ impl SqliteGameCatalogueReadStore {
                           )
                       )
                 )
-                SELECT source_product_id, title, public_cover_url, selected_metascore
+                SELECT source_product_id, title, has_local_cover, selected_metascore
                 FROM catalogue_rows
                 ORDER BY
                     selected_metascore IS NULL ASC,
@@ -86,7 +91,7 @@ impl SqliteGameCatalogueReadStore {
                     Ok((
                         decode_source_product_id(row.get::<_, i64>(0)?)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(2)? != 0,
                         row.get::<_, Option<u8>>(3)?,
                     ))
                 },
@@ -94,12 +99,12 @@ impl SqliteGameCatalogueReadStore {
             .map_err(GameCatalogueReadStoreError::database)?;
         let mut games = Vec::new();
         for row in rows {
-            let (source_product_id, title, public_cover_url, highest_metascore) =
+            let (source_product_id, title, has_local_cover, highest_metascore) =
                 row.map_err(GameCatalogueReadStoreError::database)?;
             games.push(CatalogueGameCard::new(
                 source_product_id,
                 title,
-                public_cover_url,
+                has_local_cover,
                 highest_metascore,
                 self.platform_slugs(source_product_id)?,
                 self.developers(source_product_id)?,
@@ -127,7 +132,11 @@ impl SqliteGameCatalogueReadStore {
                     cover_filename,
                     cover_kind,
                     video_url,
-                    public_cover_url
+                    EXISTS (
+                        SELECT 1
+                        FROM game_cover_assets AS cover_assets
+                        WHERE cover_assets.game_source_product_id = games.source_product_id
+                    ) AS has_local_cover
                  FROM games
                  WHERE source_product_id = ?1",
                 params![identifier],
@@ -152,7 +161,7 @@ impl SqliteGameCatalogueReadStore {
             stored_game.title,
             stored_game.description,
             stored_game.cover,
-            stored_game.public_cover_url,
+            stored_game.has_local_cover,
             stored_game.video_url,
             platforms,
             developers,
@@ -160,6 +169,29 @@ impl SqliteGameCatalogueReadStore {
             critic_summary,
             user_summary,
         )))
+    }
+
+    fn cover_image(
+        &mut self,
+        source_product_id: SourceProductId,
+    ) -> Result<Option<StoredCoverImage>, GameCatalogueReadStoreError> {
+        let identifier = sqlite_identifier(source_product_id)?;
+        self.connection
+            .query_row(
+                "SELECT content_type, content
+                 FROM game_cover_assets
+                 WHERE game_source_product_id = ?1",
+                params![identifier],
+                |row| {
+                    let content_type = row.get::<_, String>(0)?;
+                    let bytes = row.get::<_, Vec<u8>>(1)?;
+                    CoverImageContentType::parse(&content_type)
+                        .and_then(|content_type| StoredCoverImage::new(content_type, bytes))
+                        .ok_or(rusqlite::Error::InvalidQuery)
+                },
+            )
+            .optional()
+            .map_err(GameCatalogueReadStoreError::database)
     }
 
     fn platform_filters(
@@ -399,6 +431,13 @@ impl GameCatalogueReadPort for SqliteGameCatalogueReadStore {
     ) -> Result<Option<CatalogueGameDetail>, GameCatalogueReadStoreError> {
         self.game_detail(source_product_id)
     }
+
+    fn cover_image(
+        &mut self,
+        source_product_id: SourceProductId,
+    ) -> Result<Option<StoredCoverImage>, GameCatalogueReadStoreError> {
+        self.cover_image(source_product_id)
+    }
 }
 
 struct StoredGame {
@@ -408,7 +447,7 @@ struct StoredGame {
     description: String,
     cover: Option<CatalogueCoverDescriptor>,
     video_url: Option<String>,
-    public_cover_url: Option<String>,
+    has_local_cover: bool,
 }
 
 fn read_stored_game(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredGame> {
@@ -436,7 +475,7 @@ fn read_stored_game(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredGame> {
         description: row.get(3)?,
         cover,
         video_url: row.get(8)?,
-        public_cover_url: row.get(9)?,
+        has_local_cover: row.get::<_, i64>(9)? != 0,
     })
 }
 

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod acceptance;
+mod covers;
 mod observability;
 mod runtime;
 
@@ -13,14 +14,14 @@ use gamepulse_application::{
     RuntimeJobType, RuntimeJobTypeFilter, SourceIngestionJobSchedule,
 };
 use gamepulse_storage_sqlite::{
-    SqliteAcceptanceCycleStore, SqliteGameCatalogueReadStore, SqliteJobStore, SqliteReadinessProbe,
-    SqliteReviewSummaryStore, SqliteRunProgressStore,
+    SqliteAcceptanceCycleStore, SqliteGameCatalogueReadStore, SqliteGameCoverAssetStore,
+    SqliteJobStore, SqliteReadinessProbe, SqliteReviewSummaryStore, SqliteRunProgressStore,
 };
 use gamepulse_worker_llm::{LocalExtractiveReviewSummarizer, ReviewSummaryHandler};
 use gamepulse_worker_source::{
     DurableRunDiscoveryHandler, DurableRunReviewSourceIngestionHandler, MetacriticCanaryClient,
-    MetacriticDailyCrawlSource, MetacriticGameReviewSource, MetacriticPublicHtmlTransport,
-    PublicHtmlCoverEnricher,
+    MetacriticCoverImageClient, MetacriticDailyCrawlSource, MetacriticGameReviewSource,
+    MetacriticPublicHtmlTransport, PublicHtmlCoverEnricher,
 };
 use observability::{LogFormat, ObservedJobHandler, ObservedPublicCoverEnricher};
 use runtime::{Runtime, RuntimeConfig, SystemRuntimeClock};
@@ -30,6 +31,7 @@ use acceptance::{
     AcceptanceCommand, AcceptanceReport, AcceptanceTerminal, EntryCommand, database_path_is_fresh,
     parse_entry_command, run_acceptance_once,
 };
+use covers::{CoverBackfillEntry, parse_cover_backfill};
 
 const DATABASE_PATH_ENV: &str = "GAMEPULSE_DATABASE_PATH";
 const HTTP_ADDRESS_ENV: &str = "GAMEPULSE_HTTP_ADDRESS";
@@ -106,28 +108,75 @@ impl RuntimeEnvironment {
 
 #[tokio::main]
 async fn main() {
-    match parse_entry_command(std::env::args_os().skip(1)) {
-        Ok(EntryCommand::Serve) => {
-            if run().await.is_err() {
-                std::process::exit(1);
-            }
-        }
-        Ok(EntryCommand::AcceptanceHelp) => {
-            print!("{}", acceptance::ACCEPTANCE_HELP);
-        }
-        Ok(EntryCommand::Acceptance(command)) => {
-            let report = run_acceptance(command).await;
-            println!("{}", report.to_json());
-            let exit_code = report.exit_code();
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    match parse_cover_backfill(arguments.clone()) {
+        Ok(Some(CoverBackfillEntry::Help)) => print!("{}", covers::COVER_BACKFILL_HELP),
+        Ok(Some(CoverBackfillEntry::Command(command))) => {
+            let exit_code = run_cover_backfill(command).await;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
         }
+        Ok(None) => match parse_entry_command(arguments) {
+            Ok(EntryCommand::Serve) => {
+                if run().await.is_err() {
+                    std::process::exit(1);
+                }
+            }
+            Ok(EntryCommand::AcceptanceHelp) => {
+                print!("{}", acceptance::ACCEPTANCE_HELP);
+            }
+            Ok(EntryCommand::Acceptance(command)) => {
+                let report = run_acceptance(command).await;
+                println!("{}", report.to_json());
+                let exit_code = report.exit_code();
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+            }
+            Err(_) => {
+                eprintln!("invalid command");
+                std::process::exit(2);
+            }
+        },
         Err(_) => {
             eprintln!("invalid command");
             std::process::exit(2);
         }
     }
+}
+
+async fn run_cover_backfill(command: covers::CoverBackfillCommand) -> i32 {
+    let mut store = match SqliteGameCoverAssetStore::open(command.database_path()) {
+        Ok(store) => store,
+        Err(_) => return 1,
+    };
+    let candidates = match store.missing_cover_candidates(command.limit()) {
+        Ok(candidates) => candidates,
+        Err(_) => return 1,
+    };
+    let client = match MetacriticCoverImageClient::new() {
+        Ok(client) => client,
+        Err(_) => return 1,
+    };
+    let mut stored = 0_usize;
+    let mut unavailable = 0_usize;
+    let mut failed = 0_usize;
+    for candidate in candidates {
+        match client.fetch(candidate.descriptor()).await {
+            Ok(Some(cover)) => match store.store_cover(candidate.source_product_id(), &cover) {
+                Ok(()) => stored += 1,
+                Err(_) => failed += 1,
+            },
+            Ok(None) => unavailable += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    println!(
+        "{{\"schema_version\":\"gamepulse.cover_backfill.v1\",\"attempted\":{},\"stored\":{stored},\"unavailable\":{unavailable},\"failed\":{failed}}}",
+        stored + unavailable + failed
+    );
+    if failed == 0 { 0 } else { 1 }
 }
 
 /// The composition root owns concrete SQLite, clock, scheduler, and source-lane wiring.

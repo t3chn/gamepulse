@@ -15,9 +15,9 @@ A bounded canary confirmed that the observed descriptor maps to a first-party
 2. Derive the observed first-party URL from a strictly validated descriptor.
    Selected because it uses already fetched structured data, needs no new
    runtime request, and is easy to disable.
-3. Download or proxy image bytes. Rejected because caching, storage,
-   attribution, and operational ownership are disproportionate for the
-   take-home.
+3. Download one bounded asset through an explicit operator command. Selected
+   after the deployed database showed that a persisted URL alone leaves old
+   snapshots without renderable covers and leaks the upstream URL into HTML.
 
 ## Decision
 
@@ -32,14 +32,23 @@ The source adapter may derive a public cover URL only when all of these hold:
 - the resulting URL passes the existing exact HTTPS `www.metacritic.com`
   validation.
 
-The derived URL is persisted with the snapshot. Optional HTML enrichment may
+The derived URL remains source-adapter data. Optional HTML enrichment may
 replace it with another validated first-party URL, but a missing HTML result
-must not erase it. Web reads never derive URLs.
+must not erase it. Web reads never derive URLs or fetch upstream images.
+
+`cover-backfill` is the sole acquisition path for existing records. It accepts
+an existing absolute SQLite path and a hard limit of 1–20, resolves only the
+validated descriptor shape, makes no redirect or retry, accepts only
+JPEG/PNG/WebP with a matching file signature and a 2 MiB cap, and writes bytes
+to `game_cover_assets`. It never deletes game data or starts the service. The
+server-rendered pages refer only to `/games/{id}/cover`; that route serves the
+persisted bytes and allowlisted content type without exposing a source URL or
+descriptor in HTML.
 
 ## Rollback
 
-Remove descriptor derivation and retain the stored descriptor and existing HTML
-enrichment. Existing public cover URLs remain ordinary nullable snapshot data.
+Stop running `cover-backfill`. Existing local assets remain durable and can be
+removed only through a separately authorized data migration.
 
 ## Revisit condition
 

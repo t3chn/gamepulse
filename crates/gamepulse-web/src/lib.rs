@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex};
 use askama::Template;
 use axum::Router;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use gamepulse_application::{
     CatalogueGameDetail, CataloguePage, CatalogueQuery, CatalogueReviewSummary,
     GameCatalogueReadPort, ServiceReadinessPort, SourceProductId, load_catalogue,
-    load_catalogue_game,
+    load_catalogue_cover, load_catalogue_game,
 };
 
 // This stylesheet is compiled into the single binary with the Askama templates. It deliberately
@@ -180,6 +180,7 @@ where
     Router::new()
         .route("/", get(root_redirect))
         .route("/games", get(list_games::<P>))
+        .route("/games/{id}/cover", get(show_cover::<P>))
         .route("/games/{id}", get(show_game::<P>))
         .with_state(CatalogueState { catalogue })
         .fallback(missing_page)
@@ -336,6 +337,20 @@ where
     }
 }
 
+async fn show_cover<P>(
+    State(state): State<CatalogueState<P>>,
+    Path(raw_source_product_id): Path<String>,
+) -> Response
+where
+    P: GameCatalogueReadPort + Send + 'static,
+    P::Error: Send + 'static,
+{
+    match parse_source_product_id(&raw_source_product_id) {
+        Some(source_product_id) => cover_image_response(state.catalogue, source_product_id).await,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 fn parse_source_product_id(value: &str) -> Option<u64> {
     value.parse::<u64>().ok()
 }
@@ -364,6 +379,32 @@ where
     };
     match GameDetailTemplate::from_game(game).render() {
         Ok(rendered) => Html(rendered).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Serve one already-persisted local cover with a fixed allowlisted content type.
+pub async fn cover_image_response<P>(catalogue: Arc<Mutex<P>>, source_product_id: u64) -> Response
+where
+    P: GameCatalogueReadPort + Send + 'static,
+    P::Error: Send + 'static,
+{
+    let source_product_id = match SourceProductId::new(source_product_id) {
+        Ok(source_product_id) => source_product_id,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let mut catalogue = match catalogue.lock() {
+        Ok(catalogue) => catalogue,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    match load_catalogue_cover(&mut *catalogue, source_product_id) {
+        Ok(Some(cover)) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, cover.content_type().as_str())],
+            cover.bytes().to_vec(),
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -506,12 +547,11 @@ fn decode_hex(value: u8) -> Option<u8> {
         <li>
           <article class="game-card">
             <div class="game-card__top">
-              {% match game.public_cover_url %}
-              {% when Some with (cover_url) %}
-              <img class="cover-image" src="{{ cover_url }}" alt="Cover for {{ game.title }}">
-              {% when None %}
+              {% if game.has_local_cover %}
+              <img class="cover-image" src="/games/{{ game.source_product_id }}/cover" alt="Cover for {{ game.title }}">
+              {% else %}
               <div class="cover-placeholder" aria-hidden="true">GP</div>
-              {% endmatch %}
+              {% endif %}
               <div>
                 <h3><a class="game-title" href="/games/{{ game.source_product_id }}">{{ game.title }}</a></h3>
               </div>
@@ -594,7 +634,7 @@ impl CatalogueTemplate {
                 .map(|game| CatalogueGameCardView {
                     source_product_id: game.source_product_id().value(),
                     title: game.title().to_owned(),
-                    public_cover_url: game.public_cover_url().map(str::to_owned),
+                    has_local_cover: game.has_local_cover(),
                     highest_metascore: game.highest_metascore(),
                     platforms: game
                         .platforms()
@@ -617,7 +657,7 @@ struct CataloguePlatformView {
 struct CatalogueGameCardView {
     source_product_id: u64,
     title: String,
-    public_cover_url: Option<String>,
+    has_local_cover: bool,
     highest_metascore: Option<u8>,
     platforms: Vec<String>,
     developers: Vec<String>,
@@ -648,14 +688,11 @@ struct CatalogueGameCardView {
     <article>
       <header class="detail-hero">
         <div>
-          {% match game.public_cover_url %}
-          {% when Some with (cover_url) %}
-          <img class="cover-image cover-image--large" src="{{ cover_url }}" alt="Cover for {{ game.title }}">
-          {% when None %}
+          {% if game.has_local_cover %}
+          <img class="cover-image cover-image--large" src="/games/{{ game.source_product_id }}/cover" alt="Cover for {{ game.title }}">
+          {% else %}
           <div class="cover-placeholder cover-placeholder--large" aria-hidden="true">GP</div>
-          {% endmatch %}
-          {% if !game.has_public_cover %}
-          <p class="cover-status">No local cover image stored</p>
+          <p class="cover-status">No stored cover image available.</p>
           {% endif %}
         </div>
         <div class="detail-hero__copy">
@@ -755,19 +792,6 @@ struct CatalogueGameCardView {
           {% endif %}
         </section>
       </div>
-      <details class="provenance">
-        <summary>Stored source record</summary>
-        <dl>
-          <dt>Source product ID</dt><dd>{{ game.source_product_id }}</dd>
-          <dt>Source slug</dt><dd>{{ game.source_slug }}</dd>
-          {% match game.cover %}
-          {% when Some with (cover) %}
-          <dt>Cover descriptor</dt><dd>{{ cover.bucket_type }} · {{ cover.bucket_path }}/{{ cover.filename }} · {{ cover.kind }}</dd>
-          {% when None %}
-          <dt>Cover descriptor</dt><dd>No cover descriptor stored.</dd>
-          {% endmatch %}
-        </dl>
-      </details>
     </article>
   </main>
 </body>
@@ -785,17 +809,9 @@ impl GameDetailTemplate {
             ui_css: UI_CSS,
             game: CatalogueGameDetailView {
                 source_product_id: game.source_product_id().value(),
-                source_slug: game.source_slug().to_owned(),
                 title: game.title().to_owned(),
                 description: game.description().to_owned(),
-                cover: game.cover().map(|cover| CatalogueCoverView {
-                    bucket_path: cover.bucket_path().to_owned(),
-                    bucket_type: cover.bucket_type().to_owned(),
-                    filename: cover.filename().to_owned(),
-                    kind: cover.kind().to_owned(),
-                }),
-                public_cover_url: game.public_cover_url().map(str::to_owned),
-                has_public_cover: game.public_cover_url().is_some(),
+                has_local_cover: game.has_local_cover(),
                 video: game.video_url().map(|value| CatalogueVideoView {
                     value: value.to_owned(),
                     is_safe_href: is_safe_http_link(value),
@@ -836,12 +852,9 @@ fn is_safe_http_link(value: &str) -> bool {
 
 struct CatalogueGameDetailView {
     source_product_id: u64,
-    source_slug: String,
     title: String,
     description: String,
-    cover: Option<CatalogueCoverView>,
-    public_cover_url: Option<String>,
-    has_public_cover: bool,
+    has_local_cover: bool,
     video: Option<CatalogueVideoView>,
     platform_scores: Vec<CataloguePlatformScoreView>,
     developers: Vec<String>,
@@ -900,13 +913,6 @@ struct ReviewSummaryView {
     likes: Vec<String>,
     dislikes: Vec<String>,
     mixed: Vec<String>,
-}
-
-struct CatalogueCoverView {
-    bucket_path: String,
-    bucket_type: String,
-    filename: String,
-    kind: String,
 }
 
 struct CatalogueVideoView {

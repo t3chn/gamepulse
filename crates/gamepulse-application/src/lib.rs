@@ -33,12 +33,65 @@ pub trait GameSnapshotStore {
     fn upsert_snapshot(&mut self, snapshot: &GameSnapshot) -> Result<(), Self::Error>;
 }
 
+/// The allowlisted media types GamePulse may retain and serve for a local game cover.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverImageContentType {
+    Jpeg,
+    Png,
+    Webp,
+}
+
+impl CoverImageContentType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Jpeg => "image/jpeg",
+            Self::Png => "image/png",
+            Self::Webp => "image/webp",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "image/jpeg" => Some(Self::Jpeg),
+            "image/png" => Some(Self::Png),
+            "image/webp" => Some(Self::Webp),
+            _ => None,
+        }
+    }
+}
+
+/// A size-bounded image already validated by the source adapter for durable local delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredCoverImage {
+    content_type: CoverImageContentType,
+    bytes: Vec<u8>,
+}
+
+impl StoredCoverImage {
+    pub const MAX_BYTES: usize = 2 * 1024 * 1024;
+
+    pub fn new(content_type: CoverImageContentType, bytes: Vec<u8>) -> Option<Self> {
+        (!bytes.is_empty() && bytes.len() <= Self::MAX_BYTES).then_some(Self {
+            content_type,
+            bytes,
+        })
+    }
+
+    pub const fn content_type(&self) -> CoverImageContentType {
+        self.content_type
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// The compact fields rendered on a catalogue card.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogueGameCard {
     source_product_id: SourceProductId,
     title: String,
-    public_cover_url: Option<String>,
+    has_local_cover: bool,
     highest_metascore: Option<u8>,
     platforms: Vec<String>,
     developers: Vec<String>,
@@ -48,7 +101,7 @@ impl CatalogueGameCard {
     pub fn new(
         source_product_id: SourceProductId,
         title: impl Into<String>,
-        public_cover_url: Option<String>,
+        has_local_cover: bool,
         highest_metascore: Option<u8>,
         platforms: Vec<String>,
         developers: Vec<String>,
@@ -56,7 +109,7 @@ impl CatalogueGameCard {
         Self {
             source_product_id,
             title: title.into(),
-            public_cover_url,
+            has_local_cover,
             highest_metascore,
             platforms,
             developers,
@@ -71,8 +124,8 @@ impl CatalogueGameCard {
         &self.title
     }
 
-    pub fn public_cover_url(&self) -> Option<&str> {
-        self.public_cover_url.as_deref()
+    pub const fn has_local_cover(&self) -> bool {
+        self.has_local_cover
     }
 
     pub const fn highest_metascore(&self) -> Option<u8> {
@@ -213,7 +266,7 @@ pub struct CatalogueGameDetail {
     title: String,
     description: String,
     cover: Option<CatalogueCoverDescriptor>,
-    public_cover_url: Option<String>,
+    has_local_cover: bool,
     video_url: Option<String>,
     platform_scores: Vec<CataloguePlatformScore>,
     developers: Vec<String>,
@@ -230,7 +283,7 @@ impl CatalogueGameDetail {
         title: impl Into<String>,
         description: impl Into<String>,
         cover: Option<CatalogueCoverDescriptor>,
-        public_cover_url: Option<String>,
+        has_local_cover: bool,
         video_url: Option<String>,
         platform_scores: Vec<CataloguePlatformScore>,
         developers: Vec<String>,
@@ -244,7 +297,7 @@ impl CatalogueGameDetail {
             title: title.into(),
             description: description.into(),
             cover,
-            public_cover_url,
+            has_local_cover,
             video_url,
             platform_scores,
             developers,
@@ -274,8 +327,8 @@ impl CatalogueGameDetail {
         self.cover.as_ref()
     }
 
-    pub fn public_cover_url(&self) -> Option<&str> {
-        self.public_cover_url.as_deref()
+    pub const fn has_local_cover(&self) -> bool {
+        self.has_local_cover
     }
 
     pub fn video_url(&self) -> Option<&str> {
@@ -386,6 +439,11 @@ pub trait GameCatalogueReadPort {
         &mut self,
         source_product_id: SourceProductId,
     ) -> Result<Option<CatalogueGameDetail>, Self::Error>;
+
+    fn cover_image(
+        &mut self,
+        source_product_id: SourceProductId,
+    ) -> Result<Option<StoredCoverImage>, Self::Error>;
 }
 
 /// Application-owned readiness boundary for the configured durable store.
@@ -415,6 +473,17 @@ where
     P: GameCatalogueReadPort,
 {
     port.game_detail(source_product_id)
+}
+
+/// Read one local cover asset through the application-owned catalogue boundary.
+pub fn load_catalogue_cover<P>(
+    port: &mut P,
+    source_product_id: SourceProductId,
+) -> Result<Option<StoredCoverImage>, P::Error>
+where
+    P: GameCatalogueReadPort,
+{
+    port.cover_image(source_product_id)
 }
 
 /// Persist one previously validated inner snapshot through the application-owned boundary.

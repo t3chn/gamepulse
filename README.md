@@ -39,7 +39,7 @@ a video link for 4 of them; an omitted source value is shown as unavailable.
 | Process 20 games not processed today | Each durable run targets exactly 20 successful unique games. Daily state and source identities survive restart. |
 | Start each day with New Releases | The first daily selection uses New Releases. Later selections use the newest-first SEE ALL feed and persisted pagination. A new UTC day resets the sequence. |
 | Insert or update games | SQLite upserts the current game snapshot and refreshes source-derived review data. |
-| Title, cover, platforms, scores, developer, description, video | Stored and rendered on the catalogue/detail pages. Missing source fields remain explicitly unavailable. |
+| Title, cover, platforms, scores, developer, description, video | Covers are served from persisted local SQLite assets on the catalogue/detail pages. Missing or unavailable cover assets remain explicitly unavailable. |
 | Separate critic and user summaries | Reviews are fetched and stored separately. A local deterministic summarizer produces independent likes/dislikes summaries. |
 | Catalogue and game page | Implemented as server-rendered pages with assets embedded in the binary. |
 | Search, platform filter, rating sort | Implemented from persisted SQLite data; page requests do not call Metacritic. |
@@ -126,6 +126,25 @@ cargo run --locked -p gamepulse
 
 Set `GAMEPULSE_SOURCE_WORK_ENABLED=false` for an offline UI/smoke run. The
 catalogue always reads only persisted data.
+
+## Local cover backfill
+
+Existing databases are upgraded forward without deleting game records. Covers
+are acquired only through the explicit, bounded operator command; normal page
+reads, the demo, and mandatory source runs never request an image. It attempts
+at most 20 existing valid cover descriptors, follows no redirects, retries
+nothing, and prints an aggregate-only report:
+
+```bash
+cargo run --locked --offline -p gamepulse -- cover-backfill \
+  --database "$GAMEPULSE_DATABASE_PATH" \
+  --limit 20
+```
+
+Run it only when source access is appropriate. Until an asset is stored, the
+catalogue and detail page show the accessible GP placeholder; stored assets are
+served through GamePulse and no upstream image URL or source descriptor is put
+in page HTML.
 
 Health endpoints:
 

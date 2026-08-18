@@ -137,14 +137,16 @@ domain -----------------------------------> no workspace crate
 - **Prevents:** YouTube quota, missing transcripts, or optional LLM work causing
   mandatory ingestion to fail or starve.
 - **Rule:** mandatory review summaries have higher priority than optional media
-  work. A missing transcript is a terminal optional outcome. Optional failures
-  remain visible but cannot fail mandatory game processing. M012 public cover
-  enrichment is a source-lane-only optional substep: one in-process,
-  low-concurrency HTML gate has a bounded timeout, body limit, disabled
-  redirects and retries, and an until-restart circuit for `403`, `429`, or
-  challenge-like HTML. A missing, malformed, duplicate, oversized, non-HTTPS,
-  or non-`www.metacritic.com` value persists no public cover URL while the
-  mandatory snapshot remains eligible to commit.
+work. A missing transcript is a terminal optional outcome. Optional failures
+remain visible but cannot fail mandatory game processing. M012 public cover
+enrichment is a source-lane-only optional substep: one in-process,
+low-concurrency HTML gate has a bounded timeout, body limit, disabled
+redirects and retries, and an until-restart circuit for `403`, `429`, or
+challenge-like HTML. A missing, malformed, duplicate, oversized, non-HTTPS,
+or non-`www.metacritic.com` value persists no public cover URL while the
+mandatory snapshot remains eligible to commit. Local cover assets are acquired
+only by the explicit bounded operator command, never by page reads or a
+mandatory source job.
 
 ### AD-10 — Preserve the evaluation and secret boundary
 
@@ -192,6 +194,7 @@ by the binary rather than imported by workers or web.
 | State | Owner | Purpose |
 | --- | --- | --- |
 | Games, platform scores, and validated public cover URL | `games`, `game_platform_scores` | Current source data |
+| Local cover bytes and allowlisted MIME type | `game_cover_assets` | Offline-first cover delivery |
 | Review source snapshots | `review_snapshots` | Summary inputs and hashes |
 | Summary freshness and output | `summaries` | UI-visible LLM state |
 | Daily crawl progression | `crawl_days` | New Releases then browse ordering |
@@ -357,13 +360,14 @@ queue settlement, daily selection, and summary behavior unchanged. The durable
 run boundary is independent of optional cover results; a cover failure neither
 changes candidate acceptance nor source progression.
 
-M021 renders a validated public cover URL only after the source adapter and SQLite snapshot
-persistence have carried it into the catalogue read model. A descriptor-derived URL is accepted
-only for the observed exact `catalog` bucket, `cardImage` kind, `/provider/` path, and matching
-filename, with traversal, query, fragment, separator, and host changes rejected. Catalogue and
-detail templates use the persisted value directly without a server-side or render-time fetch; an
-absent URL retains the safe local placeholder. The original source descriptor remains provenance
-data.
+Local cover delivery retains the source descriptor only as durable source data. The explicit
+`cover-backfill` command resolves the exact observed `catalog` / `cardImage` / `/provider/`
+descriptor shape, fetches at most 20 missing images with no redirect or retry, and persists only
+size-bounded JPEG/PNG/WebP bytes whose declared type matches their signature. The catalogue and
+detail templates render `/games/{id}/cover` only when that asset exists; the endpoint serves the
+SQLite bytes and fixed allowlisted MIME type. Page reads never contact a source, source URLs and
+descriptor fields never enter evaluator-facing HTML, and absent/failed covers retain the safe GP
+placeholder. This command is operationally opt-in and remains outside mandatory run settlement.
 
 M013 adds local delivery readiness without changing the one-binary,
 one-process topology. `gamepulse-web` owns `GET /health/live` and

@@ -23,12 +23,13 @@ use serde_json::Value;
 
 use gamepulse_application::{
     AsyncDailyCrawlSourcePort, AsyncReviewSourceIngestionPort, AsyncSourceIngestionPort,
-    CrawlDayKey, CrawlDiscoveryRequest, DailyCrawlOutcome, DailyCrawlStatePort, DiscoveryCandidate,
-    DiscoveryPage, DurableRunDiscovery, DurableRunProgressOutcome, DurableRunProgressStore,
-    GameReviewRefresh, GameReviewRefreshStore, GameSnapshotStore, JobHandler, JobHandlerFailure,
-    JobHandlerFuture, JobHandlerResult, ReviewInput, ReviewPolarity, ReviewSourceIngestion,
-    ReviewSourceIngestionError, ReviewSummaryJobSchedule, RunSourceIngestionRequest,
-    RuntimeJobType, SourceIngestionJobSchedule, SourceIngestionRequest, TypedJob,
+    CoverImageContentType, CrawlDayKey, CrawlDiscoveryRequest, DailyCrawlOutcome,
+    DailyCrawlStatePort, DiscoveryCandidate, DiscoveryPage, DurableRunDiscovery,
+    DurableRunProgressOutcome, DurableRunProgressStore, GameReviewRefresh, GameReviewRefreshStore,
+    GameSnapshotStore, JobHandler, JobHandlerFailure, JobHandlerFuture, JobHandlerResult,
+    ReviewInput, ReviewPolarity, ReviewSourceIngestion, ReviewSourceIngestionError,
+    ReviewSummaryJobSchedule, RunSourceIngestionRequest, RuntimeJobType,
+    SourceIngestionJobSchedule, SourceIngestionRequest, StoredCoverImage, TypedJob,
     WorkerFailureCategory, execute_async_daily_crawl_with_source_ingestion_jobs,
     execute_async_review_source_ingestion, execute_async_source_ingestion,
     persist_game_review_refresh, upsert_game_snapshot,
@@ -57,6 +58,7 @@ const PUBLIC_HTML_BASE_URL: &str = "https://www.metacritic.com/";
 const PUBLIC_HTML_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_PUBLIC_HTML_RESPONSE_BYTES: usize = 262_144;
 const MAX_PUBLIC_COVER_URL_BYTES: usize = 2_048;
+const COVER_IMAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_PUBLIC_HTML_PARSE_NODES: usize = 1_024;
 const MAX_PUBLIC_HTML_PARSE_DEPTH: usize = 64;
 const MAX_PUBLIC_HTML_ATTRIBUTES_PER_ELEMENT: usize = 64;
@@ -1466,23 +1468,37 @@ fn validate_public_cover_url(value: &str) -> Option<GamePublicCoverUrl> {
     GamePublicCoverUrl::new(url.to_string()).ok()
 }
 
-fn derive_public_cover_url(image: &ImageDescriptor) -> Option<GamePublicCoverUrl> {
-    if image.bucket_type != "catalog" || image.kind != "cardImage" {
+/// Resolve the exact observed first-party image descriptor shape without trusting a source URL.
+pub fn resolve_local_cover_source_url(
+    descriptor: &GameCoverDescriptor,
+) -> Option<GamePublicCoverUrl> {
+    if descriptor.bucket_type() != "catalog" || descriptor.kind() != "cardImage" {
         return None;
     }
-    let path = image.bucket_path.strip_prefix("/provider/")?;
+    let path = descriptor.bucket_path().strip_prefix("/provider/")?;
     if path.is_empty()
         || path.contains("..")
         || path.contains(['\\', '?', '#'])
-        || image.filename.is_empty()
-        || image.filename.contains(['/', '\\', '?', '#'])
-        || !path.ends_with(&format!("/{}", image.filename))
+        || descriptor.filename().is_empty()
+        || descriptor.filename().contains(['/', '\\', '?', '#'])
+        || !path.ends_with(&format!("/{}", descriptor.filename()))
     {
         return None;
     }
     validate_public_cover_url(&format!(
         "https://www.metacritic.com/a/img/catalog/provider/{path}"
     ))
+}
+
+fn derive_public_cover_url(image: &ImageDescriptor) -> Option<GamePublicCoverUrl> {
+    let descriptor = GameCoverDescriptor::new(
+        image.bucket_path.clone(),
+        image.bucket_type.clone(),
+        image.filename.clone(),
+        image.kind.clone(),
+    )
+    .ok()?;
+    resolve_local_cover_source_url(&descriptor)
 }
 
 /// Map one parsed product payload and the available per-platform Userscores into the inner model.
@@ -2303,6 +2319,117 @@ pub struct MetacriticPublicHtmlResponse {
     content_type: Option<String>,
     content_length: Option<u64>,
     response: Option<reqwest::Response>,
+}
+
+/// Bounded direct-image client used only by the explicit local-cover backfill command.
+#[derive(Clone)]
+pub struct MetacriticCoverImageClient {
+    http: Client,
+}
+
+#[derive(Debug)]
+pub struct CoverImageFetchError;
+
+impl fmt::Display for CoverImageFetchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("local cover image retrieval failed")
+    }
+}
+
+impl std::error::Error for CoverImageFetchError {}
+
+impl MetacriticCoverImageClient {
+    pub fn new() -> Result<Self, CoverImageFetchError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("image/avif,image/webp,image/apng,image/*,*/*;q=0.8"),
+        );
+        let http = Client::builder()
+            .default_headers(headers)
+            .redirect(redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .timeout(COVER_IMAGE_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|_| CoverImageFetchError)?;
+        Ok(Self { http })
+    }
+
+    /// Resolve and fetch one strictly allowlisted descriptor with no redirect or retry.
+    ///
+    /// A malformed descriptor, non-success status, non-image content type, or invalid body is an
+    /// explicit optional absence. Transport failure is opaque to keep the command aggregate-only.
+    pub async fn fetch(
+        &self,
+        descriptor: &GameCoverDescriptor,
+    ) -> Result<Option<StoredCoverImage>, CoverImageFetchError> {
+        let Some(url) = resolve_local_cover_source_url(descriptor) else {
+            return Ok(None);
+        };
+        let mut response = self
+            .http
+            .get(url.as_str())
+            .send()
+            .await
+            .map_err(|_| CoverImageFetchError)?;
+        if response.status() != StatusCode::OK {
+            return Ok(None);
+        }
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_cover_content_type);
+        let Some(content_type) = content_type else {
+            return Ok(None);
+        };
+        let capacity = match response.content_length() {
+            Some(value) => usize::try_from(value)
+                .ok()
+                .filter(|value| *value <= StoredCoverImage::MAX_BYTES)
+                .ok_or(CoverImageFetchError)?,
+            None => 0,
+        };
+        let mut bytes = Vec::with_capacity(capacity);
+        while let Some(chunk) = response.chunk().await.map_err(|_| CoverImageFetchError)? {
+            let length = bytes
+                .len()
+                .checked_add(chunk.len())
+                .filter(|value| *value <= StoredCoverImage::MAX_BYTES)
+                .ok_or(CoverImageFetchError)?;
+            bytes.reserve(length.saturating_sub(bytes.len()));
+            bytes.extend_from_slice(chunk.as_ref());
+        }
+        Ok(decode_local_cover_image(content_type, bytes))
+    }
+}
+
+fn parse_cover_content_type(value: &str) -> Option<CoverImageContentType> {
+    CoverImageContentType::parse(
+        value
+            .split(';')
+            .next()?
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+    )
+}
+
+/// Accept a local asset only when its allowlisted declared type and file signature agree.
+pub fn decode_local_cover_image(
+    content_type: CoverImageContentType,
+    bytes: Vec<u8>,
+) -> Option<StoredCoverImage> {
+    let signature_matches = match content_type {
+        CoverImageContentType::Jpeg => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        CoverImageContentType::Png => bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]),
+        CoverImageContentType::Webp => {
+            bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice())
+        }
+    };
+    signature_matches
+        .then(|| StoredCoverImage::new(content_type, bytes))
+        .flatten()
 }
 
 impl MetacriticPublicHtmlTransport {
